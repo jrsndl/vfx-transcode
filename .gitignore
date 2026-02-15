@@ -1,0 +1,9 @@
+test_files/
+build/
+dist/
+ffmpeg/
+fonts/
+ocio/
+oiio/
+tst/
+venv/
