@@ -695,6 +695,13 @@ def get_args():
         default=""
     )
     parser.add_argument(
+        '-oiio_channel_use_first',
+        help="Forces to use chanel name for conversion. Defaults to empty, can be R,G,B,A",
+        type=int,
+        required=False,
+        default=0
+    )
+    parser.add_argument(
         '-oiio_command',
         help="To be added after colorconvert and resize commands",
         type=str,
