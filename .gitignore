@@ -7,3 +7,6 @@ ocio/
 oiio/
 tst/
 venv/
+*.bat
+
+tst.py

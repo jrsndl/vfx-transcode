@@ -458,9 +458,9 @@ def convert_one_exr(one_command):
     cmd = one_command['cmd']
     my_file = one_command['file']
 
-    if args['verbose'] == 1:
+    if int(args['verbose']) and int(args['verbose']) == 1:
         print("Converting file {}".format(my_file))
-    elif args['verbose'] >= 1:
+    elif int(args['verbose']) and int(args['verbose']) >= 1:
         print("Converting file {} with command {}".format(my_file, cmd))
 
     result = subprocess.run(one_command['cmd'],
@@ -489,14 +489,14 @@ def convert_exr_to_mezzanine(args):
     output_folder = args['output_folder']
     output_path = Path(output_folder)
 
-    if args['verbose'] == 1:
+    if int(args['verbose']) and int(args['verbose']) == 1:
         print("Converting {} files".format(len(input_sequence)))
-    elif args['verbose'] >= 1:
+    elif int(args['verbose']) and int(args['verbose']) >= 1:
         print("Converting {} files".format(len(input_sequence)))
         print("The input sequence: {}".format(input_sequence))
 
     output_path.mkdir(parents=True, exist_ok=True)
-    if args['verbose'] >= 1:
+    if int(args['verbose']) and int(args['verbose']) >= 1:
         print("Creating output path: {}".format(output_folder))
 
     command_mid = [
@@ -537,8 +537,9 @@ def convert_exr_to_mezzanine(args):
             'args': args
         })
 
-    if args['verbose'] >= 0:
+    if int(args['verbose']) and int(args['verbose']) >= 0:
         print("Executing EXR conversion with {} threads".format(args['cpu_count']))
+        print("The oiio command:\n{}".format(" ".join(commands[0]['cmd'])))
 
     oiio_start = perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args['cpu_count']) as executor:
@@ -593,20 +594,22 @@ def convert_mezzanine_sequence_to_container(args):
     command.append(_prepare_filter(args))
 
     command.extend(args['ff_encode'].split())
-    if args['ff_out_ext'] in can_do_tc and bool(int(args['output_timecode'])):
-        command.extend(["-timecode", args['timecode']])
+    #if args['ff_out_ext'] in can_do_tc and bool(int(args['output_timecode'])):
+    #    command.extend(["-timecode", args['timecode']])
     command.append(new_output_file)
 
     print(f"Running command: {' '.join(command)}")
     result = subprocess.run(command, check=False, capture_output=True, text=True)
 
     if result.returncode != 0:
-        if args['verbose'] <= 1:
+        if int(args['verbose']) and int(args['verbose']) <= 1:
             print("FFmpeg failed with exit status {}.".format(result.returncode))
-        elif args['verbose'] >= 1:
+        elif int(args['verbose']) and int(args['verbose']) >= 1:
             print("FFmpeg failed with exit status {}.".format(result.returncode))
-            print(f"stdout: {result.stdout}")
-            print(f"stderr: {result.stderr}")
+            if result.stdout:
+                print(result.stdout)
+            if result.stderr:
+                print(result.stderr)
         raise subprocess.CalledProcessError(result.returncode, " ".join(command))
 
 
@@ -653,7 +656,7 @@ def get_args():
         "-v",
         "--verbose",
         default=0,
-        action='count',
+        type=str,
         help="Verbose description."
     )
     parser.add_argument(
@@ -833,11 +836,11 @@ def get_args():
 def pick_preferred_channels(args):
 
     more_args = {}
-    channel_names = None
+    channel_names = []
     more_args['oiio_width'] = 0
     more_args['oiio_height'] = 0
     for one in args['info']:
-        channel_names = one.get('channelnames')
+        channel_names.extend(one.get('channelnames'))
         _w = one.get("width", None)
         if _w:
             more_args['oiio_width'] = _w
@@ -876,6 +879,9 @@ def pick_preferred_channels(args):
     if args['oiio_channel_preferred'] in channel_names:
         more_args['picked_channel'] = ','.join(args['oiio_channel_preferred'])
         print(f"Channel picked by argument : {more_args['picked_channel']}")
+    elif args['oiio_channel_preferred'] != '':
+        more_args['picked_channel'] = ','.join(args['oiio_channel_preferred'])
+        print(f"Channel picked by argument : {more_args['picked_channel']}\nWarning: channels not present.")
     else:
         # pick best chanel
         more_args['picked_channel'] = ''
@@ -908,10 +914,11 @@ def pick_preferred_channels(args):
     else:
         more_args['picked_channel_no_alpha'] = more_args['picked_channel']
 
-    if args['verbose'] >= 1:
+    if int(args['verbose']) and int(args['verbose']) >= 1:
         print("Channels found:")
         pprint.pprint(channel_names)
-
+        print("Channels picked:")
+        pprint.pprint(more_args['picked_channel_no_alpha'])
 
     # get other important image info
     return more_args
@@ -1031,4 +1038,3 @@ def main():
 if __name__ == "__main__":
     #TODO detect failed conversions, copy next, delete copied
     main()
-
