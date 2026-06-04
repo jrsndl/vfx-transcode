@@ -540,12 +540,13 @@ def convert_exr_to_mezzanine(args):
     if int(args['verbose']) and int(args['verbose']) >= 0:
         print("Executing EXR conversion with {} threads".format(args['cpu_count']))
         print("The oiio command:\n{}".format(" ".join(commands[0]['cmd'])))
+        print("The oiio command:\n{}".format(" ".join(commands[0]['cmd'])))
 
     oiio_start = perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args['cpu_count']) as executor:
         executor.map(convert_one_exr, commands)
     oiio_end = perf_counter()
-    print(f"Conversion to PNGs took {(oiio_end - oiio_start):.2f} seconds")
+    print(f"Conversion to {args['mezzanine']} took {(oiio_end - oiio_start):.2f} seconds")
 
     ifl = '# ifl for ffmpeg\n'
     one_frame_duration = float(int(args['fps_div'][1])) / float(int(args['fps_div'][0]))
