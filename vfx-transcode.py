@@ -299,10 +299,10 @@ def _prepare_filter(args):
 
     in_filter = args['ff_filter']
 
-    scale = 'scale={}:0'.format(str(args['width']))
+    scale = f'scale=w={args["width"]}:h=0'
 
     # pads to even number if height is bad
-    scale += ',pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2'
+    scale += ':in_color_matrix=bt709:out_color_matrix=bt709,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2'
     if in_filter != '':
         scale += ',{}'.format(str(in_filter))
     burn = _prepare_burnin(args)
@@ -311,7 +311,7 @@ def _prepare_filter(args):
             scale += ','
         scale += str(burn)
 
-    v_filter = f"-filter:v [in]{scale}[out]"
+    v_filter = f'-vf {scale}'
     return v_filter
 
 
@@ -592,9 +592,10 @@ def convert_mezzanine_sequence_to_container(args):
     else:
         command.append(str(args['input_printf']))
 
-    command.append(_prepare_filter(args))
+    video_filter = _prepare_filter(args)
+    my_encode = args['ff_encode'].replace('{videofilter}', video_filter)
+    command = command + my_encode.split()
 
-    command.extend(args['ff_encode'].split())
     #if args['ff_out_ext'] in can_do_tc and bool(int(args['output_timecode'])):
     #    command.extend(["-timecode", args['timecode']])
     command.append(new_output_file)
@@ -813,10 +814,10 @@ def get_args():
     )
     parser.add_argument(
         '-ff_encode',
-        help="FFmpeg encoding to be put after filtering and before output file. Defaults to nice h264.",
+        help="FFmpeg encoding to be put after filtering and before output file. Defaults to nice h264. Use {videofilter} for the filter.",
         type=str,
         required=False,
-        default='-c:v libx264 -profile:v main -g 1 -tune stillimage -crf 18 -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709'
+        default='-pix_fmt yuv420p {videofilter} -c:v libx264 -g 1 -preset slower -crf 18 -color_range tv -color_primaries bt709 -color_trc bt709 -colorspace bt709 -movflags faststart'
     )
     parser.add_argument(
         '-ff_out_ext',
