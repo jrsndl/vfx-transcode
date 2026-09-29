@@ -14,6 +14,8 @@
 - [Metadata](#metadata)
 - [Reel name](#reel-name)
 - [Burn-ins](#burn-ins)
+- [Slate](#slate)
+- [Letterbox](#letterbox)
 - [Encoding (ffmpeg)](#encoding-ffmpeg)
 - [Presets file](#presets-file)
 - [Logging and exit codes](#logging-and-exit-codes)
@@ -24,8 +26,9 @@
 1. `-i` names any one file of a sequence. The tool finds the other frames next to it and reports any holes.
 2. **EXR input.** oiiotool reads the header of the sequence's first frame, whichever frame `-i` points at. The channels, frame rate, timecode, reel name and `{meta:…}` values all come from that header. It then converts every frame to an intermediate file (PNG by default) in a temporary folder, by default in your user temp folder (see `-temp_location`). The conversion applies the OCIO colour transform and resizes the image.
    **Other input** (PNG, JPG, DPX, TIFF, …) skips this step. ffmpeg reads those frames directly.
-3. ffmpeg encodes the frames with the chosen preset and adds burn-ins, timecode and metadata.
-4. The intermediate files are deleted unless `-temp_keep 1` is set.
+3. With a [slate](#slate), ffmpeg draws one extra frame, matching the intermediate frames, and puts it before the first picture.
+4. ffmpeg encodes the frames with the chosen preset and adds burn-ins, timecode and metadata.
+5. The intermediate files are deleted unless `-temp_keep 1` is set.
 
 ## Conventions
 
@@ -40,7 +43,8 @@
 | Option | Default | Description |
 |---|---|---|
 | `-i PATH` | *(required)* | Any file of the input sequence. See the sequence rules below. |
-| `-o PATH` | `<input folder>/<name>.<ext>` | Output movie. `<name>` is the sequence name without its frame number and separator (`shot_010.1001.exr` → `shot_010`). `<ext>` comes from the preset or `-ff_out_ext`. Missing folders are created. |
+| `-o PATH` | `<input folder>/<name>.<ext>` | Output movie. `<name>` is the sequence name without its frame number and separator (`shot_010.1001.exr` → `shot_010`). `<ext>` comes from the preset or `-ff_out_ext`. Missing folders are created. The container follows `-ff_out_ext`, else the extension of `-o` (`-o review.mov` makes a mov even with the h264 preset), else the preset's `ext`. |
+| `-version_regex REGEX` | `_v(\d\d\d)` | How the version is found in the sequence name for the [name keywords](#name-keywords). |
 
 **How the sequence is found.** The frame number is the run of digits at the end of the file name, just before the extension:
 - `shot_010.1001.exr` → name `shot_010.`, frame 1001, 4-digit padding.
@@ -245,12 +249,14 @@ The three sources:
 
 The log shows the timecode and its source, e.g. `Timecode: 00:00:41:17 (frame counter)`. The same value starts the `{tc}` burn-in.
 
+With a [slate](#slate) the movie starts one frame earlier, so its timecode track starts at the slate's timecode (start − 1). The pictures keep the timecode described here.
+
 ## Metadata
 
 | Option | Default | Description |
 |---|---|---|
 | `-metadata_preset NAME` | the presets file's `default_metadata` (`none`) | A [metadata preset](#metadata-presets): tags, copy rules, reel name and timecode settings in one name. `none` means no preset. |
-| `-metadata KEY=VALUE` | *(none)* | Write a tag. Repeatable. The value may use `{clean_name}`, `{frame_start}`, `{frame_end}`, `{timecode}`, `{fps}`, `{preset}`, `{date}` and [`{meta:ATTR}`](#header-values-metaattr). `KEY=` with no value removes a tag that a preset would write. |
+| `-metadata KEY=VALUE` | *(none)* | Write a tag. Repeatable. The value may use `{clean_name}`, `{frame_start}`, `{frame_end}`, `{timecode}`, `{fps}`, `{preset}`, `{date}`, [`{meta:ATTR}`](#header-values-metaattr) and the [name keywords](#name-keywords). `KEY=` with no value removes a tag that a preset would write. |
 | `-metadata_copy SPEC` | the metadata preset's `copy`, else none | Copy attributes from the first frame's EXR header. See below. `-metadata_copy ""` switches off a preset's copying. |
 
 Examples:
@@ -377,6 +383,7 @@ Keywords in the text:
 | `{date}` | Today's date, `YYYY-MM-DD`. |
 | `{preset}` | Name of the encode preset. |
 | `{meta:ATTR}` | An attribute of the source header, e.g. `{meta:owner}`, `{meta:cameraModel}`, `{meta:nuke/input/filename}`. See [Header values](#header-values-metaattr). |
+| `{version_string}`, `{version_number}`, `{namesplit1}` … `{namesplit-9}` | Parts of the sequence name; see [Name keywords](#name-keywords). |
 
 **New lines.** `\n` in a text starts a new line, e.g. `-burn_bc "{clean_name}\nTC {tc}"` or in `presets.json` `"tl": "{clean_name}\n{date}"`. A real line break in the JSON string (`"\n"` as JSON writes it) works too.
 
@@ -387,6 +394,28 @@ Keywords in the text:
 - Centred and right-aligned multi-line text needs ffmpeg 6.1 or newer (drawtext's `text_align` option). Left-aligned and single-line text works with any version.
 
 Any other characters are allowed, including `: ' % , [ ] ;`; the tool escapes them for ffmpeg. This includes characters inside header values. An unknown `{word}` is printed as typed, with a warning.
+
+### Name keywords
+
+These keywords come from the sequence name (the clean name, without frame number). They work everywhere keywords do: burn-ins, slate, `-metadata` values, metadata preset tags and `-reelid`.
+
+**Version.** `-version_regex` (default `_v(\d\d\d)`) finds the version. If the name matches more than once, the last match counts.
+
+| Keyword | `sh010_comp_v007` | Meaning |
+|---|---|---|
+| `{version_string}` | `007` | What group 1 of the regex matched (the whole match if the regex has no group). |
+| `{version_number}` | `7` | The same without leading zeroes; `000` gives `0`. |
+
+Both are empty if the name has no version, so a slate row `"Version": "{version_number}"` is then hidden. For other naming, e.g. `-version_regex "_v(\d+)"` for any number of digits, or `"[._]V(\d+)"` for `shot.V12`.
+
+**Name splits.** The name split at `_`, counted from the start (`{namesplit1}` … `{namesplit9}`) or from the end (`{namesplit-1}` … `{namesplit-9}`). Parts that don't exist are empty.
+
+| Name `AA_BBB_C_DD` | 1 | 2 | 3 | 4 | 5–9 |
+|---|---|---|---|---|---|
+| `{namesplitN}` | `AA` | `BBB` | `C` | `DD` | *(empty)* |
+| `{namesplit-N}` | `DD` | `C` | `BBB` | `AA` | *(empty)* |
+
+For example, for `ICOI2_005_033_renderCompSecondary_v000`, `-burn_tl "{namesplit2}_{namesplit3}"` burns in `005_033` and `-reelid "{namesplit1}"` gives the reel `ICOI2`.
 
 ### Header values `{meta:ATTR}`
 
@@ -402,16 +431,98 @@ Any other characters are allowed, including `: ' % , [ ] ;`; the tool escapes th
 
 Example: `-burn_tl "{meta:owner}" -burn_tc "{meta:cameraModel} / {meta:lensModel}" -burn_bl "{meta:nuke/input/filename|}"`.
 
+## Slate
+
+A slate is one information frame placed before the first picture: shot name, frame range, timecode, format, colour, reel, notes and a thumbnail of the shot. It follows the usual VFX conventions:
+
+- **Frame and timecode.** The slate is frame *start − 1*, and its timecode is the start timecode − 1. The movie's timecode track starts at the slate, so the first picture keeps its own timecode, e.g. slate `00:00:41:16`, first picture `00:00:41:17`. A start timecode of `00:00:00:00` can't go lower, so the slate also gets `00:00:00:00`. Because a movie's timecode runs continuously, the pictures then start at `00:00:00:01`; a warning says so, and `{timecode}` shows that value everywhere.
+- **Same format as the pictures.** The slate is written next to the intermediate frames with the same width, height and pixel format. It goes through the same scale, pixel aspect reformat and colour tags. After drawing it, the tool checks the size and stops with an error if it doesn't match.
+- **Pixel aspect.** For anamorphic input the slate is laid out at display proportions (width × pixel aspect) and squeezed to the stored width. Text and thumbnail therefore look right once the player un-squeezes the movie, and with `-par_out square` as well.
+- **Burn-ins** are not drawn on the slate. Their counters still count it, so the first picture shows the right `{current_frame}` and `{tc}`. `-slate_burnin 1` draws them on the slate too.
+- **Colour.** The thumbnail is taken from the converted intermediates, so it is in the output colourspace like the rest of the movie. The slate's own colours (background, text) are output values and are not colour-converted.
+
+| Option | Default | Description |
+|---|---|---|
+| `-slate NAME` | the presets file's `default_slate` (`none`) | Slate preset from the [presets file](#presets-file); `none` means no slate. `--help` lists the presets and their rows. |
+| `-slate_title TEXT` | the preset's, else `{clean_name}` | Big first line. |
+| `-slate_subtitle TEXT` | the preset's | Smaller line under the title. |
+| `-slate_field "LABEL=TEXT"` | *(none)* | Adds a row, or replaces the row with that label: `-slate_field "Notes=first comp pass"`. `"LABEL="` removes a row. Repeatable; new rows go at the end. |
+| `-slate_thumbnail middle\|first\|last\|none\|FRAME` | the preset's, else `middle` | Which frame is shown as a thumbnail. If that frame is a hole or failed, the nearest existing frame is used. |
+| `-slate_scale PERCENT` | the preset's, else `100%` | Size of the whole slate layout: text, spacing, the rule and the thumbnail. `100%` fills the picture; `50%` is everything at half size, centred in the picture. `50%`, `50` and `0.5` all mean half. From 5% to 100%. |
+| `-slate_valign center\|top` | the preset's, else `center` | Vertical placement of the content: centred (same space above and below), or from the top. |
+| `-slate_title_size SIZE` | the preset's, else `5%` | Title text size: percent of the picture height or pixels, as in [Text size](#text-size). |
+| `-slate_subtitle_size SIZE` | the preset's, else `3.2%` | Subtitle text size. |
+| `-slate_size SIZE` | the preset's, else `2.5%` | Text size of the rows, labels and values. |
+| `-slate_value_color COLOR` | the preset's, else `white` | Colour of the row values. |
+| `-slate_rule 0\|1` | the preset's, else `0` | A line under the title, in `line_color`. |
+| `-slate_label_color COLOR` | the preset's, else `#7a7a7a` | Colour of the row labels (the field names), usually a darker grey. |
+| `-slate_style "KEY=VALUE,..."` | *(none)* | Any style setting, e.g. `-slate_style "title_color=yellow,background=#000000"`. Keys: `background`, `title_color`, `subtitle_color`, `value_color`, `label_color`, `line_color`, `title_size`, `subtitle_size`, `size`, `scale`, `valign`, `rule` (1/0), and `color` (title and values). Repeatable; wins over the options above. |
+| `-slate_burnin 0\|1` | `0` | Draw the burn-ins on the slate as well. |
+
+The `-slate_*` options without `-slate` make a plain slate: title `{clean_name}`, only the rows you give, and a thumbnail. With `-slate none` they are ignored, with a warning. `-skipffmpeg` makes no slate, because ffmpeg draws it.
+
+**Keywords** for the title, subtitle and rows:
+
+| Keyword | Value |
+|---|---|
+| `{clean_name}` | Sequence name without frame number. |
+| `{frame_start}`, `{frame_end}`, `{frames}` | First and last picture frame, and their count (holes included). |
+| `{timecode}`, `{timecode_end}` | Timecode of the first and last picture. |
+| `{duration}` | Length as timecode, e.g. `00:00:04:12`. |
+| `{fps}` | Frame rate. |
+| `{width}`, `{height}`, `{par}` | Size and pixel aspect of the encoded movie. |
+| `{colour}` | The colour transform, e.g. `ACEScg -> out_rec709`; empty for non-EXR input. |
+| `{reel}` | The [reel name](#reel-name), empty if none. |
+| `{preset}`, `{date}`, `{user}`, `{input}` | Encode preset, today's date, login name, the `-i` file name. |
+| `{meta:ATTR}`, `{meta:ATTR\|fallback}` | Any [header value](#header-values-metaattr) of the first frame. |
+| `{version_string}`, `{version_number}`, `{namesplit1}` … `{namesplit-9}` | The [name keywords](#name-keywords). |
+
+`\n` starts a new line. Long values wrap next to the thumbnail. **Rows whose value comes out empty are left out** (unless the preset sets `"hide_empty": false`). So `"Artist": "{meta:Artist|}"` shows the row only when the header has an Artist, and a `Notes` row appears once you give it text. If the rows don't fit the picture height, all text shrinks until they do.
+
+**Scale.** Sizes given in percent are percent of the picture height, and `-slate_scale` multiplies everything: with `-slate_scale 50%`, a title of `5%` is drawn at 2.5% of the height, and pixel sizes are halved as well. Spacing and thumbnail shrink the same way, and the smaller layout is centred in the picture. The background always fills the whole frame.
+
+Shipped slate presets:
+
+| Preset | Rows | Thumbnail |
+|---|---|---|
+| `generic` | subtitle from `ImageDescription`; Date, Artist, Frames, Timecode, Duration, Format, Colour, Codec, Reel | middle |
+| `client` | Date, Duration, Notes (bigger text, 2.6%) | middle |
+| `editorial` | Reel, TC in, TC out, Frames, FPS, Format, Date | none |
+
+The layout (title, label/value rows, thumbnail, rows hidden when empty) follows the HTML slate of [ynput/LabLib](https://github.com/ynput/LabLib). LabLib renders HTML in a headless browser; here ffmpeg draws the slate, so nothing else needs to be installed.
+
+## Letterbox
+
+The letterbox covers part of the picture with bars, to show how it looks at a target aspect ratio. Which kind of bars you get follows from the movie's **display** ratio (width × pixel aspect ÷ height):
+
+- target ratio **wider** than the picture (2.39 on a 16:9 movie): bars top and bottom, a **letterbox**.
+- target ratio **narrower** (4:3 on a 16:9 movie, or 2.39 on an anamorphic 2:1 movie that displays at about 4.8:1): bars left and right, a **pillarbox**.
+- the same ratio (within a pixel): no bars, and the log says so.
+
+The bars are drawn on the encoded size, after scaling, pixel aspect reformat and padding. They are drawn before `-ff_filter` and before the burn-ins, so burn-ins are drawn on top of them. The [slate](#slate) never gets bars.
+
+| Option | Default | Description |
+|---|---|---|
+| `-letterbox 0\|1` | `0` | Turn the letterbox on. The other options only apply when it is on; giving them alone prints a warning. |
+| `-letterbox_ratio RATIO` | `2.39` | Target ratio: `2.39`, `2.39:1`, `1.85`, `16:9`, `16/9`, `4:3` … |
+| `-letterbox_color R,G,B,A` | `0,0,0,255` | Bar colour, 0–255 per channel. Alpha below 255 makes the bars see-through: `0,0,0,160` darkens the covered part instead of hiding it. `R,G,B` (solid) and `#RRGGBBAA` work too. |
+| `-letterbox_line PIXELS` | `0` | A line along the inner edge of each bar, next to the visible picture, in movie pixels. `0` = no line. It is drawn inside the bar, so it never covers the visible picture. |
+| `-letterbox_line_color R,G,B,A` | `255,255,255,255` | Colour of that line, same format as `-letterbox_color`. |
+
+The log shows the result, e.g. `Letterbox 2.39: letterbox, bars of 138 px top and bottom, line 2 px`.
+
 ## Encoding (ffmpeg)
 
 | Option | Default | Description |
 |---|---|---|
 | `-preset NAME` | the presets file's `default_encode` (`h264`) | Encode preset. `--help` lists the available ones with their notes. |
-| `-presets_file PATH` | `./presets.json` | JSON file holding the encode presets, burn-in presets and channel preferences. See [Presets file](#presets-file). |
+| `-presets_file PATH` | `./presets.json` | JSON file holding the encode, burn-in, metadata and slate presets and the channel preferences. See [Presets file](#presets-file). |
 | `-ff_out_ext EXT` | the preset's `ext` | Output extension/container, e.g. `mov`, `mp4`, `mkv`, `mxf`. |
 | `-ff_encode ARGS` | *(none)* | Replaces the preset's codec arguments for one run. It must contain `{videofilter}` as a separate word where the `-vf` filter goes. No colour tags are added. Example: `-ff_encode "-pix_fmt yuv420p {videofilter} -c:v libx264 -crf 23"`. |
 | `-ff_filter FILTERS` | *(none)* | Extra ffmpeg video filters, inserted after scale/pad and before the burn-ins, e.g. `-ff_filter "eq=gamma=1.1"`. Used as given, so escape ffmpeg special characters yourself. |
 | `-skipffmpeg 0\|1` | `0` | Only convert the EXRs. The movie isn't made and the intermediates are kept (implies `-temp_keep 1`); the log prints their folder. Add `-temp_location source` to get them next to the source files. |
+
+With the preset's colour tags, the frames themselves are tagged too (`setparams`). Newer ffmpeg builds (seen with 7.1) take the colour tags from the frames, i.e. from the intermediate PNGs, whose gamma chunk can make the movie come out as "unknown/linear" despite `-color_trc`.
 
 Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_color_matrix=bt709:out_range=tv:out_color_matrix=bt709`) and pads odd sizes to even ones.
 
@@ -425,6 +536,7 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
   "default_encode": "h264",
   "default_burnin": "none",
   "default_metadata": "none",
+  "default_slate": "none",
   "channel_preferences": ["rgba.R,rgba.G,rgba.B,rgba.A", "R,G,B,A", "R,G,B", "beauty.R,beauty.G,beauty.B"],
   "encode_presets": {
     "my-proxy": {
@@ -453,6 +565,16 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
       "br": "{current_frame} / {frame_end}",
       "size": "2%"
     }
+  },
+  "slate_presets": {
+    "my-slate": {
+      "notes": "Shown in --help.",
+      "title": "{clean_name}",
+      "subtitle": "{meta:ImageDescription|}",
+      "fields": {"Date": "{date}", "Frames": "{frame_start} - {frame_end}", "Artist": "{meta:Artist|}"},
+      "thumbnail": "middle",
+      "size": "2.5%"
+    }
   }
 }
 ```
@@ -465,6 +587,8 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
 | `burnin_presets` | The burn-in presets. Optional. The name `none` is reserved. |
 | `default_metadata` | Metadata preset used without `-metadata_preset`. `none` (or leaving it out) means none. |
 | `metadata_presets` | The metadata presets. Optional. The name `none` is reserved. |
+| `default_slate` | Slate preset used without `-slate`. `none` (or leaving it out) means no slate. |
+| `slate_presets` | The slate presets. Optional. The name `none` is reserved. |
 | `channel_preferences` | Ordered channel sets for the [automatic channel choice](#exr-conversion-oiiotool). Each set is a string `"R,G,B"` or a list `["R", "G", "B"]`. Put your studio's beauty-layer names first. Optional; if it's missing, the built-in list shown there is used. |
 
 Encode preset fields:
@@ -498,6 +622,27 @@ Burn-in preset fields (all optional; any other field is an error):
 | `size` | [Text size](#text-size) for the whole preset: `"1.5%"`, `40` (pixels) or `"h/75"`. Default `"1.33%"`. |
 | `box` | `true` for a black box behind the text, for the whole preset. |
 | `font` | Font file; `./` paths are relative to the application folder. |
+| `notes` | Description shown in `--help`. |
+
+Slate preset fields (all optional; any other field is an error):
+
+| Field | Description |
+|---|---|
+| `title`, `subtitle` | Text with the [slate keywords](#slate). Title default `{clean_name}`. |
+| `fields` | Rows in order, `{"Label": "value", ...}`; values use the slate keywords. |
+| `hide_empty` | `true` (default): rows whose value comes out empty are left out. |
+| `thumbnail` | `middle` (default), `first`, `last`, `none` or a frame number. |
+| `title_size`, `subtitle_size`, `size` | Text sizes of the title (`"5%"`), subtitle (`"3.2%"`) and rows (`"2.5%"`): percent of the picture height, or pixels. |
+| `scale` | Whole layout, `"100%"` default; `"50%"` is half size, centred. |
+| `valign` | `center` (default) or `top`. |
+| `background` | Canvas colour, default `#1b1b1b`. |
+| `title_color`, `subtitle_color` | Default `white` and `#b4b4b4`. |
+| `value_color` | Row values, default `white`. |
+| `label_color` | Row labels (field names), default `#7a7a7a`. |
+| `rule` | `true` draws a line under the title, default `false`. |
+| `line_color` | Colour of that line, default `#5a5a5a`. |
+| `color` | Shortcut: sets `title_color` and `value_color`. |
+| `font` | Font file; default the burn-in font. |
 | `notes` | Description shown in `--help`. |
 
 Shipped encode presets, based on the [ASWF Encoding Guidelines](https://github.com/AcademySoftwareFoundation/EncodingGuidelines):
@@ -590,6 +735,27 @@ The same with an explicit reel name built from the shot name:
 
 ```
 python vfx-transcode.py -i D:/shots/sh010/comp/sh010_comp.1001.exr -preset prores422hq -reelid "{clean_name}"
+```
+
+Review movie with a slate: note on the slate, burn-ins only on the pictures:
+
+```
+python vfx-transcode.py -i D:/shots/sh010/comp/sh010_comp.1001.exr -slate generic ^
+  -slate_field "Notes=first comp pass, check the helmet edge" -burn_preset review
+```
+
+Editorial ProRes with a slate carrying the reel name and source timecode:
+
+```
+python vfx-transcode.py -i D:/shots/sh010/comp/sh010_comp.1001.exr -preset prores422hq ^
+  -metadata_preset conform -slate editorial
+```
+
+Review with a see-through 2.39 letterbox and a thin grey edge, burn-ins on top:
+
+```
+python vfx-transcode.py -i D:/shots/sh010/comp/sh010_comp.1001.exr -burn_preset review ^
+  -letterbox 1 -letterbox_ratio 2.39 -letterbox_color 0,0,0,160 -letterbox_line 2 -letterbox_line_color 128,128,128,255
 ```
 
 Anamorphic 2.0 plates (the header wrongly says 1), made square for review:

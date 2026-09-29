@@ -70,6 +70,17 @@ class Config:
     burn: Dict[str, str] = field(default_factory=dict)   # place -> text template
     burn_styles: Dict[str, Any] = field(default_factory=dict)   # place -> resolved BurnStyle
 
+    # slate
+    slate: Any = None                  # slate.SlateSpec, None = no slate
+
+    # letterbox
+    letterbox: Any = None              # letterbox.LetterboxSpec, None = off
+    letterbox_plan: Any = None         # letterbox.LetterboxPlan, set at run time
+
+    # keywords from the sequence name
+    version_regex: str = r"_v(\d\d\d)"
+    name_tokens: Dict[str, str] = field(default_factory=dict)   # set at run time
+
     # set at run time
     header_file: str = ""              # the file whose header was read (first frame)
     header_attribs: Dict[str, Any] = field(default_factory=dict)   # its attributes, {meta:NAME}

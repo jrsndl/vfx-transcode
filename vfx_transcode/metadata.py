@@ -81,7 +81,7 @@ _reported = set()
 def meta_lookup(attribs, spec):
     """{meta:NAME} / {meta:NAME|fallback}: the header attribute (OIIO or EXR name, any case)
     as text. Returns (value, found). Each name is logged once."""
-    name, _sep, fallback = (spec or "").partition("|")
+    name, sep, fallback = (spec or "").partition("|")
     name = name.strip()
     value = header_value(attribs or {}, name) if name else ""
     found = bool(value)
@@ -89,9 +89,9 @@ def meta_lookup(attribs, spec):
         _reported.add(name)
         if found:
             log.info("Header value {meta:%s} = %r", name, value)
-        else:
-            log.warning("Header value {meta:%s} not found in the first frame; using %r",
-                        name, fallback)
+        else:     # with an explicit fallback ({meta:Artist|}) a missing value is expected
+            (log.info if sep else log.warning)(
+                "Header value {meta:%s} not found in the first frame; using %r", name, fallback)
     return (value if found else fallback), found
 
 
@@ -118,7 +118,10 @@ def expand(value, context):
         if field == "meta":
             out.append(meta_lookup(context.get("meta"), spec)[0])
         elif field in context:
-            out.append(format(context[field], spec) if spec else str(context[field]))
+            try:
+                out.append(format(context[field], spec) if spec else str(context[field]))
+            except ValueError:            # e.g. {version_number:03d} on a text value
+                out.append(str(context[field]))
         else:
             out.append("{" + field + (":" + spec if spec else "") + "}")
     return "".join(out)

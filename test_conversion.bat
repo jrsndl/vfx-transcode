@@ -113,7 +113,7 @@ set RC=%ERRORLEVEL%
 "%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\08_icoi_header.mov" > "%OUT%\08_icoi_header_probe.txt" 2>&1
 type "%OUT%\08_icoi_header.log"
 call :check %RC% "8  icoi_header"
-call :expect "%OUT%\08_icoi_header.log" "Frame rate: 24 (EXR header FramesPerSecond)" "8  icoi_header"
+call :expect "%OUT%\08_icoi_header.log" "Frame rate: 24 (EXR header" "8  icoi_header"
 call :expect "%OUT%\08_icoi_header.log" "Timecode: 00:00:41:17 (EXR header)" "8  icoi_header"
 call :expect "%OUT%\08_icoi_header.log" "Reel name: Z017_C001_20190920_R (EXR header owner)" "8  icoi_header"
 call :expect "%OUT%\08_icoi_header_probe.txt" "reel_name" "8  icoi_header movie"
@@ -150,7 +150,7 @@ set RC=%ERRORLEVEL%
 "%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\10_icoi_fps_exr_wins.mp4" > "%OUT%\10_icoi_fps_exr_wins_probe.txt" 2>&1
 type "%OUT%\10_icoi_fps_exr_wins.log"
 call :check %RC% "10 icoi_fps_exr_wins"
-call :expect "%OUT%\10_icoi_fps_exr_wins.log" "Frame rate: 24 (EXR header FramesPerSecond)" "10 icoi_fps_exr_wins"
+call :expect "%OUT%\10_icoi_fps_exr_wins.log" "Frame rate: 24 (EXR header" "10 icoi_fps_exr_wins"
 call :expect "%OUT%\10_icoi_fps_exr_wins.log" "-r 25 ignored" "10 icoi_fps_exr_wins"
 call :expect "%OUT%\10_icoi_fps_exr_wins.log" "Timecode: 00:00:41:17 (frame counter)" "10 icoi_fps_exr_wins"
 call :expect_not "%OUT%\10_icoi_fps_exr_wins.log" "Reel name:" "10 icoi_fps_exr_wins"
@@ -405,6 +405,125 @@ set RC=%ERRORLEVEL%
 type "%OUT%\26_multiline.log"
 call :check %RC% "26 multiline"
 if exist "%OUT%\26_multiline.png" (>> "%SUMMARY%" echo [INFO] 26 multiline - first frame saved as 26_multiline.png, check the line layout by eye)
+
+echo.
+echo ==== 27  slate: generic preset with a note; slate is frame 1000 at TC 00:00:41:16, pictures keep 00:00:41:17 ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -preset prores422hq -slate generic -slate_field "Notes=first comp pass, check the helmet edge against the sky" ^
+  -burn_preset review ^
+  -o "%OUT%\27_slate_generic.mov" > "%OUT%\27_slate_generic.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\27_slate_generic.mov" > "%OUT%\27_slate_generic_probe.txt" 2>&1
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\27_slate_generic.mov" -vf "select=lt(n\,2),scale=960:-2,tile=1x2" -frames:v 1 "%OUT%\27_slate_generic.png" >nul 2>&1
+type "%OUT%\27_slate_generic.log"
+call :check %RC% "27 slate_generic"
+call :expect "%OUT%\27_slate_generic.log" "Timecode: 00:00:41:17 (frame counter), slate 00:00:41:16" "27 slate_generic"
+call :expect "%OUT%\27_slate_generic.log" "Slate (preset generic): frame 1000" "27 slate_generic"
+call :expect "%OUT%\27_slate_generic_probe.txt" "00:00:41:16" "27 slate_generic movie"
+if exist "%OUT%\27_slate_generic.png" (>> "%SUMMARY%" echo [INFO] 27 slate_generic - slate and first picture saved as 27_slate_generic.png, check by eye)
+
+echo.
+echo ==== 28  slate at timecode 00:00:00:00: the slate keeps it, the pictures start at 00:00:00:01 ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -preset prores422hq -timecode 00:00:00:00 -slate editorial -burn_preset editorial ^
+  -o "%OUT%\28_slate_tc_zero.mov" > "%OUT%\28_slate_tc_zero.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\28_slate_tc_zero.mov" > "%OUT%\28_slate_tc_zero_probe.txt" 2>&1
+type "%OUT%\28_slate_tc_zero.log"
+call :check %RC% "28 slate_tc_zero"
+call :expect "%OUT%\28_slate_tc_zero.log" "pictures start at 00:00:00:01" "28 slate_tc_zero"
+call :expect "%OUT%\28_slate_tc_zero_probe.txt" "00:00:00:00" "28 slate_tc_zero movie"
+
+echo.
+echo ==== 29  slate on anamorphic 2.0: frames squeezed to half width, -par 2 un-squeezes them; slate matches ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -oiio_command "--resize 960x962" -par 2 -par_out same -slate generic -slate_thumbnail first ^
+  -o "%OUT%\29_slate_anamorphic.mp4" > "%OUT%\29_slate_anamorphic.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\29_slate_anamorphic.mp4" > "%OUT%\29_slate_anamorphic_probe.txt" 2>&1
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\29_slate_anamorphic.mp4" -vf "select=eq(n\,0),scale=iw*sar:ih,setsar=1,scale=1920:-2" -frames:v 1 "%OUT%\29_slate_anamorphic.png" >nul 2>&1
+type "%OUT%\29_slate_anamorphic.log"
+call :check %RC% "29 slate_anamorphic"
+call :expect "%OUT%\29_slate_anamorphic.log" "thumbnail of frame 1001" "29 slate_anamorphic"
+call :expect "%OUT%\29_slate_anamorphic.log" "960x962" "29 slate_anamorphic squeezed"
+call :expect "%OUT%\29_slate_anamorphic_probe.txt" "SAR 2:1" "29 slate_anamorphic movie"
+if exist "%OUT%\29_slate_anamorphic.png" (>> "%SUMMARY%" echo [INFO] 29 slate_anamorphic - un-squeezed slate saved as 29_slate_anamorphic.png, text and thumbnail should look normal, the movie too)
+
+echo.
+echo ==== 30  plain slate from -slate_field only, underscore sequence from 1000, 16-bit, burn-ins on the slate too ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\LS_AMB_SH101_BEAUTY_v005\LS_AMB_SH101_BEAUTY_v005_1000.exr" ^
+  -mezzanine_16bit 1 -slate_field "Shot={clean_name}" -slate_field "Artist={meta:Artist|unknown}" ^
+  -slate_field "Frames={frame_start} - {frame_end}" -slate_burnin 1 -burn_preset frame ^
+  -o "%OUT%\30_slate_plain.mp4" > "%OUT%\30_slate_plain.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\30_slate_plain.mp4" -frames:v 1 "%OUT%\30_slate_plain.png" >nul 2>&1
+type "%OUT%\30_slate_plain.log"
+call :check %RC% "30 slate_plain"
+call :expect "%OUT%\30_slate_plain.log" "Slate: frame 999" "30 slate_plain"
+call :expect "%OUT%\30_slate_plain.log" "rgb48be" "30 slate_plain 16-bit"
+if exist "%OUT%\30_slate_plain.png" (>> "%SUMMARY%" echo [INFO] 30 slate_plain - slate saved as 30_slate_plain.png, frame counter 999 in the corner)
+
+echo.
+echo ==== 31  slate style: half size, top aligned, own sizes and colours ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -slate generic -slate_field "Notes=style test" -slate_scale 50%% -slate_valign top ^
+  -slate_title_size 6%% -slate_subtitle_size 3%% -slate_size 3%% ^
+  -slate_label_color #555555 -slate_value_color #ffcc00 -slate_rule 1 -slate_style "title_color=#88ccff,line_color=#ffcc00" ^
+  -o "%OUT%\31_slate_style.mp4" > "%OUT%\31_slate_style.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\31_slate_style.mp4" -frames:v 1 "%OUT%\31_slate_style.png" >nul 2>&1
+type "%OUT%\31_slate_style.log"
+call :check %RC% "31 slate_style"
+if exist "%OUT%\31_slate_style.png" (>> "%SUMMARY%" echo [INFO] 31 slate_style - slate saved as 31_slate_style.png: half size at the top, yellow values, dark labels, yellow line under the title)
+
+echo.
+echo ==== 32  letterbox 2.39 see-through with a red edge line, burn-ins on top, slate without bars ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -slate generic -burn_preset review ^
+  -letterbox 1 -letterbox_ratio 2.39 -letterbox_color 0,0,0,160 -letterbox_line 3 -letterbox_line_color 255,0,0,255 ^
+  -o "%OUT%\32_letterbox.mp4" > "%OUT%\32_letterbox.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\32_letterbox.mp4" -vf "select=lt(n\,2),scale=960:-2,tile=1x2" -frames:v 1 "%OUT%\32_letterbox.png" >nul 2>&1
+type "%OUT%\32_letterbox.log"
+call :check %RC% "32 letterbox"
+call :expect "%OUT%\32_letterbox.log" "Letterbox 2.39: letterbox" "32 letterbox"
+if exist "%OUT%\32_letterbox.png" (>> "%SUMMARY%" echo [INFO] 32 letterbox - slate and first picture in 32_letterbox.png: clean slate, dark see-through bars with a red edge)
+
+echo.
+echo ==== 33  pillarbox: 4:3 on the 16:9 picture, solid bars ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -burn_preset review -letterbox 1 -letterbox_ratio 4:3 ^
+  -o "%OUT%\33_pillarbox.mp4" > "%OUT%\33_pillarbox.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\33_pillarbox.mp4" -frames:v 1 "%OUT%\33_pillarbox.png" >nul 2>&1
+type "%OUT%\33_pillarbox.log"
+call :check %RC% "33 pillarbox"
+call :expect "%OUT%\33_pillarbox.log" "Letterbox 4:3: pillarbox" "33 pillarbox"
+
+echo.
+echo ==== 34  name keywords: version and name splits in burn-ins, metadata title, slate and reel name ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -burn_tl "{namesplit2}_{namesplit3}" -burn_tr "v{version_string} / {namesplit-2}" ^
+  -metadata "title={namesplit2}_{namesplit3} v{version_number}" -reelid "{namesplit1}" -reelid_source arg ^
+  -slate generic -slate_field "Version={version_number}" ^
+  -o "%OUT%\34_name_keywords.mov" > "%OUT%\34_name_keywords.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\34_name_keywords.mov" > "%OUT%\34_name_keywords_probe.txt" 2>&1
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\34_name_keywords.mov" -vf "select=lt(n\,2),scale=960:-2,tile=1x2" -frames:v 1 "%OUT%\34_name_keywords.png" >nul 2>&1
+type "%OUT%\34_name_keywords.log"
+call :check %RC% "34 name_keywords"
+call :expect "%OUT%\34_name_keywords.log" "Version: 000" "34 name_keywords"
+call :expect "%OUT%\34_name_keywords.log" "Reel name: ICOI2" "34 name_keywords"
+call :expect "%OUT%\34_name_keywords_probe.txt" "005_033 v0" "34 name_keywords movie"
+if exist "%OUT%\34_name_keywords.png" (>> "%SUMMARY%" echo [INFO] 34 name_keywords - 34_name_keywords.png: slate row Version 0, burn-ins 005_033 and v000 / renderCompSecondary)
 
 echo.
 echo ===========================================================================

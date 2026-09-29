@@ -6,8 +6,11 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .burnin import BURN_PLACES, PLACE_NAMES, STYLE_FIELDS, BurnStyle, style_from_values
+from .burnin import (BURN_PLACES, PLACE_NAMES, STYLE_FIELDS, BurnStyle, parse_size,
+                     style_from_values)
 from .errors import TranscodeError
+from .slate import (NO_SLATE, SLATE_PRESET_FIELDS, SlateSpec, parse_fields, parse_thumbnail,
+                    style_values)
 from .tools import split_args
 
 DEFAULT_PRESETS_FILE = "./presets.json"
@@ -77,6 +80,18 @@ class PresetFile:
     channel_preferences: List[List[str]] = field(default_factory=list)
     metadata_presets: "OrderedDict[str, MetadataPreset]" = field(default_factory=OrderedDict)
     default_metadata: str = ""
+    slates: "OrderedDict[str, SlateSpec]" = field(default_factory=OrderedDict)
+    default_slate: str = ""
+
+    def get_slate(self, name):
+        """Slate preset by name; None for "" or "none"."""
+        if not name or name == NO_SLATE:
+            return None
+        try:
+            return self.slates[name]
+        except KeyError:
+            raise TranscodeError('Unknown slate preset "{}". Available: {} (from {})'.format(
+                name, ", ".join(list(self.slates) + [NO_SLATE]), self.path))
 
     def get_metadata_preset(self, name):
         """Metadata preset by name; None for "" or "none"."""
@@ -107,7 +122,7 @@ class PresetFile:
 
     def describe(self):
         width = max(len(n) for n in list(self.presets) + list(self.burnins)
-                    + list(self.metadata_presets))
+                    + list(self.metadata_presets) + list(self.slates))
         lines = ["Encode presets (-preset), default {}:".format(self.default)]
         lines += ["  {:<{}}  .{:<4} {}".format(p.name, width, p.ext, p.notes)
                   for p in self.presets.values()]
@@ -133,6 +148,15 @@ class PresetFile:
                 settings += ["{}: {}".format(f, getattr(m, f)) for f in METADATA_PRESET_FIELDS[2:]
                              if getattr(m, f) not in (None, "")]
                 for item in settings:
+                    lines.append("  {:<{}}    {}".format("", width, item))
+        if self.slates:
+            lines += ["", "Slate presets (-slate), default {}:".format(self.default_slate or NO_SLATE)]
+            for sl in self.slates.values():
+                lines.append("  {:<{}}  {}".format(sl.name, width, sl.notes))
+                rows = ["title: " + sl.title] + (["subtitle: " + sl.subtitle] if sl.subtitle else [])
+                rows += ["{}: {}".format(k, v) for k, v in sl.fields.items()]
+                rows.append("thumbnail: " + sl.thumbnail)
+                for item in rows:
                     lines.append("  {:<{}}    {}".format("", width, item))
         if self.channel_preferences:
             lines += ["", "Automatic channel choice (channel_preferences), first found wins:"]
@@ -253,6 +277,35 @@ def _burnin_from_json(name, data, path):
                       font=data.get("font") or None, notes=str(notes))
 
 
+def _slate_from_json(name, data, path):
+    where = '{}: slate preset "{}"'.format(path, name)
+    if name == NO_SLATE:
+        raise TranscodeError('{}: "{}" is reserved (it switches the slate off).'.format(path, name))
+    if not isinstance(data, dict):
+        raise TranscodeError("{} must be an object.".format(where))
+    unknown = sorted(set(data) - set(SLATE_PRESET_FIELDS))
+    if unknown:
+        raise TranscodeError("{}: unknown field(s) {}; use {}.".format(
+            where, ", ".join(unknown), ", ".join(SLATE_PRESET_FIELDS)))
+    values = {}
+    for key in ("title", "subtitle"):
+        if data.get(key) is not None:
+            values[key] = str(data[key])
+    if data.get("fields") is not None:
+        values["fields"] = parse_fields(data["fields"], where)
+    if data.get("thumbnail") is not None:
+        values["thumbnail"] = parse_thumbnail(data["thumbnail"], where + ": thumbnail")
+    if data.get("hide_empty") is not None:
+        values["hide_empty"] = bool(data["hide_empty"])
+    values.update(style_values(data, where))
+    if data.get("font"):
+        values["font"] = str(data["font"])
+    notes = data.get("notes", "")
+    if isinstance(notes, list):
+        notes = " ".join(str(n) for n in notes)
+    return SlateSpec(name=name, notes=str(notes), **values)
+
+
 def _channel_preferences_from_json(data, path):
     """[["rgba.R", ...], "R,G,B", ...] -> list of channel lists."""
     if not isinstance(data, list) or not data:
@@ -308,9 +361,15 @@ def load_presets(path):
     if default_metadata and default_metadata != NO_BURNIN and default_metadata not in metadata_presets:
         raise TranscodeError('{}: default metadata preset "{}" is not defined.'.format(
             path, default_metadata))
+    slates = OrderedDict((name, _slate_from_json(name, sl, path))
+                         for name, sl in (data.get("slate_presets") or {}).items())
+    default_slate = data.get("default_slate") or ""
+    if default_slate and default_slate != NO_SLATE and default_slate not in slates:
+        raise TranscodeError('{}: default slate preset "{}" is not defined.'.format(path, default_slate))
     return PresetFile(str(path), default, presets, burnins,
                       "" if default_burnin == NO_BURNIN else default_burnin, channel_preferences,
-                      metadata_presets, "" if default_metadata == NO_BURNIN else default_metadata)
+                      metadata_presets, "" if default_metadata == NO_BURNIN else default_metadata,
+                      slates, "" if default_slate == NO_SLATE else default_slate)
 
 
 def transfer_for(colorout):

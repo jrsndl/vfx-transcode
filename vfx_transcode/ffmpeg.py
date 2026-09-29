@@ -13,7 +13,7 @@ from pathlib import Path
 from .errors import TranscodeError
 from . import metadata as md
 from .burnin import BURN_PLACES, DEFAULT_STYLE, BurnStyle, size_expression, size_pixels
-from .presets import colour_tags
+from .presets import colour_tags, transfer_for
 from .timecode import fps_display, fps_to_str
 from .tools import run_tool, split_args
 
@@ -71,11 +71,26 @@ class BurnContext:
     preset: str = ""
     date: str = ""
     header: dict = field(default_factory=dict)   # source header attributes, for {meta:NAME}
+    lead_frames: int = 0     # frames before the first picture (1 with a slate): the running
+                             # counters start that many frames earlier
+    movie_timecode: str = "" # timecode of the movie's first frame (the slate), if different
+    skip_lead: bool = True   # no burn-ins on the lead frames
+    tokens: dict = field(default_factory=dict)   # name keywords: {version_string}, {namesplit1} ...
+
+    @property
+    def counter_start(self):
+        return self.frame_start - self.lead_frames
+
+    @property
+    def running_timecode(self):
+        return self.movie_timecode or self.timecode
 
     def static_values(self):
-        return {"clean_name": self.clean_name, "frame_start": self.frame_start,
-                "frame_end": self.frame_end, "timecode": self.timecode,
-                "fps": fps_display(self.fps), "preset": self.preset, "date": self.date}
+        values = dict(self.tokens)
+        values.update({"clean_name": self.clean_name, "frame_start": self.frame_start,
+                       "frame_end": self.frame_end, "timecode": self.timecode,
+                       "fps": fps_display(self.fps), "preset": self.preset, "date": self.date})
+        return values
 
 
 BURN_KEYWORDS = ("clean_name", "current_frame", "frame_start", "frame_end", "tc",
@@ -111,9 +126,9 @@ def expand_burn_template(template, ctx):
             text += escape_text_expansion(md.meta_lookup(ctx.header, spec)[0])
         elif field_name == "current_frame":
             text += "%{frame_num}"
-            options.append(("start_number", str(ctx.frame_start)))
+            options.append(("start_number", str(ctx.counter_start)))
         elif field_name == "tc":
-            options += [("timecode", ctx.timecode), ("rate", fps_to_str(ctx.fps))]
+            options += [("timecode", ctx.running_timecode), ("rate", fps_to_str(ctx.fps))]
             tc_seen = True
         elif field_name in static:
             value = static[field_name]
@@ -156,6 +171,9 @@ def build_drawtext(template, place, ctx, font, style, picture_height=1080):
         if place[1] in "cr":
             options.append(("text_align", "C" if place[1] == "c" else "R"))   # ffmpeg 6.1+
     options += [("x", x), ("y", y)]
+    if ctx.lead_frames and ctx.skip_lead:
+        # the counters still run on the skipped frames, so the first picture shows the right values
+        options.append(("enable", "gte(n,{})".format(ctx.lead_frames)))
     return make_filter("drawtext", options)
 
 
@@ -173,6 +191,16 @@ def build_video_filter(cfg, ctx, scale_width):
     filters += [make_filter("scale", scale),
                 make_filter("pad", [("width", "ceil(iw/2)*2"), ("height", "ceil(ih/2)*2")]),
                 sar_filter(cfg.par_out_value)]         # also tags 1:1, so nothing is inherited
+    if cfg.preset.colour_tags and not cfg.ff_encode.strip():
+        # Tag the frames too, not only the encoder: newer ffmpeg (seen with 7.1) takes the
+        # colour tags from the frames, i.e. from the intermediate PNGs' gamma chunks
+        # ("unknown/linear"), and ignores -color_trc / -color_primaries.
+        filters.append(make_filter("setparams", [
+            ("range", "tv"), ("color_primaries", "bt709"),
+            ("color_trc", transfer_for(cfg.output_colour)), ("colorspace", "bt709")]))
+    if cfg.letterbox_plan is not None:
+        from .letterbox import filters as letterbox_filters
+        filters += letterbox_filters(cfg.letterbox_plan, ctx.lead_frames)   # not on the slate
     if cfg.ff_filter.strip():
         filters.append(cfg.ff_filter.strip())   # user's raw filtergraph, used as given
 

@@ -369,7 +369,8 @@ class PixelAspectTests(unittest.TestCase):
         self.assertTrue(parts[0].startswith("scale=w=iw:h=trunc(ih*1/2/2)*2"))   # reformat first
         sar = next(i for i, p in enumerate(parts) if p.startswith("setsar"))
         self.assertTrue(parts[sar - 1].startswith("pad="))                        # tag after pad
-        self.assertTrue(parts[sar + 1].startswith("drawtext"))
+        self.assertTrue(parts[sar + 1].startswith("setparams"))                   # frame colour tags
+        self.assertTrue(parts[sar + 2].startswith("drawtext"))
         self.assertIn("setsar=sar=1/1", vf)
         vf = ffmpeg.build_video_filter(_cfg(par_in=Fraction(2), par_out_value=Fraction(2)), _ctx(), 0)
         self.assertNotIn("trunc(ih", vf)                                           # same: no reformat
@@ -891,6 +892,388 @@ class CliTests(unittest.TestCase):
         self.assertEqual(resolve_path("./oiio/oiiotool.exe", "/app"), str(Path("/app/oiio/oiiotool.exe")))
         self.assertEqual(resolve_path("../tools/ffmpeg", "/app/bin"), str(Path("/app/tools/ffmpeg")))
         self.assertEqual(resolve_path("C:/ffmpeg.exe", "/app"), "C:/ffmpeg.exe")
+
+
+class SlateTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_slate_timecode(self):
+        from vfx_transcode.slate import slate_timecode
+        self.assertEqual(slate_timecode("00:00:41:17", 24), "00:00:41:16")
+        self.assertEqual(slate_timecode("01:00:00:00", 24), "00:59:59:23")
+        self.assertEqual(slate_timecode("00:00:00:00", 24), "00:00:00:00")   # never below zero
+        self.assertEqual(slate_timecode("00:00:01;00", 30), "00:00:00;29")   # keeps the separator
+
+    def test_parse_probe(self):
+        from vfx_transcode.slate import FrameFormat, parse_probe
+        self.assertEqual(parse_probe("  Stream #0:0: Video: png, rgb48be(pc), 1920x1080, 25 tbr"),
+                         FrameFormat(1920, 1080, "rgb48be"))
+        self.assertEqual(parse_probe("Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc, "
+                                     "bt470bg/unknown/unknown), 2048x858 [SAR 1:1 DAR 1024:429]"),
+                         FrameFormat(2048, 858, "yuvj420p"))
+        self.assertEqual(parse_probe("Stream #0:0: Video: tiff, rgb24, 1280x721, 25 tbr"),
+                         FrameFormat(1280, 721, "rgb24"))
+        self.assertIsNone(parse_probe("No such file"))
+
+    def test_pick_thumbnail(self):
+        from vfx_transcode.slate import pick_thumbnail
+        frames = [1001, 1002, 1003, 1005, 1006]
+        available = {f: "f" for f in frames}
+        self.assertEqual(pick_thumbnail("middle", frames, available), 1003)
+        self.assertEqual(pick_thumbnail("first", frames, available), 1001)
+        self.assertEqual(pick_thumbnail("last", frames, available), 1006)
+        self.assertEqual(pick_thumbnail("1004", frames, available), 1003)   # hole: nearest
+        self.assertIsNone(pick_thumbnail("none", frames, available))
+        self.assertEqual(pick_thumbnail("middle", frames, {1006: "f"}), 1006)  # failed frames
+
+    def test_fields_and_hide_empty(self):
+        from vfx_transcode import metadata as md
+        from vfx_transcode.slate import SlateSpec, apply_field_options, expand_all
+        fields = apply_field_options({"Date": "{date}", "Artist": "{meta:Artist|}", "Codec": "x"},
+                                     ["Codec=", "Notes=take 2", "Date=today"])
+        self.assertEqual(list(fields.items()),
+                         [("Date", "today"), ("Artist", "{meta:Artist|}"), ("Notes", "take 2")])
+        spec = SlateSpec(title="{clean_name}", fields=fields)
+        title, _sub, rows = expand_all(spec, {"clean_name": "sh010", "meta": {}}, md.expand)
+        self.assertEqual(title, "sh010")
+        self.assertEqual(rows, [("Date", "today"), ("Notes", "take 2")])    # no Artist: hidden
+        spec = SlateSpec(fields=fields, hide_empty=False)
+        self.assertEqual(len(expand_all(spec, {"meta": {}}, md.expand)[2]), 3)
+        with self.assertRaises(TranscodeError):
+            apply_field_options({}, ["no equals sign"])
+
+    def test_layout_fits_and_shrinks(self):
+        from vfx_transcode.slate import SlateSpec, layout
+        spec = SlateSpec()
+        rows = [("Row{}".format(i), "value") for i in range(8)]
+        lay = layout(spec, 1920, 1080, "title", "", rows, True)
+        self.assertTrue(all(t.y < 1080 * 0.93 for t in lay.texts))
+        self.assertTrue(lay.thumb[0] + lay.thumb[2] <= 1920 * 0.95 + 1)
+        many = [("Row{}".format(i), "value") for i in range(60)]
+        small = layout(spec, 1920, 1080, "title", "", many, False)
+        self.assertLess(small.texts[-1].size, lay.texts[-1].size)            # shrunk to fit
+        self.assertTrue(all(t.y < 1080 for t in small.texts))
+        long = layout(spec, 1920, 1080, "t", "", [("Notes", "word " * 80)], True)
+        self.assertGreater(len([t for t in long.texts if t.x == long.texts[-1].x]), 2)  # wrapped
+
+    def test_slate_command(self):
+        from vfx_transcode.slate import FrameFormat, SlateSpec, build_slate_command, canvas_size, layout
+        fmt = FrameFormat(1024, 429, "rgb48be")
+        cw, ch = canvas_size(fmt, Fraction(2))
+        self.assertEqual((cw, ch), (2048, 429))                   # laid out at display width
+        spec = SlateSpec()
+        lay = layout(spec, cw, ch, "it's 50%", "", [("Notes", "a:b, c;d")], True)
+        cmd = build_slate_command("ffmpeg", spec, fmt, Fraction(2), lay, "t.png", "s.png")
+        source = cmd[cmd.index("-f") + 3]
+        self.assertIn("s=2048x429", source)
+        self.assertTrue(source.endswith("format=rgb24"))        # odd heights stay odd
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("scale=w=1024:h=429", graph)               # squeezed back to stored pixels
+        self.assertTrue(graph.endswith("format=pix_fmts=rgb48be"))
+        self.assertIn("[thumb]", graph)
+        self.assertIn("50" + "\\" * 4 + "%", graph)             # % escaped for drawtext
+        no_thumb = build_slate_command("ffmpeg", spec, FrameFormat(1920, 1080, "rgb24"), Fraction(1),
+                                       layout(spec, 1920, 1080, "t", "", [], False), None, "s.png")
+        self.assertEqual(no_thumb.count("-i"), 1)
+        self.assertNotIn("scale=w=", no_thumb[no_thumb.index("-filter_complex") + 1])
+
+    def test_movie_size(self):
+        from vfx_transcode.slate import FrameFormat, movie_size
+        self.assertEqual(movie_size(FrameFormat(1280, 721, "rgb24"), Fraction(1), Fraction(1), 0),
+                         (1280, 722))
+        self.assertEqual(movie_size(FrameFormat(2048, 858, "rgb24"), Fraction(2), Fraction(1), 0),
+                         (2048, 428))
+        self.assertEqual(movie_size(FrameFormat(4096, 2160, "rgb24"), Fraction(1), Fraction(1), 1920),
+                         (1920, 1012))
+
+    def test_cli(self):
+        self.assertIsNone(self._cfg().slate)                    # default_slate none
+        cfg = self._cfg("-slate", "generic", "-slate_field", "Notes=v2", "-slate_field", "Codec=",
+                        "-slate_thumbnail", "first", "-slate_size", "30", "-slate_title", "T")
+        self.assertEqual(cfg.slate.name, "generic")
+        self.assertEqual(list(cfg.slate.fields)[-1], "Notes")
+        self.assertNotIn("Codec", cfg.slate.fields)
+        self.assertEqual((cfg.slate.thumbnail, cfg.slate.size, cfg.slate.title), ("first", "30", "T"))
+        self.assertFalse(cfg.slate.burnin)
+        plain = self._cfg("-slate_field", "Shot={clean_name}")  # slate options alone: plain slate
+        self.assertEqual(list(plain.slate.fields), ["Shot"])
+        self.assertIsNone(self._cfg("-slate", "none", "-slate_field", "A=b").slate)
+        for bad in (["-slate", "nope"], ["-slate", "generic", "-slate_thumbnail", "centre"],
+                    ["-slate", "generic", "-slate_size", "big"]):
+            with self.assertRaises(TranscodeError):
+                self._cfg(*bad)
+
+    def test_presets(self):
+        self.assertEqual(PRESETS.default_slate, "")
+        self.assertIn("generic", PRESETS.slates)
+        self.assertIn("Slate presets", PRESETS.describe())
+        with tempfile.TemporaryDirectory() as tmp:
+            base = json.loads((REPO / "presets.json").read_text(encoding="utf-8"))
+            for broken in ({"x": {"colour": "red"}}, {"x": {"thumbnail": "centre"}},
+                           {"x": {"background": "not a colour!"}}, {"none": {}}):
+                data = dict(base, slate_presets=broken)
+                path = Path(tmp) / "p.json"
+                path.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaises(TranscodeError):
+                    load_presets(path)
+            data = dict(base, default_slate="missing")
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(TranscodeError):
+                load_presets(path)
+
+    def test_burnin_counters_start_at_slate(self):
+        ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24), lead_frames=1,
+                                 movie_timecode="00:00:41:16")
+        options = dict(ffmpeg.expand_burn_template("{current_frame}", ctx))
+        self.assertEqual(options["start_number"], "1000")
+        self.assertEqual(dict(ffmpeg.expand_burn_template("TC {tc}", ctx))["timecode"], "00:00:41:16")
+        self.assertIn("00:00:41:17", dict(ffmpeg.expand_burn_template("{timecode}", ctx))["text"])
+        style = ffmpeg.DEFAULT_STYLE
+        self.assertIn("enable=gte(n\\,1)", ffmpeg.build_drawtext("{current_frame}", "br", ctx, "", style))
+        ctx.skip_lead = False
+        self.assertNotIn("enable", ffmpeg.build_drawtext("{current_frame}", "br", ctx, "", style))
+        plain = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24))
+        self.assertEqual(dict(ffmpeg.expand_burn_template("{current_frame}", plain))["start_number"], "1001")
+        self.assertNotIn("enable", ffmpeg.build_drawtext("x", "br", plain, "", style))
+
+
+class SlateStyleTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def _layout(self, **style):
+        from vfx_transcode.slate import SlateSpec, layout
+        spec = SlateSpec(**style)
+        rows = [("Date", "2026-09-29"), ("Frames", "1001 - 1010")]
+        return layout(spec, 1920, 1080, "sh010", "comp", rows, True)
+
+    def test_centred_by_default(self):
+        lay = self._layout()
+        top = min(t.y for t in lay.texts)
+        bottom = max(lay.thumb[1] + lay.thumb[3], max(t.y + t.size for t in lay.texts))
+        self.assertAlmostEqual(top, 1080 - bottom, delta=0.03 * 1080)    # same space above and below
+        top_aligned = self._layout(valign="top")
+        self.assertLess(min(t.y for t in top_aligned.texts), top)
+
+    def test_scale(self):
+        full, half = self._layout(), self._layout(scale=0.5)
+        for h, f in zip(half.texts, full.texts):
+            self.assertAlmostEqual(h.size, f.size / 2, delta=1)
+        self.assertAlmostEqual(half.thumb[2], full.thumb[2] / 2, delta=2)
+        # the half-size layout sits in the middle of the picture
+        xs = [t.x for t in half.texts]
+        self.assertGreater(min(xs), 1920 * 0.25)
+        self.assertLess(half.thumb[0] + half.thumb[2], 1920 * 0.75 + 2)
+        self.assertEqual((half.width, half.height), (1920, 1080))          # canvas unchanged
+        pixels = self._layout(size="40", scale=0.5)
+        self.assertEqual(pixels.texts[-1].size, 20)                        # pixel sizes scale too
+
+    def test_sizes_and_colours(self):
+        lay = self._layout(title_size="10%", subtitle_size="20", size="30",
+                           label_color="#444444", value_color="yellow", title_color="red",
+                           subtitle_color="blue")
+        by_text = {t.text: t for t in lay.texts}
+        self.assertEqual((by_text["sh010"].size, by_text["sh010"].color), (108, "red"))
+        self.assertEqual((by_text["comp"].size, by_text["comp"].color), (20, "blue"))
+        self.assertEqual((by_text["Date"].size, by_text["Date"].color), (30, "#444444"))
+        self.assertEqual(by_text["2026-09-29"].color, "yellow")
+
+    def test_parse(self):
+        from vfx_transcode.slate import parse_scale, parse_valign, style_values
+        self.assertEqual([parse_scale(v) for v in ("50%", "50", "0.5", "1", "100%")],
+                         [0.5, 0.5, 0.5, 1.0, 1.0])
+        for bad in ("0", "150%", "big", "2%"):
+            with self.assertRaises(TranscodeError):
+                parse_scale(bad)
+        self.assertEqual(parse_valign("Centre"), "center")
+        with self.assertRaises(TranscodeError):
+            parse_valign("bottom")
+        self.assertEqual(style_values({"color": "red"}, "x"), {"title_color": "red", "value_color": "red"})
+        with self.assertRaises(TranscodeError):
+            style_values({"label_color": "not a colour"}, "x")
+
+    def test_cli(self):
+        cfg = self._cfg("-slate", "generic", "-slate_scale", "50%", "-slate_valign", "top",
+                        "-slate_title_size", "4%", "-slate_subtitle_size", "30",
+                        "-slate_size", "2%", "-slate_value_color", "#eeeeee",
+                        "-slate_label_color", "#555555",
+                        "-slate_style", "title_color=yellow,background=#000000",
+                        "-slate_style", "label_color=#666666")
+        sl = cfg.slate
+        self.assertEqual((sl.scale, sl.valign, sl.title_size, sl.subtitle_size, sl.size),
+                         (0.5, "top", "4%", "30", "2%"))
+        self.assertEqual((sl.value_color, sl.label_color, sl.title_color, sl.background),
+                         ("#eeeeee", "#666666", "yellow", "#000000"))      # -slate_style wins
+        self.assertEqual(self._cfg("-slate_scale", "80%").slate.scale, 0.8)   # plain slate
+        for bad in (["-slate", "generic", "-slate_style", "font=x.ttf"],
+                    ["-slate", "generic", "-slate_style", "nope=1"],
+                    ["-slate", "generic", "-slate_valign", "bottom"]):
+            with self.assertRaises(TranscodeError):
+                self._cfg(*bad)
+
+    def test_preset_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = json.loads((REPO / "presets.json").read_text(encoding="utf-8"))
+            path = Path(tmp) / "p.json"
+            data = dict(base, slate_presets={"x": {"scale": "60%", "valign": "top", "color": "red",
+                                                   "label_color": "#333333", "title_size": 50}})
+            path.write_text(json.dumps(data), encoding="utf-8")
+            sl = load_presets(path).slates["x"]
+            self.assertEqual((sl.scale, sl.valign, sl.title_color, sl.value_color, sl.label_color,
+                              sl.title_size), (0.6, "top", "red", "red", "#333333", "50"))
+            data["slate_presets"] = {"x": {"scale": "300%"}}
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(TranscodeError):
+                load_presets(path)
+
+
+class FrameColourTagTests(unittest.TestCase):
+    def _filter(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        cfg = cli.config_from_args(ns, PRESETS)
+        ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24))
+        return ffmpeg.build_video_filter(cfg, ctx, 0)
+
+    def test_frames_tagged_like_the_encoder(self):
+        self.assertIn("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                      self._filter())
+        self.assertIn("color_trc=iec61966-2-1", self._filter("-co", "out_srgb"))
+        self.assertIn("color_trc=iec61966-2-1", self._filter("-display", "sRGB - Display"))
+        self.assertNotIn("setparams", self._filter("-ff_encode", "{videofilter} -c:v libx264"))
+
+
+class SlateRuleTests(unittest.TestCase):
+    def _graph(self, **style):
+        from vfx_transcode.slate import FrameFormat, SlateSpec, build_slate_command, layout
+        spec = SlateSpec(**style)
+        lay = layout(spec, 1920, 1080, "t", "", [("A", "b")], True)
+        cmd = build_slate_command("ffmpeg", spec, FrameFormat(1920, 1080, "rgb24"), Fraction(1),
+                                  lay, "t.png", "s.png")
+        return cmd[cmd.index("-filter_complex") + 1]
+
+    def test_no_thumbnail_frame_and_rule_off_by_default(self):
+        graph = self._graph()
+        self.assertNotIn("pad=", graph)
+        self.assertNotIn("drawbox", graph)
+        self.assertIn("drawbox", self._graph(rule=True))
+
+    def test_rule_options(self):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-slate", "generic", "-slate_rule"])
+        self.assertTrue(cli.config_from_args(ns, PRESETS).slate.rule)
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-slate", "generic",
+                                                   "-slate_style", "rule=1"])
+        self.assertTrue(cli.config_from_args(ns, PRESETS).slate.rule)
+        self.assertFalse(PRESETS.slates["generic"].rule)
+
+
+class LetterboxTests(unittest.TestCase):
+    def test_parse(self):
+        from vfx_transcode.letterbox import parse_ratio, parse_rgba
+        for text, value in (("2.39", 2.39), ("2.39:1", 2.39), ("16:9", 16 / 9), ("16/9", 16 / 9),
+                            ("1.85", 1.85), ("239/100", 2.39)):
+            self.assertAlmostEqual(parse_ratio(text), value)
+        for bad in ("wide", "0", "2:0", "-1"):
+            with self.assertRaises(TranscodeError):
+                parse_ratio(bad)
+        self.assertEqual(parse_rgba("0,0,0,128", "x"), (0, 0, 0, 128))
+        self.assertEqual(parse_rgba("255, 0, 0", "x"), (255, 0, 0, 255))
+        self.assertEqual(parse_rgba("#ff000080", "x"), (255, 0, 0, 128))
+        for bad in ("0,0", "0,0,0,256", "red", "1,2,3,4,5"):
+            with self.assertRaises(TranscodeError):
+                parse_rgba(bad, "x")
+
+    def test_plan(self):
+        from vfx_transcode.letterbox import LetterboxSpec, plan
+        lb = plan(LetterboxSpec(ratio=2.39), 1920, 1080)
+        self.assertEqual((lb.kind, lb.bar), ("letterbox", 138))        # (1080 - 1920/2.39) / 2
+        self.assertEqual([(b.x, b.y, b.w, b.h) for b in lb.boxes],
+                         [("0", "0", "iw", "138"), ("0", "ih-138", "iw", "138")])
+        self.assertEqual(lb.boxes[0].color, "0x000000@1")
+        pb = plan(LetterboxSpec(ratio=4 / 3), 1920, 1080)
+        self.assertEqual((pb.kind, pb.bar), ("pillarbox", 240))
+        self.assertEqual(pb.boxes[1].x, "iw-240")
+        self.assertEqual(plan(LetterboxSpec(ratio=16 / 9), 1920, 1080).kind, "none")
+        # anamorphic: 2048x858 at 2:1 displays 4.77:1, so 2.39 is narrower -> pillarbox
+        ana = plan(LetterboxSpec(ratio=2.39), 2048, 858, Fraction(2))
+        self.assertEqual((ana.kind, ana.bar), ("pillarbox", 511))
+        lined = plan(LetterboxSpec(ratio=2.39, fill=(0, 0, 0, 128), line=4,
+                                   line_color=(255, 0, 0, 255)), 1920, 1080)
+        self.assertEqual(len(lined.boxes), 4)
+        self.assertEqual((lined.boxes[2].y, lined.boxes[2].h), ("134", "4"))    # inner edge
+        self.assertEqual(lined.boxes[2].color, "0xFF0000@1")
+        self.assertEqual(lined.boxes[0].color, "0x000000@0.502")
+
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_cli_and_filter(self):
+        from vfx_transcode.letterbox import plan
+        self.assertIsNone(self._cfg().letterbox)
+        self.assertIsNone(self._cfg("-letterbox_ratio", "2").letterbox)        # off: ignored
+        cfg = self._cfg("-letterbox", "-letterbox_ratio", "1.85", "-letterbox_color", "0,0,0,100",
+                        "-letterbox_line", "2", "-letterbox_line_color", "#ffffff", "-burn_tl", "x")
+        self.assertAlmostEqual(cfg.letterbox.ratio, 1.85)
+        self.assertEqual((cfg.letterbox.fill, cfg.letterbox.line), ((0, 0, 0, 100), 2))
+        cfg.letterbox_plan = plan(cfg.letterbox, 1920, 1080)
+        ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24), lead_frames=1)
+        vf = ffmpeg.build_video_filter(cfg, ctx, 0)
+        self.assertLess(vf.index("drawbox"), vf.index("drawtext"))            # under the burn-ins
+        self.assertIn("enable=gte(n\\,1)", vf[vf.index("drawbox"):vf.index("drawtext")])  # not on the slate
+        self.assertEqual(self._cfg("-letterbox").letterbox.ratio, 2.39)        # default ratio
+        with self.assertRaises(TranscodeError):
+            self._cfg("-letterbox", "-letterbox_line", "-1")
+
+
+class NameKeywordTests(unittest.TestCase):
+    def test_splits(self):
+        from vfx_transcode.names import name_tokens
+        t = name_tokens("AA_BBB_C_DD")
+        self.assertEqual([t["namesplit{}".format(i)] for i in range(1, 6)], ["AA", "BBB", "C", "DD", ""])
+        self.assertEqual([t["namesplit-{}".format(i)] for i in range(1, 6)], ["DD", "C", "BBB", "AA", ""])
+        self.assertEqual(t["namesplit9"], "")
+        self.assertEqual(t["namesplit-9"], "")
+        self.assertEqual(name_tokens("")["namesplit1"], "")
+
+    def test_version(self):
+        from vfx_transcode.names import name_tokens, parse_version
+        self.assertEqual(parse_version("sh010_comp_v007"), ("007", "7"))
+        self.assertEqual(parse_version("sh010_comp_v000"), ("000", "0"))
+        self.assertEqual(parse_version("sh010_comp_v120"), ("120", "120"))
+        self.assertEqual(parse_version("sh010_comp"), ("", ""))
+        self.assertEqual(parse_version("v001_plate_v003"), ("003", "3"))           # last one wins
+        self.assertEqual(parse_version("sh010_comp_v0042", r"_v(\d+)"), ("0042", "42"))
+        self.assertEqual(parse_version("sh010.V12", r"[vV]\d+"), ("V12", "V12"))  # no group: match
+        self.assertEqual(name_tokens("a_v005")["version_number"], "5")
+
+    def test_used_everywhere(self):
+        from vfx_transcode import metadata as md
+        from vfx_transcode.names import name_tokens
+        tokens = name_tokens("sh010_comp_v007")
+        ctx = ffmpeg.BurnContext("sh010_comp_v007", 1001, 1010, "00:00:41:17", Fraction(24),
+                                 tokens=tokens)
+        text = dict(ffmpeg.expand_burn_template("{namesplit1} {namesplit-2} v{version_number}", ctx))["text"]
+        self.assertEqual(text, "sh010 comp v7")
+        self.assertEqual(md.expand("{namesplit-1}/{version_string}", tokens), "v007/007")
+        self.assertEqual(md.expand("{version_number:03d}", tokens), "7")            # no crash
+
+    def test_cli(self):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-version_regex", r"_V(\d+)"])
+        self.assertEqual(cli.config_from_args(ns, PRESETS).version_regex, r"_V(\d+)")
+        with self.assertRaises(TranscodeError):
+            ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-version_regex", "(("])
+            cli.config_from_args(ns, PRESETS)
+
+    def test_container_from_output_name(self):
+        def ext(*argv):
+            ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+            return cli.config_from_args(ns, PRESETS).ff_out_ext
+        self.assertEqual(ext(), "mp4")
+        self.assertEqual(ext("-o", "out/x.mov"), "mov")
+        self.assertEqual(ext("-o", "x.mov", "-ff_out_ext", "mxf"), "mxf")
 
 
 if __name__ == "__main__":

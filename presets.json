@@ -32,6 +32,9 @@
     "            {timecode} (start timecode) {fps} {date} {preset} (encode preset name)",
     "            {meta:ATTR} any attribute of the first frame's EXR header, e.g. {meta:owner},",
     "            {meta:nuke/input/filename}; {meta:ATTR|fallback} if it may be missing",
+    "            {version_string} {version_number} (from -version_regex, default _v(\\d\\d\\d)),",
+    "            {namesplit1}..{namesplit9} / {namesplit-1}..{namesplit-9}: the name split at _",
+    "            (these name keywords work in slate, metadata tags and -reelid as well)",
     "  \\n in a text starts a new line (lines follow the place: left, centred or right-aligned).",
     "  Text after {tc} in the same place is dropped: ffmpeg always puts the timecode last.",
     "  Style layers, later wins: defaults < preset < preset place < -burn_color/-burn_opacity/",
@@ -56,11 +59,40 @@
     "  timecode_source  counter | arg | exr, like -timecode_source",
     "  All fields are optional. Command-line options override the preset field by field; -metadata",
     "  KEY=VALUE adds or replaces one tag, and -metadata KEY= removes one.",
-    "  Tag order, later wins: copied header < encode preset metadata < metadata preset tags < -metadata."
+    "  Tag order, later wins: copied header < encode preset metadata < metadata preset tags < -metadata.",
+    "",
+    "SLATE PRESETS (-slate NAME), default: default_slate (\"none\" = no slate)",
+    "  One information frame before the first picture: frame start-1, timecode start-1",
+    "  (00:00:00:00 stays 00:00:00:00, the pictures then start at 00:00:00:01). Same size,",
+    "  pixel format and pixel aspect as the pictures. Burn-ins are not drawn on it (-slate_burnin 1).",
+    "  notes        free text, shown in --help",
+    "  title        big first line (default {clean_name}); subtitle: smaller line under it",
+    "  fields       {\"Label\": \"value\", ...} rows in this order; values use the keywords below",
+    "  hide_empty   true (default): rows whose value comes out empty are left out, so",
+    "               \"{meta:Artist|}\" shows the row only when the EXR header has an Artist",
+    "  thumbnail    middle (default) | first | last | none | a frame number",
+    "  title_size, subtitle_size, size   text sizes of title (5%), subtitle (3.2%) and rows",
+    "               (2.5%): percent of the picture height, or pixels; all shrink if rows do not fit",
+    "  scale        whole layout incl. thumbnail: \"100%\" (default), \"50%\" = half size, centred",
+    "  valign       center (default) or top",
+    "  background   canvas colour (default #1b1b1b)",
+    "  title_color, subtitle_color, value_color   white, #b4b4b4, white",
+    "  label_color  row labels / field names (#7a7a7a); color: shortcut for title_color and value_color",
+    "  rule         true = a line under the title (default false), in line_color (#5a5a5a)",
+    "  font         optional font file (default: the burn-in font)",
+    "  Keywords: {clean_name} {frame_start} {frame_end} {frames} (count) {timecode} (first",
+    "            picture) {timecode_end} {duration} {fps} {width} {height} (movie size) {par}",
+    "            {colour} (colour transform) {reel} (reel name) {preset} {date} {user} {input}",
+    "            {meta:ATTR} / {meta:ATTR|fallback}, {version_string} {version_number} {namesplitN}.",
+    "            \\n starts a new line.",
+    "  -slate_title, -slate_subtitle, -slate_field \"Label=value\", -slate_scale, -slate_valign,",
+    "  -slate_*_size, -slate_value_color, -slate_label_color, -slate_rule and -slate_style override a preset;",
+    "  -slate_field \"Label=\" removes a row."
   ],
   "default_encode": "h264",
   "default_burnin": "none",
   "default_metadata": "none",
+  "default_slate": "none",
   "channel_preferences": [
     "rgba.R,rgba.G,rgba.B,rgba.A",
     "rgba.R,rgba.G,rgba.B",
@@ -221,6 +253,50 @@
       },
       "copy": "all,-husk:*,-nuke/*,-MEDIA_PATH",
       "reelid_source": "auto"
+    }
+  },
+  "slate_presets": {
+    "generic": {
+      "notes": "Internal review slate: shot, frames, timecode, format, colour, artist if known.",
+      "title": "{clean_name}",
+      "subtitle": "{meta:ImageDescription|}",
+      "fields": {
+        "Date": "{date}",
+        "Artist": "{meta:Artist|}",
+        "Frames": "{frame_start} - {frame_end}  ({frames})",
+        "Timecode": "{timecode} - {timecode_end}",
+        "Duration": "{duration} @ {fps} fps",
+        "Format": "{width} x {height}, pixel aspect {par}",
+        "Colour": "{colour}",
+        "Codec": "{preset}",
+        "Reel": "{reel}"
+      },
+      "thumbnail": "middle"
+    },
+    "client": {
+      "notes": "Client delivery: title, date and length only; no internal paths or frame numbers.",
+      "title": "{clean_name}",
+      "fields": {
+        "Date": "{date}",
+        "Duration": "{duration} @ {fps} fps",
+        "Notes": ""
+      },
+      "thumbnail": "middle",
+      "size": "2.6%"
+    },
+    "editorial": {
+      "notes": "Editorial / conform: reel name and source timecode in and out, no thumbnail.",
+      "title": "{clean_name}",
+      "fields": {
+        "Reel": "{reel}",
+        "TC in": "{timecode}",
+        "TC out": "{timecode_end}",
+        "Frames": "{frame_start} - {frame_end}  ({frames})",
+        "FPS": "{fps}",
+        "Format": "{width} x {height}, pixel aspect {par}",
+        "Date": "{date}"
+      },
+      "thumbnail": "none"
     }
   }
 }

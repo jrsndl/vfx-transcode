@@ -9,6 +9,7 @@ were replaced by a neighbouring frame, 130 interrupted.
 
 import argparse
 import datetime
+import getpass
 import logging
 import re
 import shutil
@@ -21,7 +22,9 @@ from pathlib import Path, PureWindowsPath
 from . import __version__
 from .channels import pick_channels
 from .aspect import output_par, par_display, parse_par, resolve_par
-from .burnin import BURN_PLACES, PLACE_NAMES, BurnStyle, parse_style_option, resolve_styles, style_from_values
+from dataclasses import replace
+from .burnin import (BURN_PLACES, PLACE_NAMES, BurnStyle, parse_size, parse_style_option,
+                     resolve_styles, style_from_values)
 from .config import Config
 from .deep import parse_zrange, plan_depth_view
 from .errors import TranscodeError
@@ -30,7 +33,14 @@ from .oiio import convert_sequence
 from .oiio_info import get_image_info, write_info_json
 from . import metadata as md
 from .presets import DEFAULT_PRESETS_FILE, load_presets
+from .letterbox import (DEFAULT_FILL as LB_FILL, DEFAULT_LINE_COLOR as LB_LINE_COLOR,
+                        DEFAULT_RATIO as LB_DEFAULT_RATIO, LetterboxSpec, parse_ratio, parse_rgba,
+                        plan as letterbox_plan)
+from .names import DEFAULT_VERSION_REGEX, compile_version_regex, name_tokens
 from .sequence import fill_holes, find_sequence, format_frames
+from .slate import (SLATE_STYLE_FIELDS, SlateSpec, apply_field_options, movie_size,
+                    parse_thumbnail, pick_thumbnail, probe_frames, render_slate, slate_timecode,
+                    style_values)
 from .timecode import (fps_display, fps_from_attribs, frame_to_tc, nominal_fps,
                        offset_timecode, parse_fps, timecode_from_attribs, validate_timecode)
 from .tools import app_dir, resolve_path, resolve_tool, run_tool, split_args
@@ -161,7 +171,14 @@ def build_parser(presets=None, presets_error=None):
          "Write the timecode to the output (timecode track in mov/mp4/mxf, a tag otherwise)")
     g.add_argument("-metadata", action="append", default=[], metavar="KEY=VALUE",
                    help="Write a metadata tag; repeatable; KEY= removes a preset's tag. Values may use {clean_name} "
-                        "{frame_start} {frame_end} {timecode} {fps} {preset} {date} {meta:ATTR}")
+                        "{frame_start} {frame_end} {timecode} {fps} {preset} {date} {meta:ATTR} and the name "
+                        "keywords {version_number} {namesplit1} ... (see -version_regex)")
+    g.add_argument("-version_regex", default=DEFAULT_VERSION_REGEX, metavar="REGEX",
+                   help="Finds the version in the sequence name for {version_string} (group 1, "
+                        "e.g. 007) and {version_number} (7). Default %(default)s. The name "
+                        "keywords {namesplit1}..{namesplit9} and {namesplit-1}..{namesplit-9} are "
+                        "the name's parts split at _, counted from the start or the end; all of "
+                        "them work in burn-ins, slate, metadata and -reelid")
     g.add_argument("-metadata_preset", default=None, metavar="NAME",
                    help='Metadata preset from the presets file (tags, copy rules, reel name and '
                         'timecode settings), or "none". The options below override its values')
@@ -203,8 +220,63 @@ def build_parser(presets=None, presets_error=None):
         g.add_argument("-burn_" + place, default=None, metavar="TEXT",
                        help='Burn-in {} text{} ("" clears the preset\'s). Keywords: {{clean_name}} '
                             "{{current_frame}} {{frame_start}} {{frame_end}} {{tc}} {{timecode}} "
-                            "{{fps}} {{date}} {{preset}} {{meta:ATTR}}".format(
+                            "{{fps}} {{date}} {{preset}} {{meta:ATTR}} {{version_number}} {{namesplit1}} ...".format(
                                 PLACE_NAMES[place], ", centred" if place in ("tc", "bc") else ""))
+
+    g = p.add_argument_group("slate")
+    g.add_argument("-slate", default=None, metavar="NAME",
+                   help='Slate preset from the presets file, or "none" (default: the file\'s '
+                        "default_slate). The slate is one frame before the first picture: frame "
+                        "start-1, timecode start-1 (never below 00:00:00:00), same size and pixel "
+                        "aspect as the pictures")
+    g.add_argument("-slate_title", default=None, metavar="TEXT",
+                   help="Slate title; keywords as in the fields. Default: the preset's, else {clean_name}")
+    g.add_argument("-slate_subtitle", default=None, metavar="TEXT", help="Smaller line under the title")
+    g.add_argument("-slate_field", action="append", default=[], metavar="LABEL=TEXT",
+                   help='Add or replace a slate row, e.g. "Notes=first comp pass"; "LABEL=" '
+                        "removes one. Repeatable. Keywords: {clean_name} {frame_start} {frame_end} "
+                        "{frames} {timecode} {timecode_end} {duration} {fps} {width} {height} {par} "
+                        "{colour} {reel} {preset} {date} {user} {input} {meta:ATTR} {version_string} "
+                        "{version_number} {namesplit1}..{namesplit-9}")
+    g.add_argument("-slate_thumbnail", default=None, metavar="middle|first|last|none|FRAME",
+                   help="Shot thumbnail on the slate. Default: the preset's, else middle")
+    g.add_argument("-slate_scale", default=None, metavar="PERCENT",
+                   help="Size of the whole slate layout (text, spacing, thumbnail): 100%% "
+                        "(default) fills the picture, 50%% is half as big, centred")
+    g.add_argument("-slate_valign", default=None, metavar="center|top",
+                   help="Vertical placement of the slate content. Default center")
+    g.add_argument("-slate_title_size", default=None, metavar="SIZE",
+                   help="Title text size: percent of the picture height (5%% default) or pixels")
+    g.add_argument("-slate_subtitle_size", default=None, metavar="SIZE",
+                   help="Subtitle text size (3.2%% default)")
+    g.add_argument("-slate_size", default=None, metavar="SIZE",
+                   help="Row text size, labels and values (2.5%% default)")
+    g.add_argument("-slate_value_color", default=None, metavar="COLOR",
+                   help="Colour of the row values (white default)")
+    g.add_argument("-slate_label_color", default=None, metavar="COLOR",
+                   help="Colour of the row labels, the field names (#7a7a7a default)")
+    g.add_argument("-slate_style", action="append", default=[], metavar="KEY=VALUE,...",
+                   help="Any slate style setting, e.g. \"title_color=yellow,background=#000000\". "
+                        "Keys: " + ", ".join(k for k in SLATE_STYLE_FIELDS if k != "font") +
+                        " (color = title and value colour). Repeatable; wins over the options above")
+    flag(g, "-slate_rule", None, "Line under the slate title. Default: the preset's, else 0")
+    flag(g, "-slate_burnin", False, "Draw the burn-ins on the slate frame too")
+
+    g = p.add_argument_group("letterbox")
+    flag(g, "-letterbox", False, "Cover part of the picture with bars to show -letterbox_ratio. "
+                                 "Not drawn on the slate; burn-ins go on top")
+    g.add_argument("-letterbox_ratio", default=None, metavar="RATIO",
+                   help="Target ratio: 2.39, 2.39:1, 1.85, 16:9 ... Wider than the movie's display "
+                        "ratio: bars top and bottom (letterbox); narrower: bars left and right "
+                        "(pillarbox). Default " + LB_DEFAULT_RATIO)
+    g.add_argument("-letterbox_color", default=None, metavar="R,G,B,A",
+                   help="Bar colour, 0-255 per channel; alpha below 255 makes the bars see-through, "
+                        "e.g. 0,0,0,160. Default 0,0,0,255")
+    g.add_argument("-letterbox_line", type=int, default=None, metavar="PIXELS",
+                   help="Thickness of a line on the inner edge of each bar, in movie pixels. "
+                        "0 (default) = no line")
+    g.add_argument("-letterbox_line_color", default=None, metavar="R,G,B,A",
+                   help="Line colour, 0-255 per channel. Default 255,255,255,255")
 
     g = p.add_argument_group("encoding (ffmpeg)")
     flag(g, "-skipffmpeg", False, "Only convert the EXRs; implies -temp_keep 1")
@@ -212,7 +284,7 @@ def build_parser(presets=None, presets_error=None):
                    help="Encode preset from the presets file, see the list below. "
                         "Default: the file's \"default\"")
     g.add_argument("-presets_file", default=DEFAULT_PRESETS_FILE,
-                   help="JSON file with the encode presets, burn-in presets and channel "
+                   help="JSON file with the encode, burn-in, metadata and slate presets and channel "
                         "preferences. Default ./presets.json (relative to the application)")
     g.add_argument("-ff_filter", default="",
                    help="Extra ffmpeg video filters, inserted before the burn-ins")
@@ -242,6 +314,78 @@ def _pick(cli_value, preset, attr, default):
     return default
 
 
+SLATE_OPTIONS = ("slate_title", "slate_subtitle", "slate_thumbnail", "slate_size", "slate_scale",
+                 "slate_valign", "slate_title_size", "slate_subtitle_size", "slate_value_color",
+                 "slate_label_color")
+
+
+def parse_slate_style(items):
+    """-slate_style "key=value,key=value" (repeatable) -> {key: value}."""
+    values = {}
+    for item in items:
+        for pair in filter(None, (p.strip() for p in item.split(","))):
+            key, sep, value = pair.partition("=")
+            key = key.strip().lower()
+            if not sep or key not in SLATE_STYLE_FIELDS or key == "font":
+                raise TranscodeError('-slate_style "{}": use KEY=VALUE with KEY one of {}.'.format(
+                    item, ", ".join(k for k in SLATE_STYLE_FIELDS if k != "font")))
+            values[key] = value.strip()
+    return values
+
+
+def slate_from_args(ns, presets):
+    """The slate to draw (preset + command-line overrides), or None."""
+    spec = presets.get_slate(ns.slate if ns.slate is not None else presets.default_slate)
+    given = [o for o in SLATE_OPTIONS if getattr(ns, o) is not None] + \
+        (["slate_field"] if ns.slate_field else []) + (["slate_burnin"] if ns.slate_burnin else []) + \
+        (["slate_style"] if ns.slate_style else []) + (["slate_rule"] if ns.slate_rule is not None else [])
+    if spec is None:
+        if given and ns.slate is None:
+            spec = SlateSpec()          # -slate_field etc. alone: a plain slate
+        else:
+            if given:
+                log.warning("-%s ignored: -slate none.", given[0])
+            return None
+    changes = {"fields": apply_field_options(spec.fields, ns.slate_field),
+               "burnin": bool(ns.slate_burnin)}
+    if ns.slate_title is not None:
+        changes["title"] = ns.slate_title
+    if ns.slate_subtitle is not None:
+        changes["subtitle"] = ns.slate_subtitle
+    if ns.slate_thumbnail is not None:
+        changes["thumbnail"] = parse_thumbnail(ns.slate_thumbnail)
+    options = {"size": ns.slate_size, "title_size": ns.slate_title_size,
+               "subtitle_size": ns.slate_subtitle_size, "value_color": ns.slate_value_color,
+               "label_color": ns.slate_label_color, "scale": ns.slate_scale,
+               "valign": ns.slate_valign, "rule": ns.slate_rule}
+    changes.update(style_values(options, "command line"))
+    changes.update(style_values(parse_slate_style(ns.slate_style), "-slate_style"))
+    if spec.font:
+        changes["font"] = resolve_path(spec.font, app_dir())
+    return replace(spec, **changes)
+
+
+LETTERBOX_OPTIONS = ("letterbox_ratio", "letterbox_color", "letterbox_line", "letterbox_line_color")
+
+
+def letterbox_from_args(ns):
+    given = [o for o in LETTERBOX_OPTIONS if getattr(ns, o) is not None]
+    if not ns.letterbox:
+        if given:
+            log.warning("-%s ignored: the letterbox is off (-letterbox 1 turns it on).", given[0])
+        return None
+    ratio_text = ns.letterbox_ratio or LB_DEFAULT_RATIO
+    line = ns.letterbox_line or 0
+    if line < 0:
+        raise TranscodeError("-letterbox_line must be 0 or more pixels.")
+    return LetterboxSpec(
+        ratio=parse_ratio(ratio_text), ratio_text=ratio_text.strip(),
+        fill=parse_rgba(ns.letterbox_color, "-letterbox_color") if ns.letterbox_color else LB_FILL,
+        line=line,
+        line_color=(parse_rgba(ns.letterbox_line_color, "-letterbox_line_color")
+                    if ns.letterbox_line_color else LB_LINE_COLOR))
+
+
 def config_from_args(ns, presets):
     try:
         fps_arg = parse_fps(ns.fps) if ns.fps else None
@@ -253,6 +397,7 @@ def config_from_args(ns, presets):
             re.compile(ns.reelid_pattern)
         except re.error as exc:
             raise TranscodeError("-reelid_pattern is not a valid regular expression: {}".format(exc))
+    compile_version_regex(ns.version_regex)
     if ns.par_out.strip().lower() not in ("same", "square"):
         parse_par(ns.par_out, "-par_out")
     preset = presets.get(ns.preset or presets.default)
@@ -279,6 +424,8 @@ def config_from_args(ns, presets):
     burn_font = ns.burn_font or (burn_preset.font if burn_preset else None) or DEFAULT_BURN_FONT
     if ns.deep_zrange:
         parse_zrange(ns.deep_zrange)   # validate early
+    slate = slate_from_args(ns, presets)
+    letterbox = letterbox_from_args(ns)
     base = app_dir()
     skip_ffmpeg = ns.skipffmpeg
     return Config(
@@ -330,11 +477,15 @@ def config_from_args(ns, presets):
         burn_font=resolve_path(burn_font, base),
         burn=burn,
         burn_styles=burn_styles,
+        slate=slate,
+        letterbox=letterbox,
+        version_regex=ns.version_regex,
         skip_ffmpeg=skip_ffmpeg,
         ff_filter=ns.ff_filter,
         preset=preset,
         ff_encode=ns.ff_encode,
-        ff_out_ext=(ns.ff_out_ext or preset.ext).lstrip("."),
+        # the container: -ff_out_ext, else the -o file's extension, else the preset's
+        ff_out_ext=(ns.ff_out_ext or Path(ns.o).suffix or preset.ext).lstrip("."),
     )
 
 
@@ -475,9 +626,11 @@ def resolve_timecode(cfg, seq, info, header_frame=None):
 
 
 def metadata_context(cfg, seq, timecode):
-    return {"clean_name": seq.clean_name, "frame_start": seq.start, "frame_end": seq.end,
-            "timecode": timecode, "fps": fps_display(cfg.fps), "preset": cfg.preset.name,
-            "date": today(), "meta": cfg.header_attribs}
+    context = dict(cfg.name_tokens)
+    context.update({"clean_name": seq.clean_name, "frame_start": seq.start, "frame_end": seq.end,
+                    "timecode": timecode, "fps": fps_display(cfg.fps), "preset": cfg.preset.name,
+                    "date": today(), "meta": cfg.header_attribs})
+    return context
 
 
 def resolve_reel_name(cfg, seq, info, timecode):
@@ -528,6 +681,11 @@ def output_metadata(cfg, seq, info, timecode):
 
 def run(cfg):
     seq = find_sequence(cfg.input)
+    cfg.name_tokens = name_tokens(seq.clean_name, cfg.version_regex)
+    if cfg.name_tokens["version_string"]:
+        log.info("Version: %s (from %s)", cfg.name_tokens["version_string"], seq.clean_name)
+    else:
+        log.debug("No version in %s (-version_regex %s)", seq.clean_name, cfg.version_regex)
     log.info("Input: %s  frames %s (%d)", seq.folder / seq.name(seq.start),
              format_frames(seq.frames), len(seq.frames))
     missing = seq.missing
@@ -592,7 +750,8 @@ def run(cfg):
             scale_width = cfg.width
 
         if cfg.skip_ffmpeg:
-            log.info("Skipping ffmpeg; intermediate files are in %s", work_dir)
+            log.info("Skipping ffmpeg; intermediate files are in %s%s", work_dir,
+                     " (no slate: ffmpeg draws it)" if cfg.slate else "")
             return exit_code
 
         cfg.fps, fps_source = resolve_fps(cfg, info)
@@ -609,7 +768,16 @@ def run(cfg):
                             "look stretched on playback. -par_out square avoids that.",
                             par_display(cfg.par_out_value))
         timecode, tc_source = resolve_timecode(cfg, seq, info, seq.start)
-        log.info("Timecode: %s (%s)", timecode, tc_source)
+        movie_tc = timecode
+        if cfg.slate:
+            fps_int = nominal_fps(cfg.fps)
+            movie_tc = slate_timecode(timecode, fps_int)
+            if movie_tc == timecode:
+                timecode = offset_timecode(timecode, 1, fps_int)
+                log.warning("Slate: the start timecode is %s, so the slate keeps it and the "
+                            "pictures start at %s.", movie_tc, timecode)
+        log.info("Timecode: %s (%s)%s", timecode, tc_source,
+                 ", slate {}".format(movie_tc) if cfg.slate else "")
         metadata = output_metadata(cfg, seq, info, timecode)
         reel_name, reel_source = resolve_reel_name(cfg, seq, info, timecode)
         if reel_name:
@@ -625,7 +793,18 @@ def run(cfg):
         name = seq.clean_name or seq.folder.name or "output"
         list_file = work_dir / "{}.ffconcat.txt".format(name)
         created_files.append(list_file)
-        write_concat_list(fill_holes(seq.full_range, available), cfg.fps, list_file)
+        frame_files = fill_holes(seq.full_range, available)
+        fmt = probe_frames(cfg.ffmpeg, available, cfg.verbose) if (cfg.slate or cfg.letterbox) else None
+        if cfg.letterbox:
+            width, height = movie_size(fmt, cfg.par_in, cfg.par_out_value, scale_width)
+            cfg.letterbox_plan = letterbox_plan(cfg.letterbox, width, height, cfg.par_out_value)
+            describe_letterbox(cfg.letterbox, cfg.letterbox_plan, width, height)
+        if cfg.slate:
+            slate_file = work_dir / "{}.slate{}".format(name, Path(available[min(available)]).suffix)
+            created_files.append(slate_file)
+            make_slate(cfg, seq, available, slate_file, timecode, reel_name, scale_width, fmt)
+            frame_files = [slate_file] + list(frame_files)
+        write_concat_list(frame_files, cfg.fps, list_file)
 
         if any(cfg.burn.values()):
             log.info("Burn-ins%s:", " (preset {})".format(cfg.burn_preset) if cfg.burn_preset else "")
@@ -634,11 +813,13 @@ def run(cfg):
                     st = cfg.burn_styles.get(place)
                     log.info("  %s %r  [%s]", place, cfg.burn[place], st.describe() if st else "")
         ctx = BurnContext(seq.clean_name, seq.start, seq.end, timecode, cfg.fps,
-                          cfg.preset.name, today(), cfg.header_attribs)
+                          cfg.preset.name, today(), cfg.header_attribs,
+                          lead_frames=1 if cfg.slate else 0, movie_timecode=movie_tc,
+                          skip_lead=not (cfg.slate and cfg.slate.burnin), tokens=cfg.name_tokens)
         video_filter = build_video_filter(cfg, ctx, scale_width)
         output = Path(cfg.output) if cfg.output else seq.folder / "{}.{}".format(name, cfg.ff_out_ext)
         output.parent.mkdir(parents=True, exist_ok=True)
-        encode(cfg, build_command(cfg, list_file, output, video_filter, timecode, metadata,
+        encode(cfg, build_command(cfg, list_file, output, video_filter, movie_tc, metadata,
                                   reel_name))
         log.info("Done: %s", output)
         return exit_code
@@ -648,6 +829,49 @@ def run(cfg):
         else:
             cleanup(created_files, work_dir, created_dir,
                     whole_folder=cfg.temp_location == "user" and created_dir)
+
+
+def current_user():
+    try:
+        return getpass.getuser()
+    except Exception:          # no login name (some services); not worth failing for
+        return ""
+
+
+def slate_context(cfg, seq, timecode, reel_name, width, height):
+    fps_int = nominal_fps(cfg.fps)
+    count = seq.end - seq.start + 1
+    context = metadata_context(cfg, seq, timecode)
+    context.update(frames=count, timecode_end=offset_timecode(timecode, count - 1, fps_int),
+                   duration=frame_to_tc(count, fps_int), width=width, height=height,
+                   par=par_display(cfg.par_out_value),
+                   colour=describe_colour(cfg) if seq.is_exr else "", reel=reel_name,
+                   user=current_user(), input=Path(cfg.input).name)
+    return context
+
+
+def describe_letterbox(spec, lb_plan, width, height):
+    if lb_plan.kind == "none":
+        log.info("Letterbox %s: the %dx%d movie already has that ratio, no bars.",
+                 spec.ratio_text, width, height)
+        return
+    where = "top and bottom" if lb_plan.kind == "letterbox" else "left and right"
+    log.info("Letterbox %s: %s, bars of %d px %s%s", spec.ratio_text, lb_plan.kind, lb_plan.bar,
+             where, ", line {} px".format(min(spec.line, lb_plan.bar)) if spec.line else "")
+
+
+def make_slate(cfg, seq, available, out_path, timecode, reel_name, scale_width, fmt=None):
+    """Draw the slate frame next to the intermediates, matching their format."""
+    spec = cfg.slate
+    fmt = fmt or probe_frames(cfg.ffmpeg, available, cfg.verbose)
+    width, height = movie_size(fmt, cfg.par_in, cfg.par_out_value, scale_width)
+    thumb = pick_thumbnail(spec.thumbnail, seq.frames, available)
+    log.info("Slate%s: frame %d, %dx%d %s%s", " (preset {})".format(spec.name) if spec.name else "",
+             seq.start - 1, fmt.width, fmt.height, fmt.pix_fmt,
+             ", thumbnail of frame {}".format(thumb) if thumb is not None else "")
+    context = slate_context(cfg, seq, timecode, reel_name, width, height)
+    render_slate(cfg, spec, context, md.expand, fmt,
+                 available[thumb] if thumb is not None else None, out_path)
 
 
 class _Formatter(logging.Formatter):

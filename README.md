@@ -26,13 +26,15 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - Metadata: your own `KEY=VALUE` tags, optional copying from the EXR header, and metadata presets (`review`, `conform`, `client`, `archive`).
 - Reel name for conforming (explicit, or from the EXR `owner` or any other attribute), written into the mov timecode track and mxf source package.
 - Burn-ins in six places (corners plus top/bottom centre) with name, frame counter, frame range, running timecode, fps and date; colour, opacity, size and black box per preset or per place.
+- Letterbox or pillarbox bars for a target ratio, optionally see-through and with an edge line; burn-ins stay on top.
+- VFX slate: one frame before the pictures (frame and timecode start − 1), same size and pixel aspect as the pictures, with a shot thumbnail and rows from presets, header values or the command line.
 
 ## Layout
 
 ```
 vfx-transcode.py      entry script (also used by the PyInstaller spec)
 vfx_transcode/        the package; python -m vfx_transcode works too
-presets.json          encode, burn-in and metadata presets, channel preferences
+presets.json          encode, burn-in, metadata and slate presets, channel preferences
 docs/OPTIONS.md       options reference
 tests/                unit tests
 test_conversion.bat   end-to-end test on the sample media in ./media

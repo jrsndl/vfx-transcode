@@ -62,8 +62,9 @@ def _tail(text, lines=OUTPUT_TAIL_LINES):
     return "\n".join(parts[-lines:])
 
 
-def run_tool(cmd, what, verbose=0):
-    """Run a command, return CompletedProcess. Raise ToolError with the output tail on failure."""
+def run_tool(cmd, what, verbose=0, check=True):
+    """Run a command, return CompletedProcess. Raise ToolError with the output tail on failure
+    (unless check is False: `ffmpeg -i` alone exits 1 but prints what we need)."""
     cmd = [str(c) for c in cmd]
     log.debug("%s: %s", what, cmdline(cmd))
     try:
@@ -76,7 +77,7 @@ def run_tool(cmd, what, verbose=0):
         for stream in (result.stdout, result.stderr):
             if stream and stream.strip():
                 log.debug(stream.rstrip())
-    if result.returncode != 0:
+    if check and result.returncode != 0:
         output = _tail("\n".join(s for s in (result.stdout, result.stderr) if s))
         raise ToolError("{} failed with exit code {}.".format(what, result.returncode), output)
     return result
