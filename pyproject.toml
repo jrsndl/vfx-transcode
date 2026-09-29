@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfx-transcode"
+dynamic = ["version"]
+description = "Convert OpenEXR and other image sequences to review movies with oiiotool, OCIO and ffmpeg."
+requires-python = ">=3.9"
+dependencies = []   # standard library only; oiiotool and ffmpeg are external executables
+
+[project.optional-dependencies]
+dev = ["pytest", "pyinstaller"]
+
+[project.scripts]
+vfx-transcode = "vfx_transcode.cli:main"
+
+[tool.setuptools]
+packages = ["vfx_transcode"]
+
+[tool.setuptools.dynamic]
+version = { attr = "vfx_transcode.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

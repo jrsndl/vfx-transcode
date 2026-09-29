@@ -1,0 +1,226 @@
+{
+  "_notes": [
+    "Presets for vfx-transcode. Edit freely; the full reference is in docs/OPTIONS.md.",
+    "Use another file with -presets_file PATH (./ paths are relative to the application folder).",
+    "",
+    "ENCODE PRESETS (-preset NAME), default: default_encode",
+    "  notes        free text, shown in --help",
+    "  ext          output file extension",
+    "  encode       ffmpeg arguments between the input and the output file. Must contain",
+    "               {videofilter} where the scale / pad / burn-in filter goes.",
+    "               Either one string (quotes group words) or a list of arguments.",
+    "  ten_bit      true if the codec is 10-bit; only used to suggest -mezzanine_16bit 1",
+    "  colour_tags  true to append -color_range/-colorspace/-color_primaries/-color_trc",
+    "               matching -colorout (sRGB outputs get iec61966-2-1, others bt709)",
+    "  metadata     optional: tags this codec always gets, e.g. {\"vendor_id\": \"appl\"} for ProRes.",
+    "  Timecode and reel name are added automatically; do not put them in \"encode\".",
+    "  Starting points: ASWF Encoding Guidelines,",
+    "  https://github.com/AcademySoftwareFoundation/EncodingGuidelines",
+    "",
+    "BURN-IN PRESETS (-burn_preset NAME), default: default_burnin (\"none\" = no burn-ins)",
+    "  notes              free text, shown in --help",
+    "  tl, tc, tr         top left / top centre / top right, the centre ones centre-justified",
+    "  bl, bc, br         bottom left / bottom centre / bottom right",
+    "                     each is either the text, or {\"text\": ..., \"color\": ..., \"opacity\": ...,",
+    "                     \"size\": ..., \"box\": ...} to style that place differently",
+    "  color              text colour for the whole preset: white, yellow, #ffcc00 ... (default white)",
+    "  opacity            0-1 for text, shadow and box; 1 = solid (default 1)",
+    "  size               text size: \"1.5%\" of the picture height, 40 (pixels) or \"h/75\" (default 1.33%)",
+    "  box                true = black box behind the text instead of a shadow (default false)",
+    "  font               optional: font file (default ./fonts/DroidSansMono.ttf)",
+    "  Keywords: {clean_name} {current_frame} {frame_start} {frame_end} {tc} (running timecode)",
+    "            {timecode} (start timecode) {fps} {date} {preset} (encode preset name)",
+    "            {meta:ATTR} any attribute of the first frame's EXR header, e.g. {meta:owner},",
+    "            {meta:nuke/input/filename}; {meta:ATTR|fallback} if it may be missing",
+    "  \\n in a text starts a new line (lines follow the place: left, centred or right-aligned).",
+    "  Text after {tc} in the same place is dropped: ffmpeg always puts the timecode last.",
+    "  Style layers, later wins: defaults < preset < preset place < -burn_color/-burn_opacity/",
+    "  -burn_size/-burn_box < -burn_style PLACE:key=value. -burn_tl ... -burn_br replace a text;",
+    "  an empty value (-burn_tl \"\") clears that place.",
+    "",
+    "CHANNEL PREFERENCES (automatic channel choice for EXRs)",
+    "  An ordered list of channel sets. The first set whose channels all exist in the image",
+    "  (in any EXR part) is shown; alpha is dropped. Write a set as \"R,G,B\" or [\"R\", \"G\", \"B\"].",
+    "  If no set matches, the first layer with at least 3 channels is used.",
+    "  -oiio_channel overrides this; -oiio_channel_use_first skips it.",
+    "",
+    "METADATA PRESETS (-metadata_preset NAME), default: default_metadata (\"none\" = no preset)",
+    "  notes            free text, shown in --help",
+    "  tags             {\"key\": \"value\"} written to the movie; values may use {clean_name} {frame_start}",
+    "                   {frame_end} {timecode} {fps} {preset} {date} {meta:ATTR}",
+    "  copy             EXR header attributes to copy, like -metadata_copy (\"all,-husk:*\", \"Artist,DateTime\")",
+    "  reelid_source    auto | arg | exr | off, like -reelid_source",
+    "  reelid           explicit reel name, like -reelid",
+    "  reelid_attr      EXR attribute with the reel name (default owner)",
+    "  reelid_pattern   regex to cut the reel name out of that attribute",
+    "  timecode_source  counter | arg | exr, like -timecode_source",
+    "  All fields are optional. Command-line options override the preset field by field; -metadata",
+    "  KEY=VALUE adds or replaces one tag, and -metadata KEY= removes one.",
+    "  Tag order, later wins: copied header < encode preset metadata < metadata preset tags < -metadata."
+  ],
+  "default_encode": "h264",
+  "default_burnin": "none",
+  "default_metadata": "none",
+  "channel_preferences": [
+    "rgba.R,rgba.G,rgba.B,rgba.A",
+    "rgba.R,rgba.G,rgba.B",
+    "rgb.R,rgb.G,rgb.B,rgb.A",
+    "rgb.R,rgb.G,rgb.B",
+    "R,G,B,A",
+    "r,g,b,a",
+    "R,G,B",
+    "r,g,b",
+    "beauty.R,beauty.G,beauty.B,beauty.A",
+    "beauty.R,beauty.G,beauty.B"
+  ],
+  "encode_presets": {
+    "h264": {
+      "notes": "8-bit h264, all-intra (frame-accurate scrubbing), CRF 18. The original default.",
+      "ext": "mp4",
+      "encode": "-pix_fmt yuv420p {videofilter} -c:v libx264 -g 1 -preset slower -crf 18 -movflags faststart",
+      "ten_bit": false,
+      "colour_tags": true
+    },
+    "h264-web": {
+      "notes": "8-bit h264, long GOP: much smaller files, plays everywhere.",
+      "ext": "mp4",
+      "encode": "-pix_fmt yuv420p {videofilter} -c:v libx264 -preset slower -crf 18 -movflags faststart",
+      "ten_bit": false,
+      "colour_tags": true
+    },
+    "h265": {
+      "notes": "10-bit HEVC, CRF 22, hvc1 tag for Apple players. Not playable in Firefox.",
+      "ext": "mp4",
+      "encode": "-pix_fmt yuv420p10le {videofilter} -c:v libx265 -preset slow -crf 22 -tag:v hvc1 -movflags faststart",
+      "ten_bit": true,
+      "colour_tags": true
+    },
+    "prores422hq": {
+      "notes": "ProRes 422 HQ, 10-bit. Lighting/comp review and editorial.",
+      "ext": "mov",
+      "encode": "-pix_fmt yuv422p10le {videofilter} -c:v prores_ks -profile:v 3 -vendor apl0",
+      "ten_bit": true,
+      "colour_tags": true,
+      "metadata": {
+        "vendor_id": "appl"
+      }
+    },
+    "prores4444": {
+      "notes": "ProRes 4444, 10-bit 4:4:4.",
+      "ext": "mov",
+      "encode": "-pix_fmt yuv444p10le {videofilter} -c:v prores_ks -profile:v 4444 -vendor apl0",
+      "ten_bit": true,
+      "colour_tags": true,
+      "metadata": {
+        "vendor_id": "appl"
+      }
+    },
+    "dnxhr-sq": {
+      "notes": "DNxHR SQ, 8-bit 4:2:2. Light editorial proxy.",
+      "ext": "mov",
+      "encode": "-pix_fmt yuv422p {videofilter} -c:v dnxhd -profile:v dnxhr_sq",
+      "ten_bit": false,
+      "colour_tags": true
+    },
+    "dnxhr-hqx": {
+      "notes": "DNxHR HQX, 10-bit 4:2:2.",
+      "ext": "mov",
+      "encode": "-pix_fmt yuv422p10le {videofilter} -c:v dnxhd -profile:v dnxhr_hqx",
+      "ten_bit": true,
+      "colour_tags": true
+    }
+  },
+  "burnin_presets": {
+    "frame": {
+      "notes": "Frame counter only.",
+      "br": "{current_frame}"
+    },
+    "review": {
+      "notes": "Internal review: name, running timecode, frame range and counter.",
+      "tl": "{clean_name}",
+      "tr": "TC {tc}",
+      "bl": "{frame_start}-{frame_end} @ {fps} fps",
+      "br": "{current_frame}"
+    },
+    "review-boxed": {
+      "notes": "Review on a black box, readable over bright plates; date centred on top.",
+      "box": true,
+      "opacity": 0.75,
+      "tl": "{clean_name}",
+      "tc": "{date}",
+      "tr": "TC {tc}",
+      "bl": "{frame_start}-{frame_end} @ {fps} fps",
+      "br": "{current_frame}"
+    },
+    "dailies": {
+      "notes": "Dailies: name and date on top; big centred running timecode; frame of total.",
+      "tl": "{clean_name}",
+      "tr": "{date}",
+      "bc": {
+        "text": "TC {tc}",
+        "size": "2.2%",
+        "box": true
+      },
+      "br": "{current_frame} / {frame_end}"
+    },
+    "editorial": {
+      "notes": "Editorial hand-off: name and running timecode at the bottom, clear of the picture action.",
+      "bl": "{clean_name}",
+      "br": "TC {tc}"
+    },
+    "client": {
+      "notes": "Client review: small, slightly transparent shot name and date, no internal frame numbers.",
+      "size": "1.1%",
+      "opacity": 0.8,
+      "bc": "{clean_name}   {date}"
+    },
+    "wip": {
+      "notes": "Work in progress: yellow WIP stamp centred on top, review info elsewhere.",
+      "tl": "{clean_name}",
+      "tc": {
+        "text": "WIP - NOT FOR APPROVAL",
+        "color": "yellow",
+        "size": "2.2%",
+        "box": true
+      },
+      "tr": "TC {tc}",
+      "br": "{current_frame}"
+    }
+  },
+  "metadata_presets": {
+    "review": {
+      "notes": "Internal review: title and a description line; reel name if the EXR has one.",
+      "tags": {
+        "title": "{clean_name}",
+        "comment": "{clean_name} {frame_start}-{frame_end} @ {fps} fps, start TC {timecode}"
+      },
+      "reelid_source": "auto"
+    },
+    "conform": {
+      "notes": "Conform / editorial: timecode and reel name from the EXR header (reel from owner, frame range removed).",
+      "tags": {
+        "title": "{clean_name}"
+      },
+      "timecode_source": "exr",
+      "reelid_source": "exr",
+      "reelid_attr": "owner"
+    },
+    "client": {
+      "notes": "Client delivery: only a title, nothing from the render headers, no reel name.",
+      "tags": {
+        "title": "{clean_name}"
+      },
+      "copy": "",
+      "reelid_source": "off"
+    },
+    "archive": {
+      "notes": "Archive: everything useful from the EXR header except renderer command lines and internal paths.",
+      "tags": {
+        "title": "{clean_name}",
+        "comment": "transcoded {date}, preset {preset}"
+      },
+      "copy": "all,-husk:*,-nuke/*,-MEDIA_PATH",
+      "reelid_source": "auto"
+    }
+  }
+}

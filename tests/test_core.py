@@ -1,0 +1,897 @@
+"""Unit tests. Run with `python -m unittest` (or pytest) from the repository root."""
+
+import json
+import tempfile
+import unittest
+from fractions import Fraction
+from pathlib import Path
+
+from vfx_transcode import cli, ffmpeg, oiio
+from vfx_transcode.channels import pick_channels
+from vfx_transcode.config import Config
+from vfx_transcode.errors import TranscodeError
+from vfx_transcode.oiio_info import Rational, parse_oiio_xml_output, split_imagespecs, write_info_json
+from vfx_transcode.presets import LEGACY_H264, load_presets, transfer_for
+from vfx_transcode.sequence import fill_holes, find_sequence, format_frames
+from vfx_transcode.timecode import fps_to_str, frame_to_tc, nominal_fps, parse_fps
+from vfx_transcode.tools import resolve_path, split_args
+
+
+REPO = Path(__file__).resolve().parent.parent
+PRESETS = load_presets(REPO / "presets.json")
+
+
+def _info(*subimage_channels):
+    return [{"channelnames": list(c)} for c in subimage_channels]
+
+
+class TimecodeTests(unittest.TestCase):
+    def test_frame_to_tc(self):
+        self.assertEqual(frame_to_tc(1001, 24), "00:00:41:17")
+        self.assertEqual(frame_to_tc(0, 25), "00:00:00:00")
+        self.assertEqual(frame_to_tc(24 * 3600 + 1, 24), "01:00:00:01")
+        self.assertEqual(frame_to_tc(24 * 3600 * 25, 24), "01:00:00:00")   # wraps at 24h
+
+    def test_parse_fps(self):
+        self.assertEqual(parse_fps("24"), 24)
+        self.assertEqual(parse_fps("24000/1001"), Fraction(24000, 1001))
+        self.assertEqual(parse_fps("23.976"), Fraction(24000, 1001))  # used to crash; NTSC snap
+        self.assertEqual(parse_fps("29.97"), Fraction(30000, 1001))
+        self.assertEqual(parse_fps("2997/125"), Fraction(2997, 125))    # exact fraction kept
+        self.assertEqual(parse_fps("12.5"), Fraction(25, 2))
+        with self.assertRaises(ValueError):
+            parse_fps("abc")
+        with self.assertRaises(ValueError):
+            parse_fps("0")
+
+    def test_fps_helpers(self):
+        self.assertEqual(fps_to_str(Fraction(24000, 1001)), "24000/1001")
+        self.assertEqual(fps_to_str(Fraction(25)), "25")
+        self.assertEqual(nominal_fps(Fraction(24000, 1001)), 24)
+        self.assertEqual(nominal_fps(Fraction(30000, 1001)), 30)
+
+
+class SequenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def touch(self, *names):
+        for n in names:
+            (self.dir / n).write_bytes(b"")
+
+    def test_holes_and_padding(self):
+        self.touch("shot_010.1001.exr", "shot_010.1002.exr", "shot_010.1004.exr",
+                   "shot_010.v2.exr", "shot_010.01003.exr", "other.1003.exr", "shot_010.1003.png")
+        seq = find_sequence(self.dir / "shot_010.1002.exr")
+        self.assertEqual(seq.frames, (1001, 1002, 1004))
+        self.assertEqual(seq.missing, [1003])
+        self.assertEqual(seq.runs(), [(1001, 1002), (1004, 1004)])
+        self.assertEqual(seq.clean_name, "shot_010")
+        self.assertEqual(seq.name(1003, ".png"), "shot_010.1003.png")
+
+    def test_unnumbered_single_file(self):
+        # used to crash with an unbound variable
+        self.touch("plate.exr")
+        seq = find_sequence(self.dir / "plate.exr")
+        self.assertFalse(seq.numbered)
+        self.assertEqual(seq.frames, (0,))
+        self.assertEqual(seq.name(0), "plate.exr")
+
+    def test_missing_input(self):
+        with self.assertRaises(TranscodeError):
+            find_sequence(self.dir / "nope.1001.exr")
+
+    def test_fill_holes(self):
+        files = fill_holes(range(1, 7), {2: "b", 3: "c", 5: "e"})
+        self.assertEqual(files, ["b", "b", "c", "c", "e", "e"])
+
+    def test_format_frames(self):
+        self.assertEqual(format_frames([1, 2, 3, 7, 9, 10]), "1-3,7,9-10")
+
+
+class ChannelTests(unittest.TestCase):
+    def test_prefers_rgba_over_first_layer(self):
+        # the old picker always took the first layer (AO here)
+        pick = pick_channels(_info(["AO.R", "AO.G", "AO.B", "AO.A",
+                                    "rgba.R", "rgba.G", "rgba.B", "rgba.A"]))
+        self.assertEqual(str(pick), "rgba.R,rgba.G,rgba.B")
+
+    def test_priority_order_not_last_match(self):
+        pick = pick_channels(_info(["R", "G", "B", "beauty.R", "beauty.G", "beauty.B"]))
+        self.assertEqual(str(pick), "R,G,B")
+
+    def test_plain_rgba(self):
+        self.assertEqual(str(pick_channels(_info(["R", "G", "B", "A"]))), "R,G,B")
+
+    def test_multipart(self):
+        pick = pick_channels(_info(["depth.Z"], ["rgba.R", "rgba.G", "rgba.B"]))
+        self.assertEqual(pick.subimage, 1)
+
+    def test_requested(self):
+        pick = pick_channels(_info(["N.X", "N.Y", "N.Z", "R", "G", "B"]), ["N.X", "N.Y", "N.Z"])
+        self.assertEqual(str(pick), "N.X,N.Y,N.Z")
+
+    def test_use_first_and_fallbacks(self):
+        info = _info(["diffuse.R", "diffuse.G", "diffuse.B", "R", "G", "B"])
+        self.assertEqual(str(pick_channels(info, use_first=True)), "diffuse.R,diffuse.G,diffuse.B")
+        self.assertEqual(str(pick_channels(_info(["Y"]))), "Y")
+        self.assertEqual(str(pick_channels(_info(["depth.Z", "spec.R", "spec.G", "spec.B"]))),
+                         "spec.R,spec.G,spec.B")
+
+    def test_custom_preferences_from_file(self):
+        info = _info(["beauty.R", "beauty.G", "beauty.B", "R", "G", "B"])
+        self.assertEqual(str(pick_channels(info, preferences=PRESETS.channel_preferences)), "R,G,B")
+        self.assertEqual(str(pick_channels(info, preferences=[["beauty.R", "beauty.G", "beauty.B"]])),
+                         "beauty.R,beauty.G,beauty.B")
+
+    def test_alpha_removal_is_exact(self):
+        # 'beta' ends in 'a' but is not alpha; the old regex removed it
+        pick = pick_channels(_info(["x.alpha", "x.beta", "x.gamma"]), ["x.alpha", "x.beta", "x.gamma"])
+        self.assertEqual(str(pick), "x.alpha,x.beta,x.gamma")
+
+
+class OiioInfoTests(unittest.TestCase):
+    XML = """noise before
+<?xml version="1.0"?>
+<ImageSpec version="26">
+<x>0</x><width>1920</width><height>1080</height>
+<channelnames><channelname>R</channelname><channelname>G</channelname></channelnames>
+<attrib name="FramesPerSecond" type="rational2i">24/1</attrib>
+<attrib name="worldToCamera" type="matrix">1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16</attrib>
+<attrib name="weird" type="string">a&#01;b</attrib>
+</ImageSpec>"""
+
+    def test_parse(self):
+        blocks = split_imagespecs(self.XML + "\n" + self.XML)
+        self.assertEqual(len(blocks), 2)
+        info = parse_oiio_xml_output(blocks[0])
+        self.assertEqual(info["width"], 1920)
+        self.assertEqual(info["channelnames"], ["R", "G"])
+        self.assertAlmostEqual(float(info["attribs"]["FramesPerSecond"]), 24.0)
+        self.assertEqual(info["attribs"]["worldToCamera"][0], [1, 2, 3, 4])   # rows, not columns
+
+    def test_json_with_rational(self):
+        # json.dump used to crash on the Rational attribute
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "info.json"
+            write_info_json([{"attribs": {"fps": Rational("24/1")}}], path)
+            self.assertEqual(json.loads(path.read_text())[0]["attribs"]["fps"], "24/1")
+
+
+class EscapingTests(unittest.TestCase):
+    def test_ffmpeg_docs_example(self):
+        # from the ffmpeg-filters documentation, "Notes on filtergraph escaping"
+        value = "this is a 'string': may contain one, or more, special characters"
+        level1 = ffmpeg.escape_option_value(value)
+        self.assertEqual(level1, r"this is a \'string\'\: may contain one, or more, special characters")
+        self.assertEqual(ffmpeg.escape_filtergraph("text=" + level1),
+                         r"text=this is a \\\'string\\\'\\: may contain one\, or more\, special characters")
+
+
+def _cfg(**kw):
+    base = dict(input="in.1001.exr", oiiotool="oiiotool", ffmpeg="ffmpeg",
+                burn={"tl": "", "tr": "", "bl": "", "br": ""}, preset=PRESETS.get("h264"))
+    base.update(kw)
+    return Config(**base)
+
+
+def _ctx():
+    return ffmpeg.BurnContext("shot 010", 1001, 1100, "00:00:41:17", Fraction(24))
+
+
+class BurnStyleTests(unittest.TestCase):
+    def parse(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_layers(self):
+        from vfx_transcode.burnin import BurnStyle, resolve_styles
+        styles = resolve_styles(BurnStyle(opacity=0.8, size="3%"),
+                                {"tc": BurnStyle(color="yellow", box=True)},
+                                BurnStyle(size="40"), {"tc": BurnStyle(opacity=1.0)})
+        self.assertEqual(styles["tl"], BurnStyle("white", 0.8, "40", False))    # cli size beats preset
+        self.assertEqual(styles["tc"], BurnStyle("yellow", 1.0, "40", True))      # place overrides
+
+    def test_command_line(self):
+        cfg = self.parse("-burn_tc", "{date}", "-burn_color", "#ffcc00", "-burn_opacity", "0.5",
+                         "-burn_style", "tc:color=red,box=1,size=30", "-burn_style", "all:size=50")
+        self.assertEqual(cfg.burn["tc"], "{date}")
+        tc, bl = cfg.burn_styles["tc"], cfg.burn_styles["bl"]
+        self.assertEqual((tc.color, tc.opacity, tc.size, tc.box), ("red", 0.5, "50", True))  # later -burn_style wins
+        self.assertEqual((bl.color, bl.size, bl.box), ("#ffcc00", "50", False))
+        for bad in (("-burn_opacity", "2"), ("-burn_color", "not a colour"), ("-burn_size", "0"),
+                    ("-burn_style", "middle:size=3"), ("-burn_style", "tc:weight=bold"),
+                    ("-burn_style", "tc:box=maybe")):
+            with self.assertRaises(TranscodeError):
+                self.parse(*bad)
+
+    def test_size_forms(self):
+        from vfx_transcode.burnin import parse_size, size_expression, size_pixels
+        self.assertEqual(parse_size(40), "40")
+        self.assertEqual(parse_size("40px"), "40")
+        self.assertEqual(parse_size(" 1.5 % "), "1.5%")
+        self.assertEqual(parse_size("h/75"), "h/75")
+        self.assertEqual(parse_size(12.5), "12.5")
+        for bad in ("0", "0%", "150%", "big", "-3", "h/0", True):
+            with self.assertRaises(TranscodeError):
+                parse_size(bad)
+        self.assertEqual(size_expression("1.5%"), "h*0.015")
+        self.assertEqual(size_expression("h/75"), "h/75")
+        self.assertEqual(size_expression("40"), "40")
+        self.assertAlmostEqual(size_pixels("1.5%", 1080), 16.2)
+        self.assertAlmostEqual(size_pixels("h/75", 1080), 14.4)
+        self.assertEqual(size_pixels("40", 1080), 40)
+
+    def test_drawtext_options(self):
+        from vfx_transcode.burnin import BurnStyle
+        vf = ffmpeg.build_drawtext("{clean_name}", "tc", _ctx(), "", BurnStyle("yellow", 0.5, "h/40", True), 1080)
+        self.assertIn("fontcolor=yellow@0.5", vf)
+        self.assertIn("boxcolor=black@0.5", vf)
+        self.assertIn("box=1", vf)
+        self.assertIn("x=(w-tw)/2", vf)                      # centred
+        self.assertIn("fontsize=h/40", vf)
+        self.assertNotIn("shadowx", vf)
+        vf = ffmpeg.build_drawtext("x", "bc", _ctx(), "", BurnStyle("white", 1.0, "1.5%", False))
+        self.assertIn("fontsize=h*0.015", vf)
+        vf = ffmpeg.build_drawtext("x", "bc", _ctx(), "", BurnStyle("white", 1.0, "36", False))
+        self.assertIn("fontsize=36", vf)
+        self.assertIn("shadowcolor=black@1", vf)
+        self.assertIn("y=h-(2*lh)", vf)
+
+    def test_preset_file_styles(self):
+        base = '{"encode_presets": {"x": {"ext": "mp4", "encode": "{videofilter}"}}, "burnin_presets": {"b": %s}}'
+        p = load_presets(PresetFileTests.write(self, base % '{"opacity": 0.7, "tl": "a", "tc": {"text": "b", "color": "yellow", "box": true}, "bc": {"size": 20}}'))
+        b = p.get_burnin("b")
+        self.assertEqual(b.corners, {"tl": "a", "tc": "b"})
+        self.assertEqual(b.style.opacity, 0.7)
+        self.assertEqual(b.place_styles["tc"].color, "yellow")
+        for bad in ('{"tc": {"text": "x", "weight": 1}}', '{"tc": 5}', '{"opacity": 3}', '{"color": "no such"}',
+                    '{"box": "maybe"}'):
+            with self.assertRaises(TranscodeError):
+                load_presets(PresetFileTests.write(self, base % bad))
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+
+class MetaKeywordTests(unittest.TestCase):
+    HEADER = {"Copyright": "Z017_C001_20190920_R[00000-02773]", "cameraModel": "DJI Zemuse X7",
+              "nuke/node_hash": "db920c72b1fecf8c", "FramesPerSecond": Rational("24/1"),
+              "isoSpeed": 200.0, "smpte:TimeCode": "00:00:41:17"}
+
+    def test_lookup(self):
+        from vfx_transcode import metadata as md
+        self.assertEqual(md.meta_lookup(self.HEADER, "owner"), ("Z017_C001_20190920_R[00000-02773]", True))
+        self.assertEqual(md.meta_lookup(self.HEADER, "CAMERAMODEL")[0], "DJI Zemuse X7")
+        self.assertEqual(md.meta_lookup(self.HEADER, "smpte:TimeCode")[0], "00:00:41:17")
+        self.assertEqual(md.meta_lookup(self.HEADER, "FramesPerSecond")[0], "24/1")
+        self.assertEqual(md.meta_lookup(self.HEADER, "nope|n/a"), ("n/a", False))
+        self.assertEqual(md.meta_lookup({}, "nope"), ("", False))
+
+    def test_in_metadata_values(self):
+        from vfx_transcode import metadata as md
+        out = md.expand("{clean_name} shot on {meta:cameraModel} ({meta:lens|unknown lens})",
+                        {"clean_name": "sh010", "meta": self.HEADER})
+        self.assertEqual(out, "sh010 shot on DJI Zemuse X7 (unknown lens)")
+
+    def test_in_burnin(self):
+        ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24), header=self.HEADER)
+        opts = dict(ffmpeg.expand_burn_template("{meta:owner} {current_frame} 100%", ctx))
+        self.assertEqual(opts["text"], "Z017_C001_20190920_R[00000-02773] %{frame_num} 100\\%")
+        vf = ffmpeg.build_drawtext("{meta:owner}", "tc", ctx, "", __import__(
+            "vfx_transcode.burnin", fromlist=["x"]).DEFAULT_STYLE)
+        self.assertIn(r"\[00000-02773\]", vf)        # brackets escaped for the filtergraph
+
+    def test_timecode_header_frame(self):
+        seq = type("S", (), {"start": 1001, "frame_of": lambda self, p: 1003})()
+        cfg = _cfg(timecode_source="exr")
+        info = [{"attribs": {"smpte:TimeCode": "10:00:00:10"}}]
+        self.assertEqual(cli.resolve_timecode(cfg, seq, info, header_frame=1001)[0], "10:00:00:10")
+        self.assertEqual(cli.resolve_timecode(cfg, seq, info)[0], "10:00:00:08")   # from -i frame
+
+
+class DisplayViewTests(unittest.TestCase):
+    def parse(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_colorspace_mode_default(self):
+        cfg = self.parse()
+        self.assertFalse(cfg.display_mode)
+        self.assertEqual(oiio.colour_args(cfg), ["--colorconvert", "ACEScg", "out_rec709"])
+        self.assertEqual(cfg.output_colour, "out_rec709")
+
+    def test_display_view(self):
+        cfg = self.parse("-ocio", "ocio://studio-config-latest", "-display", "sRGB - Display",
+                         "-view", "ACES 1.0 - SDR Video", "-looks", "ACES 1.3 Reference Gamut Compression")
+        self.assertEqual(oiio.colour_args(cfg), ["--ociodisplay:from=ACEScg:looks=ACES 1.3 Reference Gamut Compression",
+                                                 "sRGB - Display", "ACES 1.0 - SDR Video"])
+        self.assertEqual(cfg.ocio, "ocio://studio-config-latest")
+        self.assertIn("iec61966-2-1", ffmpeg.encode_args(cfg, "VF"))          # tags follow the display
+        cfg = self.parse("-display", "Rec.1886 Rec.709 - Display")
+        self.assertEqual(oiio.colour_args(cfg), ["--ociodisplay:from=ACEScg", "Rec.1886 Rec.709 - Display", ""])
+        self.assertIn("bt709", ffmpeg.encode_args(cfg, "VF")[-1])
+        cfg = self.parse("-view", "Un-tone-mapped")                               # default display
+        self.assertEqual(oiio.colour_args(cfg)[1:], ["", "Un-tone-mapped"])
+        self.assertTrue(cli.HDR_OR_WIDE.search("Rec.2100-PQ - Display"))
+        self.assertFalse(cli.HDR_OR_WIDE.search("sRGB - Display"))
+
+    def test_ocio_info_needs_no_input(self):
+        ns = cli.build_parser(PRESETS).parse_args(["-ocio_info"])
+        self.assertIsNone(ns.i)
+        self.assertEqual(cli.main(["-v", "0"]), cli.EXIT_ERROR)                   # no -i, no -ocio_info
+
+
+class PixelAspectTests(unittest.TestCase):
+    def test_parse(self):
+        from vfx_transcode.aspect import parse_par
+        self.assertEqual(parse_par("2"), 2)
+        self.assertEqual(parse_par("1.33"), Fraction(4, 3))        # anamorphic 1.33x
+        self.assertEqual(parse_par("1.333"), Fraction(4, 3))
+        self.assertEqual(parse_par("4/3"), Fraction(4, 3))
+        self.assertEqual(parse_par("1.3"), Fraction(13, 10))       # kept as typed
+        self.assertEqual(parse_par(2.0), 2)
+        for bad in ("abc", "0", "-2", "50", "1/0"):
+            with self.assertRaises(TranscodeError):
+                parse_par(bad)
+
+    def test_sources(self):
+        from vfx_transcode.aspect import resolve_par
+        hdr2 = {"PixelAspectRatio": 2.0}
+        cases = [("arg", None, hdr2, (2, "EXR")), ("arg", Fraction(1), hdr2, (1, "-par")),
+                 ("exr", Fraction(1), hdr2, (2, "EXR")), ("exr", Fraction(4, 3), {}, (Fraction(4, 3), "-par")),
+                 ("arg_only", None, hdr2, (1, "default")), ("arg", None, {}, (1, "default")),
+                 ("arg", None, {"pixelAspectRatio": "1.33"}, (Fraction(4, 3), "EXR"))]
+        for source, arg, header, expected in cases:
+            with self.subTest(source=source, arg=arg, header=header):
+                cfg = _cfg(par_source=source, par_arg=arg, header_attribs=header)
+                par, origin = resolve_par(cfg)
+                self.assertEqual((par, origin.split(" ")[0]), expected)
+
+    def test_output(self):
+        from vfx_transcode.aspect import output_par
+        self.assertEqual(output_par(Fraction(2), "same"), 2)
+        self.assertEqual(output_par(Fraction(2), "square"), 1)
+        self.assertEqual(output_par(Fraction(2), "1.33"), Fraction(4, 3))
+
+    def test_filter_order(self):
+        cfg = _cfg(par_in=Fraction(2), par_out_value=Fraction(1),
+                   burn={"tl": "x", "tr": "", "bl": "", "br": ""})
+        vf = ffmpeg.build_video_filter(cfg, _ctx(), 0)
+        parts = vf.split(",")
+        self.assertTrue(parts[0].startswith("scale=w=iw:h=trunc(ih*1/2/2)*2"))   # reformat first
+        sar = next(i for i, p in enumerate(parts) if p.startswith("setsar"))
+        self.assertTrue(parts[sar - 1].startswith("pad="))                        # tag after pad
+        self.assertTrue(parts[sar + 1].startswith("drawtext"))
+        self.assertIn("setsar=sar=1/1", vf)
+        vf = ffmpeg.build_video_filter(_cfg(par_in=Fraction(2), par_out_value=Fraction(2)), _ctx(), 0)
+        self.assertNotIn("trunc(ih", vf)                                           # same: no reformat
+        self.assertIn("setsar=sar=2/1", vf)
+
+    def test_cli(self):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-par", "1.33", "-par_out", "square"])
+        cfg = cli.config_from_args(ns, PRESETS)
+        self.assertEqual((cfg.par_arg, cfg.par_out, cfg.par_source), (Fraction(4, 3), "square", "arg"))
+        for bad in (["-par", "x"], ["-par_out", "wide"]):
+            with self.assertRaises(TranscodeError):
+                cli.config_from_args(cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + bad), PRESETS)
+
+
+class BurnInTests(unittest.TestCase):
+    def test_edge_spaces_are_kept(self):
+        self.assertEqual(ffmpeg.escape_option_value(" TC "), "\\ TC\\ ")
+
+    def test_keywords(self):
+        opts = dict(ffmpeg.expand_burn_template("{clean_name} {current_frame}/{frame_end}", _ctx()))
+        self.assertEqual(opts["text"], "shot 010 %{frame_num}/1100")
+        self.assertEqual(opts["start_number"], "1001")
+
+    def test_tc_is_a_real_timecode(self):
+        opts = dict(ffmpeg.expand_burn_template("TC {tc}", _ctx()))
+        self.assertEqual(opts["text"], "TC ")
+        self.assertEqual(opts["timecode"], "00:00:41:17")
+        self.assertEqual(opts["rate"], "24")
+
+    def test_static_keywords(self):
+        ctx = ffmpeg.BurnContext("sh", 1, 9, "01:00:00:00", Fraction(24000, 1001), "h264", "2026-09-29")
+        opts = dict(ffmpeg.expand_burn_template("{fps} fps {date} {preset} {timecode}", ctx))
+        self.assertEqual(opts["text"], "23.976 fps 2026-09-29 h264 01:00:00:00")
+        self.assertNotIn("timecode", opts)          # {timecode} is static, only {tc} runs
+
+    def test_new_lines(self):
+        from vfx_transcode.burnin import DEFAULT_STYLE
+        opts = dict(ffmpeg.expand_burn_template(r"{clean_name}\nTC {tc}", _ctx()))
+        self.assertEqual(opts["text"], "shot 010\nTC ")                  # real newline, TC appended
+        self.assertEqual(dict(ffmpeg.expand_burn_template("a\nb", _ctx()))["text"], "a\nb")  # JSON "\n"
+        vf = ffmpeg.build_drawtext(r"a\nb\nc", "br", _ctx(), "", DEFAULT_STYLE)
+        self.assertIn("y=h-(4*lh)", vf)                                   # 3 lines grow upwards
+        self.assertIn("text_align=R", vf)
+        vf = ffmpeg.build_drawtext(r"a\nb", "tc", _ctx(), "", DEFAULT_STYLE)
+        self.assertIn("text_align=C", vf)
+        self.assertIn("y=lh", vf)
+        vf = ffmpeg.build_drawtext(r"a\nb", "tl", _ctx(), "", DEFAULT_STYLE)
+        self.assertNotIn("text_align", vf)                                # left is the default
+        vf = ffmpeg.build_drawtext("one line", "br", _ctx(), "", DEFAULT_STYLE)
+        self.assertNotIn("text_align", vf)                                # single line: unchanged
+        self.assertIn("y=h-(2*lh)", vf)
+
+    def test_percent_and_unknown(self):
+        opts = dict(ffmpeg.expand_burn_template("100% {nope}", _ctx()))
+        self.assertEqual(opts["text"], "100\\% {nope}")
+
+    def test_filter_keeps_spaces_in_one_argument(self):
+        cfg = _cfg(burn={"tl": "{clean_name}", "tr": "", "bl": "", "br": "{current_frame}"},
+                   burn_font="")
+        vf = ffmpeg.build_video_filter(cfg, _ctx(), 0)
+        cmd = ffmpeg.build_command(cfg, "C:/My Shots/list.txt", "C:/My Shots/out.mp4", vf, "01:00:00:00")
+        self.assertIn(vf, cmd)                            # -vf value is one argument
+        self.assertEqual(cmd[-1], "C:/My Shots/out.mp4")
+        self.assertIn("text=shot 010", vf)
+
+
+class CommandTests(unittest.TestCase):
+    def test_default_preset_matches_old_default(self):
+        cfg = _cfg()
+        args = ffmpeg.encode_args(cfg, "VF")
+        old = ffmpeg.split_args(LEGACY_H264.replace("{videofilter}", "-vf VF"))
+        self.assertEqual(sorted(args), sorted(old))
+
+    def test_user_encode_overrides_and_no_tags(self):
+        cfg = _cfg(ff_encode='-c:v libx264 {videofilter} -x264-params "a=1:b=2"')
+        self.assertEqual(ffmpeg.encode_args(cfg, "VF"),
+                         ["-c:v", "libx264", "-vf", "VF", "-x264-params", "a=1:b=2"])
+
+    def test_prores_vendor_tag(self):
+        from vfx_transcode import metadata as md
+        prores = PRESETS.get("prores422hq")
+        self.assertEqual(prores.metadata, {"vendor_id": "appl"})
+        self.assertNotIn("vendor_id=appl", " ".join(prores.encode))     # moved out of "encode"
+        tags = md.build({}, {}, {}, [prores.metadata])
+        cmd = ffmpeg.build_command(_cfg(preset=prores, ff_out_ext="mov"), "l", "o.mov", "VF",
+                                   "01:00:00:00", tags)
+        self.assertIn("vendor_id=appl", cmd)
+        self.assertEqual(cmd[cmd.index("-movflags") + 1], "+use_metadata_tags")   # so it is kept
+
+    def test_srgb_transfer(self):
+        self.assertEqual(transfer_for("out_srgb"), "iec61966-2-1")
+        self.assertEqual(transfer_for("Output - sRGB"), "iec61966-2-1")
+        self.assertEqual(transfer_for("out_rec709"), "bt709")
+        for preset in PRESETS.presets.values():
+            self.assertIn("{videofilter}", preset.encode)
+
+    def test_timecode_track_or_tag(self):
+        cmd = ffmpeg.build_command(_cfg(ff_out_ext="mov"), "l.txt", "o.mov", "VF", "01:00:00:00")
+        self.assertEqual(cmd[cmd.index("-timecode") + 1], "01:00:00:00")
+        cmd = ffmpeg.build_command(_cfg(ff_out_ext="mkv"), "l.txt", "o.mkv", "VF", "01:00:00:00")
+        self.assertNotIn("-timecode", cmd)
+        self.assertIn("timecode=01:00:00:00", cmd)
+        cmd = ffmpeg.build_command(_cfg(ff_out_ext="mov", output_timecode=False), "l", "o.mov", "VF", "01:00:00:00")
+        self.assertNotIn("-timecode", cmd)
+
+    def test_metadata_args_and_movflags(self):
+        cmd = ffmpeg.build_command(_cfg(), "l.txt", "o.mp4", "VF", "01:00:00:00",
+                                   {"title": "sh010", "husk:x": "a b"})
+        self.assertEqual(cmd.count("-movflags"), 1)       # merged, not a second -movflags
+        self.assertEqual(cmd[cmd.index("-movflags") + 1], "faststart+use_metadata_tags")
+        self.assertIn("title=sh010", cmd)
+        self.assertIn("husk:x=a b", cmd)
+
+    def test_oiio_args(self):
+        from vfx_transcode.channels import ChannelPick
+        pick = ChannelPick(1, ["rgba.R", "rgba.G", "rgba.B", "rgba.A"], "preferred")
+        args = oiio.process_args(_cfg(), pick)
+        self.assertEqual(args[:4], ["--subimage", "1", "--ch", "rgba.R,rgba.G,rgba.B"])
+        self.assertEqual(args[-2:], ["-d", "uint8"])
+        self.assertEqual(oiio.process_args(_cfg(mezzanine_16bit=True), pick)[-2:], ["-d", "uint16"])
+        deep = ChannelPick(0, ["R", "G", "B", "A"], "preferred", deep=True)
+        self.assertEqual(oiio.process_args(_cfg(), deep)[:3], ["--flatten", "--ch", "R,G,B"])
+
+    def test_split_args_keeps_backslashes(self):
+        self.assertEqual(split_args(r'--ociofiletransform "C:\luts\my look.cube"'),
+                         ["--ociofiletransform", r"C:\luts\my look.cube"])
+
+
+class DeepTests(unittest.TestCase):
+    KARMA = [{"deep": 1, "channelnames": ["A", "BA", "GA", "RA", "Z", "ZBack"]}]
+
+    def test_no_colour_becomes_depth_view(self):
+        from vfx_transcode import deep
+        pick = pick_channels(self.KARMA)          # would be BA,GA,RA: alphas, not colour
+        view = deep.plan_depth_view(_cfg(deep_zrange="10,500"), self.KARMA, pick)
+        self.assertEqual((view.near, view.far, view.alpha), (10, 500, True))
+        args = oiio.process_args(_cfg(), pick, view)
+        self.assertEqual(args[:6], ["--flatten", "--dup", "--ch", "R=A,G=A,B=A", "--swap", "--ch"])
+        self.assertIn("--contrast:black=10:white=500", args)
+        self.assertNotIn("--colorconvert", args)
+        self.assertEqual(args[args.index("--invert") + 1], "--mul")
+
+    def test_deep_with_colour_is_flattened_and_converted(self):
+        from vfx_transcode import deep
+        info = [{"deep": 1, "channelnames": ["R", "G", "B", "A", "Z", "ZBack"]}]
+        pick = pick_channels(info)
+        self.assertIsNone(deep.plan_depth_view(_cfg(), info, pick))
+        args = oiio.process_args(_cfg(), pick)
+        self.assertEqual(args[:3], ["--flatten", "--ch", "R,G,B"])
+        self.assertIn("--colorconvert", args)
+
+    def test_flat_image_untouched(self):
+        from vfx_transcode import deep
+        info = _info(["R", "G", "B"])
+        self.assertIsNone(deep.plan_depth_view(_cfg(), info, pick_channels(info)))
+
+    def test_printstats_and_zrange(self):
+        from vfx_transcode import deep
+        out = "Stats for x:\n    Stats Min: 0.000000 (float)\n    Stats Max: 845.3 (float)\n"
+        self.assertEqual(deep.parse_printstats(out), {"Min": [0.0], "Max": [845.3]})
+        self.assertEqual(deep.parse_zrange(" 1, 2e3"), (1.0, 2000.0))
+        for bad in ("5", "a,b", "10,1"):
+            with self.assertRaises(TranscodeError):
+                deep.parse_zrange(bad)
+
+
+class TimecodeSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        for f in (1001, 1002, 1003):
+            (d / "sh.{}.exr".format(f)).write_bytes(b"")
+        self.seq = find_sequence(d / "sh.1003.exr")
+        self.input = str(d / "sh.1003.exr")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_sources(self):
+        info = [{"attribs": {"smpte:TimeCode": "10:00:00:10"}}]
+        cfg = _cfg(input=self.input, timecode_source="counter")
+        self.assertEqual(cli.resolve_timecode(cfg, self.seq, info)[0], "00:00:41:17")
+        cfg = _cfg(input=self.input, timecode_source="arg", timecode="02:00:00:00")
+        self.assertEqual(cli.resolve_timecode(cfg, self.seq, info)[0], "02:00:00:00")
+        # header of frame 1003 says 10:00:00:10, so the first frame (1001) is 2 frames earlier
+        cfg = _cfg(input=self.input, timecode_source="exr")
+        self.assertEqual(cli.resolve_timecode(cfg, self.seq, info), ("10:00:00:08", "EXR header"))
+        self.assertEqual(cli.resolve_timecode(cfg, self.seq, [{"attribs": {}}])[1], "frame counter")
+
+    def test_header_formats(self):
+        from vfx_transcode.timecode import decode_smpte_bcd, timecode_from_attribs
+        self.assertEqual(decode_smpte_bcd(0x01000000), "01:00:00:00")
+        self.assertEqual(timecode_from_attribs({"smpte:TimeCode": [0x10594523, 0]}), "10:59:45:23")
+        self.assertEqual(timecode_from_attribs({"nuke/timecode": "01:02:03:04"}), "01:02:03:04")
+        self.assertIsNone(timecode_from_attribs({"DateTime": "2026:09:25 11:56:58"}))
+
+
+class FpsSourceTests(unittest.TestCase):
+    HDR25 = [{"attribs": {"FramesPerSecond": Rational("25/1")}}]
+    KARMA = [{"attribs": {"FramesPerSecond": 23.976}}]      # Karma writes a float
+    NONE = [{"attribs": {}}]
+
+    def fps(self, source, arg, info):
+        cfg = _cfg(fps_source=source, fps_arg=None if arg is None else Fraction(arg))
+        fps, origin = cli.resolve_fps(cfg, info)
+        return str(fps), origin.split(" ")[0]
+
+    def test_matrix(self):
+        # (source, -r, header) -> (fps, origin)
+        cases = [
+            ("arg", 24, self.HDR25, ("24", "-r")),        # explicit always wins (default)
+            ("arg", None, self.HDR25, ("25", "EXR")),     # no -r: header before the 24 default
+            ("arg", None, self.NONE, ("24", "default")),
+            ("exr", 24, self.HDR25, ("25", "EXR")),       # header overrides -r
+            ("exr", 30, self.NONE, ("30", "-r")),         # no header: -r as fallback
+            ("exr", None, self.NONE, ("24", "default")),
+            ("exr", None, None, ("24", "default")),       # non-EXR input
+            ("arg_only", None, self.HDR25, ("24", "default")),   # header ignored
+            ("arg_only", 25, self.NONE, ("25", "-r")),
+            ("exr", None, self.KARMA, ("24000/1001", "EXR")),
+        ]
+        for source, arg, info, expected in cases:
+            with self.subTest(source=source, arg=arg):
+                self.assertEqual(self.fps(source, arg, info), expected)
+
+    def test_header_values(self):
+        from vfx_transcode.timecode import fps_from_attribs, fps_from_value
+        self.assertEqual(fps_from_value(29.97), Fraction(30000, 1001))
+        self.assertEqual(fps_from_value([24000, 1001]), Fraction(24000, 1001))
+        self.assertEqual(fps_from_value(12.5), Fraction(25, 2))
+        self.assertIsNone(fps_from_value("abc"))
+        self.assertIsNone(fps_from_value(0))
+        self.assertEqual(fps_from_attribs({"frameRate": "25", "x": 1}), (25, "frameRate"))
+        self.assertEqual(fps_from_attribs({"frame_rate": 25.0}), (25, "frame_rate"))
+        self.assertEqual(fps_from_attribs({"nuke/input/frame_rate": "23.976"})[0], Fraction(24000, 1001))
+        self.assertEqual(fps_from_attribs({"frame_rate": 30, "FramesPerSecond": Rational("24/1")}),
+                         (24, "FramesPerSecond"))     # FramesPerSecond preferred
+        self.assertEqual(fps_from_attribs({"frame_rate_mode": 25}), (None, None))
+        self.assertEqual(fps_from_attribs({"FramesPerSecond": "junk"}), (None, None))
+
+    def test_cli(self):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"])
+        cfg = cli.config_from_args(ns, PRESETS)
+        self.assertEqual((cfg.fps_arg, cfg.fps_source, cfg.fps), (None, "arg", 24))
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-r", "23.976", "-fps_source", "exr"])
+        cfg = cli.config_from_args(ns, PRESETS)
+        self.assertEqual((cfg.fps_arg, cfg.fps_source), (Fraction(24000, 1001), "exr"))
+
+
+class MetadataTests(unittest.TestCase):
+    ATTRIBS = {"Artist": "bagel", "husk:command": "/opt/hfs/bin/husk ...", "compression": "zip",
+               "oiio:ColorSpace": "raw", "worldToCamera": [[1, 0], [0, 1]],
+               "renderTime": 44.7, "husk:render_stats": "x" * 5000, "FramesPerSecond": Rational("24/1")}
+
+    def test_copy_filters(self):
+        from vfx_transcode import metadata as md
+        header = md.header_metadata(self.ATTRIBS)
+        self.assertEqual(list(header), ["Artist", "husk:command", "renderTime", "FramesPerSecond"])
+        self.assertEqual(md.select(header, ""), {})
+        self.assertEqual(list(md.select(header, "all,-husk:*")), ["Artist", "renderTime", "FramesPerSecond"])
+        self.assertEqual(list(md.select(header, "Artist, render*")), ["Artist", "renderTime"])
+        self.assertEqual(header["FramesPerSecond"], "24/1")
+
+    def test_pairs_and_expansion(self):
+        from vfx_transcode import metadata as md
+        pairs = md.parse_pairs(["title={clean_name} v2", "comment=a=b", "x={unknown}"])
+        out = md.build({"Artist": "bagel", "title": "old"}, pairs, {"clean_name": "sh010"})
+        self.assertEqual(out, {"Artist": "bagel", "title": "sh010 v2", "comment": "a=b", "x": "{unknown}"})
+        with self.assertRaises(TranscodeError):
+            md.parse_pairs(["novalue"])
+
+
+class ReelNameTests(unittest.TestCase):
+    def setUp(self):
+        self.seq = type("S", (), {"clean_name": "sh010", "start": 1001, "end": 1010})()
+
+    def reel(self, source, arg="", info=None, attr="owner"):
+        cfg = _cfg(reelid_source=source, reelid=arg, reelid_attr=attr)
+        return cli.resolve_reel_name(cfg, self.seq, info, "01:00:00:00")[0]
+
+    def test_sources(self):
+        owner = [{"attribs": {"Copyright": "A001C003"}}]      # OIIO's name for EXR "owner"
+        self.assertEqual(self.reel("auto", "R1", owner), "R1")          # explicit first
+        self.assertEqual(self.reel("auto", "", owner), "A001C003")
+        self.assertEqual(self.reel("auto", "", [{"attribs": {}}]), "")  # nothing written
+        self.assertEqual(self.reel("exr", "R1", owner), "A001C003")     # header first
+        self.assertEqual(self.reel("exr", "R1", [{"attribs": {}}]), "R1")
+        self.assertEqual(self.reel("arg", "", owner), "")
+        self.assertEqual(self.reel("arg", "{clean_name}_R", owner), "sh010_R")   # keywords
+        self.assertEqual(self.reel("off", "R1", owner), "")
+        other = [{"attribs": {"pipe/reel": " B002 "}}]
+        self.assertEqual(self.reel("exr", "", other, attr="pipe/reel"), "B002")
+        self.assertEqual(self.reel("exr", "", [{"attribs": {"owner": "C3"}}]), "C3")  # raw name too
+
+    def test_clean_camera_clip_name(self):
+        from vfx_transcode import metadata as md
+        icoi = "Z017_C001_20190920_R[00000-02773]"          # owner of the ICOI2 sample
+        self.assertEqual(md.clean_reel_name(icoi), "Z017_C001_20190920_R")
+        self.assertEqual(md.clean_reel_name("A001 [12]"), "A001")
+        self.assertEqual(md.clean_reel_name("A[1]B"), "A[1]B")           # only a trailing range
+        self.assertEqual(md.clean_reel_name(icoi, r"^(Z\d+_C\d+)"), "Z017_C001")
+        self.assertEqual(md.clean_reel_name(icoi, r"C\d+"), "C001")       # whole match
+        self.assertEqual(md.clean_reel_name(icoi, r"^nomatch"), icoi)
+        info = [{"attribs": {"Copyright": icoi}}]
+        self.assertEqual(self.reel("exr", "", info), "Z017_C001_20190920_R")
+        self.assertEqual(self.reel("exr", "{clean_name}", [{"attribs": {"Copyright": "[1-2]"}}]),
+                         "sh010")                                         # empty after cleaning
+
+    def test_ffmpeg_args(self):
+        cmd = ffmpeg.build_command(_cfg(ff_out_ext="mov"), "l.txt", "o.mov", "VF", "01:00:00:00",
+                                   {}, "A001C003")
+        i = cmd.index("-metadata:s:v:0")
+        self.assertEqual(cmd[i + 1], "reel_name=A001C003")
+        self.assertIn("reel_name=A001C003", cmd[i + 2:])
+        self.assertIn("+use_metadata_tags", "".join(cmd))
+        cmd = ffmpeg.build_command(_cfg(ff_out_ext="mov"), "l.txt", "o.mov", "VF", "01:00:00:00")
+        self.assertNotIn("-metadata:s:v:0", cmd)
+
+
+class MetadataPresetTests(unittest.TestCase):
+    def parse(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_default_is_none(self):
+        cfg = self.parse()
+        self.assertEqual((cfg.metadata_preset, cfg.preset_tags, cfg.metadata_copy), ("", {}, ""))
+        self.assertEqual((cfg.reelid_source, cfg.reelid_attr, cfg.timecode_source), ("auto", "owner", "counter"))
+
+    def test_conform_preset_and_overrides(self):
+        cfg = self.parse("-metadata_preset", "conform")
+        self.assertEqual((cfg.timecode_source, cfg.reelid_source, cfg.reelid_attr), ("exr", "exr", "owner"))
+        self.assertEqual(cfg.preset_tags, {"title": "{clean_name}"})
+        cfg = self.parse("-metadata_preset", "conform", "-reelid_source", "off", "-timecode", "02:00:00:00")
+        self.assertEqual((cfg.reelid_source, cfg.timecode_source), ("off", "arg"))   # command line wins
+        cfg = self.parse("-metadata_preset", "archive", "-metadata_copy", "")
+        self.assertEqual(cfg.metadata_copy, "")                                     # "" overrides the preset
+        self.assertEqual(self.parse("-metadata_preset", "archive").metadata_copy, "all,-husk:*,-nuke/*,-MEDIA_PATH")
+        self.assertEqual(self.parse("-metadata_preset", "none").metadata_preset, "")
+        with self.assertRaises(TranscodeError):
+            self.parse("-metadata_preset", "nope")
+
+    def test_layer_order_and_removal(self):
+        from vfx_transcode import metadata as md
+        out = md.build({"title": "from exr", "Artist": "bagel"},
+                       md.parse_pairs(["comment=", "extra=1"]), {"clean_name": "sh010"},
+                       [{"vendor_id": "appl", "title": "enc"},
+                        {"title": "{clean_name}", "comment": "preset"}])
+        self.assertEqual(out, {"title": "sh010", "Artist": "bagel", "vendor_id": "appl", "extra": "1"})
+
+
+class PresetFileTests(unittest.TestCase):
+    def write(self, text):
+        path = Path(self.tmp.name) / "p.json"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_repo_file(self):
+        self.assertEqual(PRESETS.default, "h264")
+        self.assertIn("prores422hq", PRESETS.presets)
+        self.assertEqual(PRESETS.default_burnin, "")          # "none" in the file
+        self.assertEqual(PRESETS.get_burnin("client").size, "1.1%")
+        self.assertIsNone(PRESETS.get_burnin("none"))
+        for b in PRESETS.burnins.values():                    # every keyword is a known one
+            for text in b.corners.values():
+                for _lit, fieldname, _spec, _conv in __import__("string").Formatter().parse(text):
+                    if fieldname:
+                        self.assertIn(fieldname, ffmpeg.BURN_KEYWORDS)
+
+    def test_old_key_names_still_load(self):
+        from vfx_transcode.channels import PREFERRED_CHANNELS
+        p = load_presets(self.write('{"default": "x", "presets": {"x": {"ext": "mp4", '
+                                    '"encode": "{videofilter}"}}}'))
+        self.assertEqual((p.default, p.burnins), ("x", {}))
+        self.assertEqual(p.channel_preferences, PREFERRED_CHANNELS)   # built-in fallback
+
+    def test_channel_preferences(self):
+        from vfx_transcode.channels import PREFERRED_CHANNELS
+        self.assertEqual(PRESETS.channel_preferences, PREFERRED_CHANNELS)  # shipped = built-in
+        base = '{"encode_presets": {"x": {"ext": "mp4", "encode": "{videofilter}"}}, %s}'
+        p = load_presets(self.write(base % '"channel_preferences": ["beauty.R, beauty.G,beauty.B", ["Y"]]'))
+        self.assertEqual(p.channel_preferences, [["beauty.R", "beauty.G", "beauty.B"], ["Y"]])
+        for bad in ('[]', '"R,G,B"', '[""]', '[["R", 1]]', '[5]'):
+            with self.assertRaises(TranscodeError):
+                load_presets(self.write(base % ('"channel_preferences": ' + bad)))
+
+    def test_metadata_preset_errors(self):
+        base = '{"encode_presets": {"x": {"ext": "mp4", "encode": "{videofilter}"%s}}%s}'
+        p = load_presets(self.write(base % (', "metadata": {"vendor_id": "appl", "n": 5}',
+                                            ', "metadata_presets": {"m": {"tags": {"a": "b"}, "reelid_source": "exr"}}')))
+        self.assertEqual(p.get("x").metadata, {"vendor_id": "appl", "n": "5"})
+        self.assertEqual(p.get_metadata_preset("m").reelid_source, "exr")
+        for enc, extra in (('', ', "metadata_presets": {"m": {"tagz": {}}}'),             # unknown field
+                           ('', ', "metadata_presets": {"m": {"reelid_source": "maybe"}}'),
+                           ('', ', "metadata_presets": {"m": {"tags": {"a": [1]}}}'),
+                           ('', ', "metadata_presets": {"m": {"reelid_pattern": "("}}'),
+                           ('', ', "metadata_presets": {"none": {}}'),
+                           ('', ', "default_metadata": "nope"'),
+                           (', "metadata": "vendor_id=appl"', '')):
+            with self.assertRaises(TranscodeError):
+                load_presets(self.write(base % (enc, extra)))
+
+    def test_burnin_errors(self):
+        base = '{"encode_presets": {"x": {"ext": "mp4", "encode": "{videofilter}"}}, %s}'
+        for bad in ('"burnin_presets": {"b": {"top": "x"}}',           # unknown field
+                    '"burnin_presets": {"b": {"size": "big"}}',
+                    '"burnin_presets": {"none": {"tl": "x"}}',         # reserved name
+                    '"default_burnin": "nope"'):
+            with self.assertRaises(TranscodeError):
+                load_presets(self.write(base % bad))
+        with self.assertRaises(TranscodeError):
+            PRESETS.get_burnin("nope")
+
+    def test_list_form_and_errors(self):
+        p = load_presets(self.write('{"presets": {"x": {"ext": ".mkv", "notes": ["a", "b"], '
+                                    '"encode": ["-c:v", "ffv1", "{videofilter}"]}}}'))
+        self.assertEqual((p.default, p.get("x").ext, p.get("x").notes), ("x", "mkv", "a b"))
+        for bad in ('{"presets": {"x": {"ext": "mp4", "encode": "-c:v libx264"}}}',   # no {videofilter}
+                    '{"presets": {"x": {"encode": "{videofilter}"}}}',                # no ext
+                    '{"presets": {}}', "{not json"):
+            with self.assertRaises(TranscodeError):
+                load_presets(self.write(bad))
+        with self.assertRaises(TranscodeError):
+            p.get("nope")
+
+
+class CliTests(unittest.TestCase):
+    def parse(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_timecode_source_rules(self):
+        self.assertEqual(self.parse().timecode_source, "counter")
+        self.assertEqual(self.parse("-timecode", "02:00:00:00").timecode_source, "arg")
+        self.assertEqual(self.parse("-timecode_from_counter", "0").timecode_source, "arg")
+        self.assertEqual(self.parse("-timecode_source", "exr").timecode_source, "exr")
+        with self.assertRaises(TranscodeError):
+            self.parse("-timecode", "1:00:00")
+
+    def test_burn_preset_and_overrides(self):
+        cfg = self.parse()
+        self.assertEqual(set(cfg.burn.values()), {""})                       # default: none
+        self.assertEqual(sorted(cfg.burn), sorted(["tl", "tc", "tr", "bl", "bc", "br"]))
+        self.assertTrue(cfg.burn_font.endswith("DroidSansMono.ttf"))
+        cfg = self.parse("-burn_preset", "review", "-burn_tl", "{clean_name} v2", "-burn_bl", "")
+        self.assertEqual({k: v for k, v in cfg.burn.items() if v},
+                         {"tl": "{clean_name} v2", "tr": "TC {tc}", "br": "{current_frame}"})
+        self.assertEqual((cfg.burn_size, cfg.burn_preset), ("1.33%", "review"))
+        cfg = self.parse("-burn_preset", "client")
+        self.assertEqual(cfg.burn_size, "1.1%")
+        self.assertEqual(self.parse("-burn_preset", "client", "-burn_size", "40").burn_size, "40")
+        self.assertEqual(self.parse("-burn_size", "2%").burn_size, "2%")
+        self.assertEqual(self.parse("-burn_size", "h/75").burn_size, "h/75")
+        self.assertEqual(self.parse("-burn_br", "{current_frame}").burn["br"], "{current_frame}")
+        with self.assertRaises(TranscodeError):
+            self.parse("-burn_preset", "nope")
+
+    def test_preset_flag_not_mistaken_for_presets_file(self):
+        presets, err = cli.load_presets_for(["-preset", "h265", "-i", "x"])
+        self.assertIsNone(err)
+
+    def test_bad_reel_pattern(self):
+        with self.assertRaises(TranscodeError):
+            self.parse("-reelid_pattern", "(")
+
+    def test_temp_location_default(self):
+        self.assertEqual(self.parse().temp_location, "user")
+        self.assertEqual(self.parse("-temp_location", "source").temp_location, "source")
+
+    def test_old_style_switches(self):
+        cfg = self.parse("-temp_keep", "1", "-write_exr_info", "1", "-v", "1", "-skipffmpeg", "0")
+        self.assertTrue(cfg.temp_keep)
+        self.assertTrue(cfg.write_exr_info)
+        self.assertEqual(cfg.verbose, 1)          # int now; '1' <= 1 used to raise TypeError
+        self.assertFalse(cfg.skip_ffmpeg)
+        self.assertTrue(self.parse("-skipffmpeg").temp_keep)
+
+    def test_empty_channel_means_automatic(self):
+        self.assertEqual(self.parse().oiio_channel, [])
+        self.assertEqual(self.parse().channel_preferences, PRESETS.channel_preferences)
+
+    def test_preset_sets_extension(self):
+        self.assertEqual(self.parse("-preset", "prores422hq").ff_out_ext, "mov")
+        self.assertEqual(self.parse().preset.name, "h264")
+        self.assertEqual(self.parse("-preset", "prores422hq", "-ff_out_ext", "mxf").ff_out_ext, "mxf")
+
+    def test_temp_must_stay_inside_input_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seq = type("S", (), {"folder": Path(tmp)})()
+            for bad in ("/abs/path", "\\root", "C:rel", "C:/abs", "../up", "a/../../b"):
+                with self.assertRaises(TranscodeError):
+                    cli.prepare_work_dir(_cfg(temp=bad, temp_location="source"), seq)
+            work, created = cli.prepare_work_dir(_cfg(temp=".tmp", temp_location="source"), seq)
+            self.assertTrue(created and work.is_dir())
+            self.assertEqual(work, Path(tmp) / ".tmp")
+
+    def test_user_temp(self):
+        seq = type("S", (), {"folder": Path("/nowhere"), "clean_name": "sh'ot 010"})()
+        a, created = cli.prepare_work_dir(_cfg(), seq)             # default: user temp
+        b, _ = cli.prepare_work_dir(_cfg(), seq)
+        try:
+            self.assertTrue(created and a.is_dir() and a != b)     # private folder per run
+            self.assertEqual(a.parent, Path(tempfile.gettempdir()) / "vfx-transcode")
+            self.assertTrue(a.name.startswith("sh_ot_010_"))
+            (a / "partial.png").write_bytes(b"x")                 # e.g. a failed frame
+            cli.cleanup([], a, True, whole_folder=True)
+            self.assertFalse(a.exists())
+        finally:
+            cli.cleanup([], a, True, whole_folder=True)
+            cli.cleanup([], b, True, whole_folder=True)
+
+    def test_resolve_path(self):
+        self.assertEqual(resolve_path("./oiio/oiiotool.exe", "/app"), str(Path("/app/oiio/oiiotool.exe")))
+        self.assertEqual(resolve_path("../tools/ffmpeg", "/app/bin"), str(Path("/app/tools/ffmpeg")))
+        self.assertEqual(resolve_path("C:/ffmpeg.exe", "/app"), "C:/ffmpeg.exe")
+
+
+if __name__ == "__main__":
+    unittest.main()

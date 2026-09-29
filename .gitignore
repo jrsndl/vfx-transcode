@@ -1,12 +1,24 @@
+# local data, builds, scratch
+media/
 test_files/
+tst/
+tst.py
 build/
 dist/
-ffmpeg/
-fonts/
-ocio/
-oiio/
-tst/
 venv/
-*.bat
+__pycache__/
+*.egg-info/
 
-tst.py
+# personal .bat files stay local; the shared test script is tracked
+*.bat
+!test_conversion.bat
+
+# tool folders are tracked (each with a README saying what goes in), their contents are not
+ffmpeg/*
+!ffmpeg/README.md
+fonts/*
+!fonts/README.md
+ocio/*
+!ocio/README.md
+oiio/*
+!oiio/README.md
