@@ -8,6 +8,7 @@ import logging
 import re
 import string
 from dataclasses import dataclass, field
+from typing import Optional
 from fractions import Fraction
 from pathlib import Path
 
@@ -94,9 +95,13 @@ class BurnContext:
     movie_timecode: str = "" # timecode of the movie's first frame (the slate), if different
     skip_lead: bool = True   # no burn-ins on the lead frames
     tokens: dict = field(default_factory=dict)   # name keywords: {version_string}, {namesplit1} ...
+    counter_base: Optional[int] = None   # {current_frame} of the movie's first frame, if not
+                                         # frame_start - lead_frames (a one-frame preview)
 
     @property
     def counter_start(self):
+        if self.counter_base is not None:
+            return self.counter_base
         return self.frame_start - self.lead_frames
 
     @property

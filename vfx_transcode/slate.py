@@ -32,13 +32,14 @@ from .tools import run_tool
 log = logging.getLogger(__name__)
 
 NO_SLATE = "none"
+PLAIN_SLATE = "plain"      # -slate plain: no preset, only what the options give
 THUMBNAIL_CHOICES = ("middle", "first", "last", "none")
 VALIGN_CHOICES = ("center", "top")
 SLATE_COLOR_FIELDS = ("background", "title_color", "subtitle_color", "value_color", "label_color",
                       "line_color")
 SLATE_SIZE_FIELDS = ("title_size", "subtitle_size", "size")
-SLATE_STYLE_FIELDS = SLATE_COLOR_FIELDS + SLATE_SIZE_FIELDS + ("scale", "valign", "rule", "font",
-                                                               "color")
+SLATE_STYLE_FIELDS = SLATE_COLOR_FIELDS + SLATE_SIZE_FIELDS + ("scale", "valign", "rule",
+                                                               "hide_empty", "font", "color")
 SLATE_PRESET_FIELDS = ("notes", "title", "subtitle", "fields", "thumbnail", "hide_empty") \
     + SLATE_STYLE_FIELDS
 SLATE_KEYWORDS = ("clean_name", "frame_start", "frame_end", "frames", "timecode", "timecode_end",
@@ -110,6 +111,8 @@ def style_values(values, where):
         out["valign"] = parse_valign(values["valign"], where + ": valign")
     if values.get("rule") is not None:
         out["rule"] = parse_bool(values["rule"], where + ": rule")
+    if values.get("hide_empty") is not None:
+        out["hide_empty"] = parse_bool(values["hide_empty"], where + ": hide_empty")
     return out
 
 

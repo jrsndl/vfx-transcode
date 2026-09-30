@@ -10,13 +10,19 @@ requires-python = ">=3.9"
 dependencies = []   # standard library only; oiiotool and ffmpeg are external executables
 
 [project.optional-dependencies]
-dev = ["pytest", "pyinstaller"]
+tuner = ["PySide6"]                      # the tuner app: uv sync --extra tuner
+
+[dependency-groups]
+dev = ["pytest", "pyinstaller>=5.9"]     # installed by uv sync by default
 
 [project.scripts]
 vfx-transcode = "vfx_transcode.cli:main"
 
+[project.gui-scripts]
+vfx-transcode-tuner = "vfx_tuner.app:main"
+
 [tool.setuptools]
-packages = ["vfx_transcode"]
+packages = ["vfx_transcode", "vfx_tuner"]
 
 [tool.setuptools.dynamic]
 version = { attr = "vfx_transcode.__version__" }

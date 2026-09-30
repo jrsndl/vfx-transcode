@@ -10,6 +10,7 @@ were replaced by a neighbouring frame, 130 interrupted.
 import argparse
 import datetime
 import getpass
+import json
 import logging
 import re
 import shutil
@@ -30,7 +31,8 @@ from .burnin import (BURN_PLACES, DEFAULT_MARGINS, PLACE_NAMES, BurnStyle, margi
 from .config import Config
 from .deep import parse_zrange, plan_depth_view
 from .errors import TranscodeError
-from .ffmpeg import BurnContext, build_command, build_video_filter, encode, write_concat_list
+from .ffmpeg import (BurnContext, build_command, build_video_filter, encode, encode_args,
+                     write_concat_list)
 from .oiio import convert_sequence
 from .oiio_info import get_image_info, write_info_json
 from . import metadata as md
@@ -45,10 +47,10 @@ from .thumbnails import (choose_frame as choose_thumbnail_frame, ffmpeg_command 
 from .oiio import process_args
 from .sequence import fill_holes, find_sequence, format_frames
 from .channels import find_alpha
-from .slate import (SLATE_STYLE_FIELDS, SlateSpec, apply_field_options, has_alpha, movie_size,
+from .slate import (PLAIN_SLATE, SLATE_STYLE_FIELDS, SlateSpec, apply_field_options, has_alpha, movie_size,
                     parse_thumbnail, pick_thumbnail, probe_frame, probe_frames, render_slate,
                     slate_timecode, style_values)
-from .timecode import (fps_display, fps_from_attribs, frame_to_tc, nominal_fps,
+from .timecode import (fps_display, fps_from_attribs, fps_to_str, frame_to_tc, nominal_fps,
                        offset_timecode, parse_fps, timecode_from_attribs, validate_timecode)
 from .tools import app_dir, resolve_path, resolve_tool, run_tool, split_args
 
@@ -104,6 +106,11 @@ def build_parser(presets=None, presets_error=None):
     p.add_argument("-thumbnail_frame", default=None, metavar="middle|first|last|largest|FRAME",
                    help="Which frame: overrides the preset. largest = the frame whose converted "
                         "image is the biggest file (needs the movie; else middle)")
+    p.add_argument("-preview", default="", metavar="FILE.png",
+                   help="Instead of the movie: one frame exactly as the movie shows it (burn-ins, "
+                        "letterbox, pixel format), as FILE.png; the slate as FILE_slate.png; and "
+                        "FILE.json with the input and output metadata. The frame: "
+                        "-thumbnail_frame (default middle). Used by vfx-transcode-tuner")
     p.add_argument("-r", "--fps", default=None, metavar="RATE",
                    help="Frame rate: 24, 25, 23.976, 24000/1001. See -fps_source for how it "
                         "combines with the EXR header; 24 if neither gives one")
@@ -165,6 +172,10 @@ def build_parser(presets=None, presets_error=None):
          "first layer")
     g.add_argument("-oiio_command", default="",
                    help="Extra oiiotool arguments, added after colorconvert and resize")
+    g.add_argument("-oiio_transform_args", default=None, metavar="ARGS",
+                   help='oiiotool transform arguments used as they are, instead of a preset, e.g. '
+                        '"--rangecompress --resize 0x1080 --rangeexpand". Keywords work. Replaces '
+                        "-oiio_transform; -width then applies in ffmpeg. EXR only")
     g.add_argument("-oiio_transform", default=None, metavar="NAME",
                    help="Transform preset from the presets file (oiio_transforms): resize / crop "
                         "chosen by conditions on the input, e.g. its size. Replaces the oiiotool "
@@ -273,7 +284,7 @@ def build_parser(presets=None, presets_error=None):
 
     g = p.add_argument_group("slate")
     g.add_argument("-slate", default=None, metavar="NAME",
-                   help='Slate preset from the presets file, or "none" (default: the file\'s '
+                   help='Slate preset from the presets file, "plain" (only the -slate_* options) or "none" (default: the file\'s '
                         "default_slate). The slate is one frame before the first picture: frame "
                         "start-1, timecode start-1 (never below 00:00:00:00), same size and pixel "
                         "aspect as the pictures")
@@ -392,7 +403,10 @@ def parse_slate_style(items):
 
 def slate_from_args(ns, presets):
     """The slate to draw (preset + command-line overrides), or None."""
-    spec = presets.get_slate(ns.slate if ns.slate is not None else presets.default_slate)
+    if ns.slate == PLAIN_SLATE:
+        spec = SlateSpec()                  # -slate plain: title {clean_name}, only given rows
+    else:
+        spec = presets.get_slate(ns.slate if ns.slate is not None else presets.default_slate)
     given = [o for o in SLATE_OPTIONS if getattr(ns, o) is not None] + \
         (["slate_field"] if ns.slate_field else []) + (["slate_burnin"] if ns.slate_burnin else []) + \
         (["slate_style"] if ns.slate_style else []) + (["slate_rule"] if ns.slate_rule is not None else [])
@@ -515,10 +529,16 @@ def config_from_args(ns, presets):
             thumbnail = replace(thumbnail, frame=parse_thumbnail_frame(ns.thumbnail_frame))
         if ns.ot.strip():
             check_output_template(ns.ot, "-ot", THUMBNAIL_KEYWORDS)
-    elif ns.thumbnail_preset is not None or ns.thumbnail_frame is not None:
+    elif (ns.thumbnail_preset is not None or ns.thumbnail_frame is not None) and not ns.preview:
         log.warning("-thumbnail_preset / -thumbnail_frame ignored: no -ot.")
     # what to make: -o and/or -ot; neither = the movie at its default place
     movie = bool(ns.o.strip()) or ns.ot is None
+    preview_frame = "middle"
+    if ns.preview:
+        if ns.o.strip() or ns.ot is not None:
+            log.warning("-preview: -o / -ot are ignored, only the preview is written.")
+        movie, thumbnail = True, None
+        preview_frame = parse_thumbnail_frame(ns.thumbnail_frame or "middle")
     if ns.clf.strip() and (ns.display is not None or ns.view is not None or ns.looks):
         log.warning("-clf is used for the colour; -display / -view / -looks are ignored.")
     oiio_transform = presets.get_transform(
@@ -550,6 +570,8 @@ def config_from_args(ns, presets):
         channel_preferences=presets.channel_preferences,
         oiio_command=split_args(ns.oiio_command),
         oiio_transform=oiio_transform,
+        oiio_transform_explicit=(split_args(ns.oiio_transform_args)
+                                 if ns.oiio_transform_args is not None else None),
         oiio_per_file=ns.oiio_per_file,
         mezzanine=ns.mezzanine,
         mezzanine_16bit=ns.mezzanine_16bit,
@@ -581,6 +603,8 @@ def config_from_args(ns, presets):
         letterbox=letterbox,
         movie=movie,
         thumbnail=thumbnail,
+        preview=os.path.abspath(ns.preview) if ns.preview else "",
+        preview_frame=preview_frame,
         thumbnail_output=ns.ot,
         alpha=ns.alpha,
         alpha_premult=bool(ns.alpha_premult),
@@ -856,11 +880,20 @@ def run(cfg):
             if cfg.clf:
                 cfg.clf_path = resolve_clf(cfg, seq, info)
                 log.info("Colour: %s", describe_colour(cfg))
-            if cfg.oiio_transform is not None:
+            if cfg.oiio_transform_explicit is not None:
+                context = transform_context(cfg, seq, info)
+                cfg.oiio_transform_args = [md.expand(a, context) for a in cfg.oiio_transform_explicit]
+                cfg.transform_choice = "-oiio_transform_args"
+                log.info("OIIO transform: %s", " ".join(cfg.oiio_transform_args) or "(none)")
+            elif cfg.oiio_transform is not None:
                 cfg.oiio_transform_args = choose_transform(cfg, seq, info)
             if not cfg.movie:
                 return make_thumbnail_only(cfg, seq, info, pick, depth, exit_code)
-            result = convert_sequence(cfg, seq, pick, work_dir, depth)
+            if cfg.preview:
+                preview_frame = choose_preview_frame(cfg, seq)
+                result = convert_preview_frame(cfg, seq, preview_frame, pick, work_dir, depth)
+            else:
+                result = convert_sequence(cfg, seq, pick, work_dir, depth)
             # every target, so partial files of failed frames are removed as well
             created_files += [work_dir / seq.name(f, cfg.mezzanine_ext) for f in seq.frames]
             if result.failed:
@@ -875,6 +908,9 @@ def run(cfg):
             scale_width = cfg.width if cfg.oiio_transform_args is not None else 0
         else:
             available = {f: seq.path(f) for f in seq.frames}
+            if cfg.preview:
+                preview_frame = choose_preview_frame(cfg, seq)
+                available = {preview_frame: seq.path(preview_frame)}
             scale_width = cfg.width
             if cfg.clf:
                 log.warning("-clf only applies to EXR input (oiiotool); %s frames are used as "
@@ -939,7 +975,8 @@ def run(cfg):
         name = seq.clean_name or seq.folder.name or "output"
         list_file = work_dir / "{}.ffconcat.txt".format(name)
         created_files.append(list_file)
-        frame_files = fill_holes(seq.full_range, available)
+        frame_files = ([available[preview_frame]] if cfg.preview
+                       else fill_holes(seq.full_range, available))
         fmt = probe_frames(cfg.ffmpeg, available, cfg.verbose) if (cfg.slate or cfg.letterbox) else None
         if cfg.letterbox:
             width, height = movie_size(fmt, cfg.par_in, cfg.par_out_value, scale_width)
@@ -961,11 +998,23 @@ def run(cfg):
             if cfg.burn_margins and cfg.burn_margins != DEFAULT_MARGINS:
                 log.info("  margins: %s", ", ".join("{} {}".format(k, v)
                                                     for k, v in cfg.burn_margins.items()))
+        lead = 1 if cfg.slate else 0
+        counter_base = None
+        if cfg.preview:
+            # the one picture frame shows its own frame number and running timecode
+            counter_base = preview_frame - lead
+            movie_tc = offset_timecode(timecode, preview_frame - seq.start - lead,
+                                       nominal_fps(cfg.fps))
         ctx = BurnContext(seq.clean_name, seq.start, seq.end, timecode, cfg.fps,
                           cfg.preset.name, today(), cfg.header_attribs,
-                          lead_frames=1 if cfg.slate else 0, movie_timecode=movie_tc,
-                          skip_lead=not (cfg.slate and cfg.slate.burnin), tokens=cfg.name_tokens)
+                          lead_frames=lead, movie_timecode=movie_tc,
+                          skip_lead=not (cfg.slate and cfg.slate.burnin), tokens=cfg.name_tokens,
+                          counter_base=counter_base)
         video_filter = build_video_filter(cfg, ctx, scale_width)
+        if cfg.preview:
+            write_preview(cfg, seq, info, list_file, video_filter, work_dir, preview_frame,
+                          timecode, movie_tc, reel_name, metadata)
+            return exit_code
         output = resolve_output(cfg, seq, name, output_context(cfg, seq, info, timecode, reel_name))
         output.parent.mkdir(parents=True, exist_ok=True)
         encode(cfg, build_command(cfg, list_file, output, video_filter, movie_tc, metadata,
@@ -1075,6 +1124,98 @@ def resolve_path_template(template, seq, default_name, ext, ext_re, label, conte
     return Path(path)
 
 
+PREVIEW_CACHE_FILES = 60
+
+
+def choose_preview_frame(cfg, seq):
+    frame, how = choose_thumbnail_frame(cfg.preview_frame, seq.frames, None)
+    log.info("Preview: frame %d (%s)", frame, how)
+    return frame
+
+
+def convert_preview_frame(cfg, seq, frame, pick, work_dir, depth):
+    """oiiotool for the one preview frame, cached by its exact oiiotool arguments and source
+    file, so burn-in / slate / letterbox changes don't convert it again."""
+    import hashlib
+    from .oiio import ConversionResult
+    src = seq.path(frame)
+    stat = os.stat(str(src))
+    parts = [str(src), str(stat.st_mtime_ns), str(stat.st_size), cfg.mezzanine_ext,
+             os.environ.get("OCIO", "")] + process_args(cfg, pick, depth)
+    key = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+    cache_dir = Path(tempfile.gettempdir()) / TEMP_ROOT_NAME / "preview-cache"
+    cached = cache_dir / (key + cfg.mezzanine_ext)
+    target = Path(work_dir) / seq.name(frame, cfg.mezzanine_ext)
+    if cached.is_file():
+        shutil.copyfile(str(cached), str(target))
+        log.info("Preview: converted frame taken from the cache")
+        return ConversionResult(outputs={frame: target})
+    result = convert_sequence(cfg, replace(seq, frames=(frame,)), pick, work_dir, depth)
+    if frame in result.outputs:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(result.outputs[frame]), str(cached))
+            old = sorted(cache_dir.iterdir(), key=lambda p: p.stat().st_mtime)[:-PREVIEW_CACHE_FILES]
+            for path in old:
+                path.unlink()
+        except OSError as exc:
+            log.debug("Preview cache: %s", exc)
+    return result
+
+
+def preview_pix_fmt(cfg):
+    args = encode_args(cfg, "{videofilter}")
+    if "-pix_fmt" in args[:-1]:
+        return args[args.index("-pix_fmt") + 1]
+    return "yuv420p"
+
+
+def write_preview(cfg, seq, info, list_file, video_filter, work_dir, frame, timecode, movie_tc,
+                  reel_name, metadata):
+    """-preview: the movie's filter chain on the slate (if any) and the one frame, written as
+    PNG through the codec's pixel format (so chroma subsampling and range look like the movie),
+    plus a JSON file with what the tuner shows."""
+    image = Path(cfg.preview)
+    image.parent.mkdir(parents=True, exist_ok=True)
+    slate = image.with_name(image.stem + "_slate" + image.suffix) if cfg.slate else None
+    pix_fmt = preview_pix_fmt(cfg)
+    rgb = "rgba" if cfg.alpha_active else "rgb24"
+    chain = ",".join([video_filter, "format=" + pix_fmt,
+                      "scale=in_range=tv:in_color_matrix=bt709:out_range=pc", "format=" + rgb])
+    pattern = Path(work_dir) / "preview_%d.png"
+    cmd = [cfg.ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0",
+           "-r", fps_to_str(cfg.fps), "-i", Path(list_file).as_posix(), "-vf", chain,
+           "-f", "image2", "-start_number", "0", Path(pattern).as_posix()]
+    run_tool(cmd, "ffmpeg (preview)", cfg.verbose)
+    frames = [Path(str(pattern).replace("%d", str(i))) for i in range(2 if slate else 1)]
+    targets = [slate, image] if slate else [image]
+    for src, dst in zip(frames, targets):
+        shutil.move(str(src), str(dst))
+    fmt = probe_frame(cfg.ffmpeg, image, cfg.verbose)
+    context = transform_context(cfg, seq, info)
+    report = {
+        "image": str(image), "slate": str(slate) if slate else None,
+        "frame": frame, "frame_file": str(seq.path(frame)),
+        "input": {"first_file": str(seq.path(seq.start)), "frames": format_frames(seq.frames),
+                  "is_exr": seq.is_exr, "header": cfg.header_attribs,
+                  "par": par_display(cfg.par_in)},
+        "keywords": {k: v for k, v in context.items() if k != "meta"},
+        "output": {"width": fmt.width, "height": fmt.height, "par": float(cfg.par_out_value),
+                   "pix_fmt": pix_fmt, "fps": fps_display(cfg.fps), "timecode": timecode,
+                   "movie_timecode": movie_tc, "reel_name": reel_name, "metadata": metadata,
+                   "colour": describe_colour(cfg) if seq.is_exr else "",
+                   "transform": cfg.transform_choice,
+                   "transform_args": cfg.oiio_transform_args,
+                   "letterbox": (None if cfg.letterbox_plan is None else
+                                 {"kind": cfg.letterbox_plan.kind, "bar": cfg.letterbox_plan.bar}),
+                   "encode_preset": cfg.preset.name},
+    }
+    json_path = image.with_suffix(".json")
+    with open(str(json_path), "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, default=str)
+    log.info("Preview: %s%s, %s", image, " + " + str(slate) if slate else "", json_path.name)
+
+
 def frame_sizes(available):
     """{frame: bytes} of the converted intermediates, for the "largest" thumbnail."""
     sizes = {}
@@ -1158,6 +1299,7 @@ def choose_transform(cfg, seq, info):
                     "using -width %s.", preset.name, size, context["input_par"], cfg.width)
         return None
     args = transform_args(sub, context, md.expand)
+    cfg.transform_choice = "{} / {}".format(preset.name, sub.name)
     log.info('OIIO transform "%s": %s input -> sub "%s"%s: %s', preset.name, size, sub.name,
              " ({})".format("; ".join(details)) if details else "", " ".join(args) or "(no arguments)")
     if cfg.width > 0:

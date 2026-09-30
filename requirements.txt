@@ -2,3 +2,5 @@
 # Build / test tools:
 pyinstaller==5.9.0   # as before; 6.x also works
 pytest
+# The tuner (vfx-transcode-tuner.py) only:
+PySide6

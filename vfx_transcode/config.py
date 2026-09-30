@@ -43,6 +43,10 @@ class Config:
     oiio_command: List[str] = field(default_factory=list)
     oiio_transform: Any = None          # transforms.TransformPreset, None = -width resize
     oiio_transform_args: Optional[List[str]] = None   # the matching sub's args, set at run time
+    oiio_transform_explicit: Optional[List[str]] = None   # -oiio_transform_args
+    transform_choice: str = ""          # "preset / sub" that was used, for logs and -preview
+    preview: str = ""                   # -preview FILE.png: one frame as the movie shows it
+    preview_frame: str = "middle"       # which frame for -preview
     oiio_per_file: bool = False
     mezzanine: str = "png"
     mezzanine_16bit: bool = False

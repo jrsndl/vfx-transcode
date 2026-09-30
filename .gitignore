@@ -6,12 +6,14 @@ tst.py
 build/
 dist/
 venv/
+.venv/
 __pycache__/
 *.egg-info/
 
 # personal .bat files stay local; the shared test script is tracked
 *.bat
 !test_conversion.bat
+!build_exe.bat
 
 # tool folders are tracked (each with a README saying what goes in), their contents are not
 ffmpeg/*

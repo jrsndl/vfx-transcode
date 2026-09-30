@@ -130,7 +130,7 @@
     "  bits         png bit depth 8 (default) or 16"
   ],
   "default_encode": "h264",
-  "default_burnin": "none",
+  "default_burnin": "basic",
   "default_metadata": "none",
   "default_slate": "none",
   "default_oiio_transform": "none",
@@ -216,6 +216,14 @@
       "tr": "TC {tc}",
       "bl": "{frame_start}-{frame_end} @ {fps} fps",
       "br": "{current_frame}"
+    },
+    "basic": {
+      "notes": "Simple Review. First 5 underscore separated parts of the name",
+      "size": "2.5%",
+      "box": true,
+      "opacity": 0.5,
+      "bl": "{namesplit1}_{namesplit2}_{namesplit3}_{namesplit4}_{namesplit5}",
+      "br": "{current_frame}/{frame_start}-{frame_end}"
     },
     "review-boxed": {
       "notes": "Review on a black box, readable over bright plates; date centred on top.",

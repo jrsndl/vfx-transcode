@@ -18,6 +18,7 @@
 - [Letterbox](#letterbox)
 - [Alpha](#alpha)
 - [Thumbnail](#thumbnail)
+- [Preview](#preview)
 - [Encoding (ffmpeg)](#encoding-ffmpeg)
 - [Presets file](#presets-file)
 - [Logging and exit codes](#logging-and-exit-codes)
@@ -244,6 +245,7 @@ VFX projects often need a different resize or crop for each kind of input: UHD p
 | Option | Default | Description |
 |---|---|---|
 | `-oiio_transform NAME` | the presets file's `default_oiio_transform` (`none`) | Transform preset. `none` = off, the usual `-width` resize. `--help` lists the presets with their sub-presets and conditions. |
+| `-oiio_transform_args "ARGS"` | *(none)* | oiiotool transform steps used as they are, without a preset or conditions, e.g. `-oiio_transform_args "--rangecompress --resize 0x1080 --rangeexpand"`. Keywords work. Wins over `-oiio_transform`; like a transform preset, it replaces oiiotool's `-width` resize and ffmpeg then scales to `-width`. The tuner writes this when a sub-preset was edited. |
 
 **How a sub-preset is chosen.** A preset has a list of sub-presets (`subs`). They are checked from top to bottom, and the **first** one whose conditions **all** hold (logical AND) is used; the rest are not checked. A sub-preset without conditions always matches, so put one last as the catch-all. If none matches, a warning is printed and the normal `-width` resize is used.
 
@@ -529,7 +531,7 @@ A slate is one information frame placed before the first picture: shot name, fra
 
 | Option | Default | Description |
 |---|---|---|
-| `-slate NAME` | the presets file's `default_slate` (`none`) | Slate preset from the [presets file](#presets-file); `none` means no slate. `--help` lists the presets and their rows. |
+| `-slate NAME` | the presets file's `default_slate` (`none`) | Slate preset from the [presets file](#presets-file); `none` means no slate; `plain` means a slate from the `-slate_*` options only (title `{clean_name}`, no rows until `-slate_field` adds them), ignoring `default_slate`. `--help` lists the presets and their rows. |
 | `-slate_title TEXT` | the preset's, else `{clean_name}` | Big first line. |
 | `-slate_subtitle TEXT` | the preset's | Smaller line under the title. |
 | `-slate_field "LABEL=TEXT"` | *(none)* | Adds a row, or replaces the row with that label: `-slate_field "Notes=first comp pass"`. `"LABEL="` removes a row. Repeatable; new rows go at the end. |
@@ -542,7 +544,7 @@ A slate is one information frame placed before the first picture: shot name, fra
 | `-slate_value_color COLOR` | the preset's, else `white` | Colour of the row values. |
 | `-slate_rule 0\|1` | the preset's, else `0` | A line under the title, in `line_color`. |
 | `-slate_label_color COLOR` | the preset's, else `#7a7a7a` | Colour of the row labels (the field names), usually a darker grey. |
-| `-slate_style "KEY=VALUE,..."` | *(none)* | Any style setting, e.g. `-slate_style "title_color=yellow,background=#000000"`. Keys: `background`, `title_color`, `subtitle_color`, `value_color`, `label_color`, `line_color`, `title_size`, `subtitle_size`, `size`, `scale`, `valign`, `rule` (1/0), and `color` (title and values). Repeatable; wins over the options above. |
+| `-slate_style "KEY=VALUE,..."` | *(none)* | Any style setting, e.g. `-slate_style "title_color=yellow,background=#000000"`. Keys: `background`, `title_color`, `subtitle_color`, `value_color`, `label_color`, `line_color`, `title_size`, `subtitle_size`, `size`, `scale`, `valign`, `rule` (1/0), `hide_empty` (1/0), and `color` (title and values). Repeatable; wins over the options above. |
 | `-slate_burnin 0\|1` | `0` | Draw the burn-ins on the slate as well. |
 
 The `-slate_*` options without `-slate` make a plain slate: title `{clean_name}`, only the rows you give, and a thumbnail. With `-slate none` they are ignored, with a warning. `-skipffmpeg` makes no slate, because ffmpeg draws it.
@@ -652,6 +654,20 @@ Shipped thumbnail presets:
 | `start512` | first | 512 wide | jpg, quality 85 |
 | `largest1920` | largest | 1920 wide | jpg, quality 92 |
 | `middle_png` | middle | the movie's size | png, compression 6 |
+
+## Preview
+
+`-preview FILE.png` makes one frame instead of the movie, exactly as the movie would show it. The [tuner](TUNER.md) uses it; it is also handy for checking settings from a script.
+
+- The frame is chosen like a [thumbnail](#thumbnail) frame: `-thumbnail_frame` (default `middle`; `first`, `last` or a frame number). `largest` falls back to middle.
+- oiiotool converts only that frame, with the movie's processing. The converted frame is cached by its exact oiiotool settings (in `vfx-transcode/preview-cache` in the user temp folder, last 60 frames). Changes to burn-ins, slate, letterbox or metadata therefore don't convert it again.
+- ffmpeg runs the movie's filter chain on it: scale, pad, pixel aspect, letterbox, burn-ins. It converts the result to the encode preset's pixel format and back to RGB, so chroma subsampling and video range look like the movie; codec compression is not simulated.
+- `{current_frame}` and `{tc}` show the previewed frame's own number and timecode.
+- Output files:
+  - `FILE.png`: the frame.
+  - `FILE_slate.png`: the slate, when there is one.
+  - `FILE.json`: the input header, the keyword values, the output size, pixel aspect, pixel format, frame rate, timecode, reel name, colour, transform, letterbox and metadata tags.
+- `-o` and `-ot` are ignored with `-preview`.
 
 ## Encoding (ffmpeg)
 

@@ -29,6 +29,7 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - Burn-ins in six places (corners plus top/bottom centre) and a centred watermark, with name, frame counter, frame range, running timecode, fps and date; colour, opacity, size and black box per preset or per place.
 - Letterbox or pillarbox bars for a target ratio, optionally see-through and with an edge line; burn-ins stay on top.
 - Alpha: dropped by default, or kept into ProRes 4444 (or any alpha codec), straight or premultiplied.
+- A tuner app (PySide6) to tune presets by eye on a test frame, with compare image and copy-paste output: see [docs/TUNER.md](docs/TUNER.md).
 - Thumbnails (jpg/png) with the same look as the movie, from the middle, first, last or busiest frame; or thumbnails only.
 - VFX slate: one frame before the pictures (frame and timecode start − 1), same size and pixel aspect as the pictures, with a shot thumbnail and rows from presets, header values or the command line.
 
@@ -37,8 +38,10 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 ```
 vfx-transcode.py      entry script (also used by the PyInstaller spec)
 vfx_transcode/        the package; python -m vfx_transcode works too
+vfx-transcode-tuner.py  the tuner app (needs PySide6); vfx_tuner/ is its package
 presets.json          encode, burn-in, metadata and slate presets, channel preferences
 docs/OPTIONS.md       options reference
+docs/TUNER.md         the tuner
 tests/                unit tests
 test_conversion.bat   end-to-end test on the sample media in ./media
 oiio/ ffmpeg/ ocio/ fonts/   tools and data used by default; only their README is in git
@@ -49,8 +52,24 @@ Needs Python 3.9 or newer; the tool itself uses only the standard library. Tools
 
 ## Development
 
+The environment is managed with [uv](https://docs.astral.sh/uv/). vfx-transcode itself needs nothing
+beyond the standard library; the environment adds pytest and PyInstaller, and PySide6 for the tuner.
+
 ```
-python -m unittest discover -s tests -t .     # or: pytest
+uv sync --extra tuner                         # makes .venv: pytest, pyinstaller, PySide6
+uv run vfx-transcode -i D:/shots/sh010.1001.exr   # or: uv run python vfx-transcode.py ...
+uv run vfx-transcode-tuner                    # the tuner; or: uv run python vfx-transcode-tuner.py
+uv run pytest                                 # unit tests
 test_conversion.bat                           # end-to-end on ./media, logs in media\_test_output
-pyinstaller vfx-transcode.spec                # then copy presets.json next to the .exe
+build_exe.bat                                 # both executables into dist\vfx-transcode
 ```
+
+`build_exe.bat` runs `uv sync --extra tuner`, then PyInstaller twice: `vfx-transcode.exe` as a single
+console file (from `vfx-transcode.spec`) and `vfx-transcode-tuner.exe` as a windowed one-folder build
+(its `_internal` folder must stay next to it). Both land in `dist\vfx-transcode\` with `presets.json`,
+`docs`, and the `ffmpeg`, `oiio`, `ocio` and `fonts` folders; `build_exe.bat notools` skips those four
+and leaves only their READMEs. The frozen tuner runs the `vfx-transcode.exe` beside it, and both look
+for `./presets.json` and the tool folders next to the executables, so the folder can be copied anywhere.
+
+`uv sync` without `--extra tuner` leaves PySide6 out. The Python version comes from `.python-version`;
+`uv python pin 3.11` changes it. Commit `uv.lock` so everyone gets the same versions.

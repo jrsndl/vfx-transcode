@@ -657,6 +657,22 @@ if not exist "%OUT%\41_thumb_DB_1001.jpg" (
 if exist "%OUT%\41_thumb_largest.jpg" (>> "%SUMMARY%" echo [INFO] 41 thumbnail - 41_thumb_largest.jpg 1920 wide and 41_thumb_DB_1001.jpg 512 wide, no burn-ins)
 
 echo.
+echo ==== 42  preview: one frame as the movie shows it, plus slate and JSON; the tuner uses this ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -preview "%OUT%\42_preview.png" -thumbnail_frame 1007 -burn_preset review -slate generic -letterbox 1 ^
+  -oiio_transform_args "--resize 1920x0" > "%OUT%\42_preview.log" 2>&1
+set RC=%ERRORLEVEL%
+type "%OUT%\42_preview.log"
+call :check %RC% "42 preview"
+call :expect "%OUT%\42_preview.json" "renderCompSecondary_v000.1007.exr" "42 preview json"
+if not exist "%OUT%\42_preview_slate.png" (
+  >> "%SUMMARY%" echo [FAIL] 42 preview - 42_preview_slate.png missing
+  set /a FAILED+=1
+)
+if exist "%OUT%\42_preview.png" (>> "%SUMMARY%" echo [INFO] 42 preview - 42_preview.png shows frame 1007 with burn-ins and letterbox, TC 00:00:41:23)
+
+echo.
 echo ===========================================================================
 type "%SUMMARY%"
 echo.

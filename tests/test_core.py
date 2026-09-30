@@ -1675,5 +1675,30 @@ class ThumbnailTests(unittest.TestCase):
         self.assertEqual(resolve("/t/x.jpeg"), Path("/t/x.jpeg"))
 
 
+class PreviewOptionTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_preview_config(self):
+        cfg = self._cfg("-preview", "p.png", "-thumbnail_frame", "last", "-o", "x.mp4", "-ot")
+        self.assertTrue(cfg.preview.endswith("p.png"))
+        self.assertEqual((cfg.preview_frame, cfg.movie, cfg.thumbnail), ("last", True, None))
+        self.assertEqual(self._cfg().preview, "")
+
+    def test_transform_args_and_plain_slate(self):
+        cfg = self._cfg("-oiio_transform_args", '--rangecompress "--resize" 0x1080 --cut 1920x1080+{(TOP.width-1920)/2}+0',
+                        "-oiio_transform", "someotherproject")
+        self.assertEqual(cfg.oiio_transform_explicit,
+                         ["--rangecompress", "--resize", "0x1080", "--cut", "1920x1080+{(TOP.width-1920)/2}+0"])
+        slate = self._cfg("-slate", "plain", "-slate_field", "A=b", "-slate_style", "hide_empty=0").slate
+        self.assertEqual((list(slate.fields), slate.hide_empty), (["A"], False))
+
+    def test_counter_base(self):
+        ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24), lead_frames=1,
+                                 counter_base=1006, movie_timecode="00:00:41:22")
+        self.assertEqual(dict(ffmpeg.expand_burn_template("{current_frame}", ctx))["start_number"], "1006")
+
+
 if __name__ == "__main__":
     unittest.main()
