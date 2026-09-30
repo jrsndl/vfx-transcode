@@ -673,6 +673,39 @@ if not exist "%OUT%\42_preview_slate.png" (
 if exist "%OUT%\42_preview.png" (>> "%SUMMARY%" echo [INFO] 42 preview - 42_preview.png shows frame 1007 with burn-ins and letterbox, TC 00:00:41:23)
 
 echo.
+echo ==== 43  name tokens from presets.json and -name_token, in -o and a burn-in; delivery metadata tags ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\43_{shot}_{pass}.mov" -name_token "pass=render([A-Za-z]+)_v" ^
+  -burn_preset none -burn_tl "{shot} {pass}" -slate generic -metadata_preset delivery > "%OUT%\43_name_tokens.log" 2>&1
+set RC=%ERRORLEVEL%
+type "%OUT%\43_name_tokens.log"
+call :check %RC% "43 name tokens"
+call :expect "%OUT%\43_name_tokens.log" "Name token {shot} = 'ICOI2_005_033'" "43 name tokens shot"
+call :expect "%OUT%\43_name_tokens.log" "Name token {pass} = 'CompSecondary'" "43 name tokens pass"
+call :expect "%OUT%\43_name_tokens.log" "slate_length, display_type, watermarking" "43 delivery tags"
+if not exist "%OUT%\43_ICOI2_005_033_CompSecondary.mov" (
+  >> "%SUMMARY%" echo [FAIL] 43 name tokens - 43_ICOI2_005_033_CompSecondary.mov missing
+  set /a FAILED+=1
+)
+
+echo.
+echo ==== 44  smart tokens preset example_project: project, shot label, task, version in -o and a burn-in ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\44_{project}_{task}_{version}.mov" -smart_tokens example_project ^
+  -burn_preset none -burn_bl "{shot_label} {task} {version}" > "%OUT%\44_smart_tokens.log" 2>&1
+set RC=%ERRORLEVEL%
+type "%OUT%\44_smart_tokens.log"
+call :check %RC% "44 smart tokens"
+call :expect "%OUT%\44_smart_tokens.log" "Smart token {shot_label} = 'ICOI2 005 033'" "44 smart tokens shot_label"
+call :expect "%OUT%\44_smart_tokens.log" "Smart token {task} = 'comp'" "44 smart tokens task"
+if not exist "%OUT%\44_ICOI2_comp_v000.mov" (
+  >> "%SUMMARY%" echo [FAIL] 44 smart tokens - 44_ICOI2_comp_v000.mov missing
+  set /a FAILED+=1
+)
+
+echo.
 echo ===========================================================================
 type "%SUMMARY%"
 echo.

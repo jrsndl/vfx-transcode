@@ -44,6 +44,7 @@
     "            {version_string} {version_number} (from -version_regex, default _v(\\d\\d\\d)),",
     "            {namesplit1}..{namesplit9} / {namesplit-1}..{namesplit-9}: the name split at _",
     "            (these name keywords work in slate, metadata tags and -reelid as well)",
+    "            plus custom keywords from \"name_tokens\" / -name_token (see NAME TOKENS)",
     "  \\n in a text starts a new line (lines follow the place: left, centred or right-aligned).",
     "  Text after {tc} in the same place is dropped: ffmpeg always puts the timecode last.",
     "  Margins: preset margin < margin_<side> < -burn_margin < -burn_margin_<side>.",
@@ -57,10 +58,35 @@
     "  If no set matches, the first layer with at least 3 channels is used.",
     "  -oiio_channel overrides this; -oiio_channel_use_first skips it.",
     "",
+    "NAME TOKENS (custom keywords, all applied; -name_token NAME=REGEX adds or overrides one)",
+    "  \"name\": \"REGEX\"   {name} = group 1 (else the whole match) of the first match in the",
+    "                   sequence's clean name; empty if nothing matches",
+    "  \"name\": {\"regex\": ..., \"source\": ..., \"default\": ...}",
+    "                   source: the text searched, keywords allowed (default \"{clean_name}\"), e.g.",
+    "                   \"{meta:owner|}\" or an earlier token; default: the value if nothing matches",
+    "  Tokens work wherever the name keywords do: burn-ins, slate, metadata, -reelid, -o, -ot.",
+    "",
+    "SMART TOKENS (-smart_tokens NAME), default: default_smart_tokens (\"none\" = none)",
+    "  Per-project keyword rules. \"tokens\" is a list processed top to bottom; each entry sets",
+    "  one keyword, and a name may appear several times (the last one that applies wins).",
+    "  name        the keyword, e.g. \"shot\" for {shot}",
+    "  conditions  optional, as in oiio_transforms: [{\"left\": ..., \"op\": \"==\" or \"!=\", \"right\": ...}],",
+    "              all must hold, else the entry is skipped and the token keeps its value",
+    "  source      text to work on, any keywords (default \"{clean_name}\"), including tokens above",
+    "              and {input_path} {input_folder} {input_width} {meta:ATTR} {user} {date}",
+    "  regex       optional; without it the value is the source",
+    "  repl        Python replacement: \\1 = group 1, \\g<name>; keywords allowed. Empty = \\1 (or",
+    "              the whole match if the regex has no group). No match = entry skipped",
+    "  mode        extract (default): the first match, through repl | replace: re.sub, all matches",
+    "  case        as_is (default) | lower | upper | title",
+    "  Smart tokens work wherever name keywords do, and in oiio transform conditions.",
+    "",
     "METADATA PRESETS (-metadata_preset NAME), default: default_metadata (\"none\" = no preset)",
     "  notes            free text, shown in --help",
     "  tags             {\"key\": \"value\"} written to the movie; values may use {clean_name} {frame_start}",
-    "                   {frame_end} {timecode} {fps} {preset} {date} {meta:ATTR}",
+    "                   {frame_end} {frames} {timecode} {fps} {preset} {date} {meta:ATTR}, the name",
+    "                   keywords, and {slate_length} (1 or 0), {burnins} (true/false: any burn-in or",
+    "                   watermark) and {colour} (the colour conversion) for delivery tags",
     "  copy             EXR header attributes to copy, like -metadata_copy (\"all,-husk:*\", \"Artist,DateTime\")",
     "  reelid_source    auto | arg | exr | off, like -reelid_source",
     "  reelid           explicit reel name, like -reelid",
@@ -277,6 +303,71 @@
       "br": "{current_frame}"
     }
   },
+  "name_tokens": {
+    "shot": {
+      "regex": "^([A-Za-z0-9]+_\\d+_\\d+)",
+      "notes": "SHOW_SEQ_SHOT at the start of the name: ICOI2_005_033_comp_v002 -> ICOI2_005_033"
+    },
+    "task": {
+      "regex": "_(comp|lgt|fx|anim|roto|paint|plate)(?:_|$)",
+      "notes": "Department word anywhere in the name; empty if none"
+    }
+  },
+  "default_smart_tokens": "none",
+  "smart_tokens": {
+    "example_project": {
+      "notes": "Example for names like ICOI2_005_033_renderCompSecondary_v000. Copy and adapt per project.",
+      "tokens": [
+        {
+          "name": "project",
+          "source": "{namesplit1}",
+          "case": "upper",
+          "notes": "first part of the name: ICOI2"
+        },
+        {
+          "name": "shot",
+          "regex": "^([A-Za-z0-9]+)_(\\d+)_(\\d+)",
+          "repl": "\\1_\\2_\\3",
+          "notes": "PROJECT_SEQ_SHOT: ICOI2_005_033"
+        },
+        {
+          "name": "shot_label",
+          "source": "{shot}",
+          "regex": "_",
+          "repl": " ",
+          "mode": "replace",
+          "notes": "the shot with spaces: ICOI2 005 033"
+        },
+        {
+          "name": "task",
+          "source": "other",
+          "notes": "fallback first; the definitions below override it when they apply"
+        },
+        {
+          "name": "task",
+          "regex": "_render([A-Z][a-z]+)",
+          "case": "lower",
+          "notes": "renderCompSecondary -> comp"
+        },
+        {
+          "name": "task",
+          "conditions": [{"left": "{namesplit-2}", "op": "==", "right": "plate"}],
+          "source": "plate",
+          "notes": "..._plate_v001 is a plate, whatever came before"
+        },
+        {
+          "name": "version",
+          "source": "v{version_string}",
+          "notes": "v000; stays as typed below when the name has no version"
+        },
+        {
+          "name": "version",
+          "conditions": [{"left": "{version_string}", "op": "==", "right": ""}],
+          "source": "noversion"
+        }
+      ]
+    }
+  },
   "metadata_presets": {
     "review": {
       "notes": "Internal review: title and a description line; reel name if the EXR has one.",
@@ -289,7 +380,9 @@
     "conform": {
       "notes": "Conform / editorial: timecode and reel name from the EXR header (reel from owner, frame range removed).",
       "tags": {
-        "title": "{clean_name}"
+        "title": "{clean_name}",
+        "vfx-transcode_first_frame": "{frame_start}",
+        "vfx-transcode_last_frame": "{frame_end}"
       },
       "timecode_source": "exr",
       "reelid_source": "exr",
@@ -302,6 +395,21 @@
       },
       "copy": "",
       "reelid_source": "off"
+    },
+    "delivery": {
+      "notes": "Delivery: tags streaming specs often ask for - source frame rate, frame range, slate length, display colour, burn-ins/watermark present.",
+      "tags": {
+        "title": "{clean_name}",
+        "source_frame_rate": "{fps}",
+        "first_frame": "{frame_start}",
+        "last_frame": "{frame_end}",
+        "frame_count": "{frames}",
+        "slate_length": "{slate_length}",
+        "display_type": "{colour}",
+        "watermarking": "{burnins}"
+      },
+      "copy": "",
+      "reelid_source": "auto"
     },
     "archive": {
       "notes": "Archive: everything useful from the EXR header except renderer command lines and internal paths.",

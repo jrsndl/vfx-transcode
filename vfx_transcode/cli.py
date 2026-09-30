@@ -16,6 +16,7 @@ import re
 import shutil
 import string
 import tempfile
+from collections import OrderedDict
 from fractions import Fraction
 import os
 import sys
@@ -40,7 +41,9 @@ from .presets import DEFAULT_PRESETS_FILE, load_presets
 from .letterbox import (DEFAULT_FILL as LB_FILL, DEFAULT_LINE_COLOR as LB_LINE_COLOR,
                         DEFAULT_RATIO as LB_DEFAULT_RATIO, LetterboxSpec, parse_ratio, parse_rgba,
                         plan as letterbox_plan)
-from .names import NAME_KEYWORDS, DEFAULT_VERSION_REGEX, compile_version_regex, name_tokens
+from .smart_tokens import evaluate_preset as evaluate_smart_tokens
+from .names import (NAME_KEYWORDS, DEFAULT_VERSION_REGEX, compile_version_regex, custom_tokens,
+                    merge_rules, name_tokens)
 from .transforms import INPUT_KEYWORDS, input_tokens, select as select_transform, transform_args
 from .thumbnails import (choose_frame as choose_thumbnail_frame, ffmpeg_command as thumbnail_ffmpeg,
                          oiiotool_command as thumbnail_oiiotool, parse_frame as parse_thumbnail_frame)
@@ -52,7 +55,7 @@ from .slate import (PLAIN_SLATE, SLATE_STYLE_FIELDS, SlateSpec, apply_field_opti
                     slate_timecode, style_values)
 from .timecode import (fps_display, fps_from_attribs, fps_to_str, frame_to_tc, nominal_fps,
                        offset_timecode, parse_fps, timecode_from_attribs, validate_timecode)
-from .tools import app_dir, resolve_path, resolve_tool, run_tool, split_args
+from .tools import app_dir, ffmpeg_filters, resolve_path, resolve_tool, run_tool, split_args
 
 log = logging.getLogger("vfx_transcode")
 
@@ -228,6 +231,16 @@ def build_parser(presets=None, presets_error=None):
                         "keywords {namesplit1}..{namesplit9} and {namesplit-1}..{namesplit-9} are "
                         "the name's parts split at _, counted from the start or the end; all of "
                         "them work in burn-ins, slate, metadata and -reelid")
+    g.add_argument("-name_token", action="append", default=[], metavar="NAME=REGEX",
+                   help="Custom keyword {NAME}: group 1 (else the whole match) of the first match "
+                        "of REGEX in the sequence name, empty if none; repeatable. Adds to / "
+                        "overrides the presets file's \"name_tokens\" (which can also read other "
+                        "sources, e.g. a header value); NAME= removes one. Example: "
+                        "-name_token \"shot=^([A-Z0-9]+_\\d+)\"")
+    g.add_argument("-smart_tokens", default=None, metavar="NAME",
+                   help='Smart tokens preset from the presets file: per-project keyword rules '
+                        '(conditions, regex, replacement, case), or "none". Default: the file\'s '
+                        "default_smart_tokens")
     g.add_argument("-metadata_preset", default=None, metavar="NAME",
                    help='Metadata preset from the presets file (tags, copy rules, reel name and '
                         'timecode settings), or "none". The options below override its values')
@@ -520,15 +533,19 @@ def config_from_args(ns, presets):
     slate = slate_from_args(ns, presets)
     letterbox = letterbox_from_args(ns)
     check_alpha_args(ns, preset)
+    name_rules = merge_rules(presets.name_rules, ns.name_token)
+    smart_tokens = presets.get_smart_tokens(
+        ns.smart_tokens if ns.smart_tokens is not None else presets.default_smart_tokens)
+    token_names = tuple(name_rules) + tuple(smart_tokens.names() if smart_tokens else ())
     if ns.o.strip():
-        check_output_template(ns.o)
+        check_output_template(ns.o, extra=token_names)
     thumbnail = None
     if ns.ot is not None:
         thumbnail = presets.get_thumbnail(ns.thumbnail_preset or presets.default_thumbnail)
         if ns.thumbnail_frame is not None:
             thumbnail = replace(thumbnail, frame=parse_thumbnail_frame(ns.thumbnail_frame))
         if ns.ot.strip():
-            check_output_template(ns.ot, "-ot", THUMBNAIL_KEYWORDS)
+            check_output_template(ns.ot, "-ot", tuple(THUMBNAIL_KEYWORDS) + token_names)
     elif (ns.thumbnail_preset is not None or ns.thumbnail_frame is not None) and not ns.preview:
         log.warning("-thumbnail_preset / -thumbnail_frame ignored: no -ot.")
     # what to make: -o and/or -ot; neither = the movie at its default place
@@ -609,6 +626,8 @@ def config_from_args(ns, presets):
         alpha=ns.alpha,
         alpha_premult=bool(ns.alpha_premult),
         version_regex=ns.version_regex,
+        name_rules=name_rules,
+        smart_tokens=smart_tokens,
         skip_ffmpeg=skip_ffmpeg,
         ff_filter=ns.ff_filter,
         preset=preset,
@@ -758,11 +777,99 @@ def resolve_timecode(cfg, seq, info, header_frame=None):
     return frame_to_tc(seq.start, fps_int), "frame counter"
 
 
+def colour_label(cfg, seq):
+    """Short colour description for keywords: 'CLF name.clf' or the OCIO conversion."""
+    if not seq.is_exr:
+        return ""
+    return ("CLF " + Path(cfg.clf_path).name) if cfg.clf_path else describe_colour(cfg)
+
+
 def metadata_context(cfg, seq, timecode):
+    """Keywords for -metadata, metadata preset tags and -reelid. Besides the name keywords:
+    {frames} frame count, {slate_length} 1 or 0, {burnins} true/false (any burn-in or
+    watermark drawn), {colour} the colour conversion - the delivery tags some specs ask for."""
     context = dict(cfg.name_tokens)
     context.update({"clean_name": seq.clean_name, "frame_start": seq.start, "frame_end": seq.end,
+                    "frames": seq.end - seq.start + 1,
                     "timecode": timecode, "fps": fps_display(cfg.fps), "preset": cfg.preset.name,
-                    "date": today(), "meta": cfg.header_attribs})
+                    "date": today(), "meta": cfg.header_attribs,
+                    "slate_length": 1 if cfg.slate else 0,
+                    "burnins": "true" if any(cfg.burn.values()) else "false",
+                    "colour": colour_label(cfg, seq)})
+    return context
+
+
+def needed_filters(cfg):
+    """{ffmpeg filter: what needs it} for the movie as configured. Only filters a build may
+    lack are listed; scale, format, pad and setsar are in every ffmpeg."""
+    need = OrderedDict()
+
+    def add(name, why):
+        need[name] = need[name] + ", " + why if name in need else why
+
+    if any(cfg.burn.values()):
+        add("drawtext", "burn-ins")
+    if cfg.slate:
+        add("drawtext", "the slate")
+        add("color", "the slate")
+        if cfg.slate.thumbnail != "none":
+            add("overlay", "the slate thumbnail")
+        if cfg.slate.rule:
+            add("drawbox", "the slate rule")
+    if cfg.letterbox:
+        add("drawbox", "the letterbox")
+        if cfg.alpha == "keep":
+            add("color", "the letterbox with alpha")
+            add("overlay", "the letterbox with alpha")
+    if cfg.alpha == "keep" and cfg.alpha_premult:
+        add("premultiply", "-alpha_premult")
+    if cfg.preset.colour_tags and not cfg.ff_encode.strip():
+        add("setparams", "the colour tags")
+    return need
+
+
+def check_ffmpeg_filters(cfg):
+    """Stop before any frame is converted if this ffmpeg lacks a filter the movie needs
+    (typically drawtext: builds without libfreetype, e.g. some static ones, have none)."""
+    need = needed_filters(cfg)
+    if not need:
+        return
+    available = ffmpeg_filters(cfg.ffmpeg)
+    if available is None:
+        log.warning("Could not list the filters of %s; not checked.", cfg.ffmpeg)
+        return
+    missing = [name for name in need if name not in available]
+    if not missing:
+        return
+    lines = ["  {} - needed for {}".format(name, need[name]) for name in missing]
+    hint = (" drawtext comes with libfreetype: use a \"full\" build (e.g. gyan.dev or BtbN), or "
+            "turn off the burn-ins and the slate." if "drawtext" in missing else "")
+    raise TranscodeError('ffmpeg "{}" has no {} filter:\n{}\n{}'.format(
+        cfg.ffmpeg, " / ".join(missing), "\n".join(lines), hint.strip()).rstrip())
+
+
+def add_custom_tokens(cfg, seq, info=None):
+    """The presets file's name_tokens and -name_token, then the smart tokens preset, added to
+    the name keywords. Run once the header is read, so sources can use {meta:ATTR}, and
+    before the oiio transform is chosen, so its conditions can use the tokens."""
+    context = dict(cfg.name_tokens)
+    context.update({"clean_name": seq.clean_name, "frame_start": seq.start, "frame_end": seq.end,
+                    "meta": cfg.header_attribs})
+    if cfg.name_rules:
+        cfg.name_tokens.update(custom_tokens(cfg.name_rules, context, md.expand))
+    if cfg.smart_tokens is not None:
+        context = smart_token_context(cfg, seq, info)
+        cfg.name_tokens.update(evaluate_smart_tokens(cfg.smart_tokens, context, md.expand))
+
+
+def smart_token_context(cfg, seq, info):
+    """What smart token sources, repl and conditions can use: everything known before the
+    frames are converted. Timecode, fps, reel and output size come later, so they are not here."""
+    context = transform_context(cfg, seq, info)
+    context.update({"frames": seq.end - seq.start + 1, "date": today(), "user": current_user(),
+                    "preset": cfg.preset.name, "input": Path(cfg.input).name,
+                    "input_path": Path(cfg.input).resolve().as_posix(),
+                    "input_folder": Path(cfg.input).resolve().parent.name})
     return context
 
 
@@ -831,6 +938,8 @@ def run(cfg):
     base = app_dir()
     if not cfg.skip_ffmpeg or (cfg.thumbnail is not None and not seq.is_exr):
         cfg.ffmpeg = resolve_tool(cfg.ffmpeg, base, "ffmpeg")
+        if cfg.movie and not cfg.skip_ffmpeg:
+            check_ffmpeg_filters(cfg)
     work_dir, created_dir = prepare_work_dir(cfg, seq)
     log.info("Intermediate files: %s", work_dir)
     created_files = []
@@ -850,6 +959,7 @@ def run(cfg):
                             "right colour tags with -ff_encode for HDR / P3 deliveries.", cfg.ocio_display)
             info = get_image_info(cfg.oiiotool, cfg.header_file, cfg.verbose)
             cfg.header_attribs = md.header_attribs(info)
+            add_custom_tokens(cfg, seq, info)
             if cfg.write_exr_info:
                 write_info_json(info, cfg.header_file + ".json")
             pick = pick_channels(info, cfg.oiio_channel, cfg.oiio_channel_use_first,
@@ -907,6 +1017,7 @@ def run(cfg):
             # scales the transform's output (whatever size it is) to -width
             scale_width = cfg.width if cfg.oiio_transform_args is not None else 0
         else:
+            add_custom_tokens(cfg, seq, info)
             available = {f: seq.path(f) for f in seq.frames}
             if cfg.preview:
                 preview_frame = choose_preview_frame(cfg, seq)
@@ -1321,8 +1432,7 @@ def slate_context(cfg, seq, timecode, reel_name, width, height):
     context.update(frames=count, timecode_end=offset_timecode(timecode, count - 1, fps_int),
                    duration=frame_to_tc(count, fps_int), width=width, height=height,
                    par=par_display(cfg.par_out_value),
-                   colour=(("CLF " + Path(cfg.clf_path).name) if cfg.clf_path else
-                           describe_colour(cfg)) if seq.is_exr else "", reel=reel_name,
+                   colour=colour_label(cfg, seq), reel=reel_name,
                    user=current_user(), input=Path(cfg.input).name)
     return context
 

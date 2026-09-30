@@ -98,6 +98,8 @@ class Config:
 
     # keywords from the sequence name
     version_regex: str = r"_v(\d\d\d)"
+    name_rules: Dict[str, Any] = field(default_factory=dict)    # names.NameRule by keyword
+    smart_tokens: Any = None                                    # smart_tokens.SmartTokenPreset
     name_tokens: Dict[str, str] = field(default_factory=dict)   # set at run time
 
     # set at run time

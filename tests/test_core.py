@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from vfx_transcode import cli, ffmpeg, oiio
 from vfx_transcode.channels import pick_channels
 from vfx_transcode.config import Config
 from vfx_transcode.errors import TranscodeError
+from vfx_transcode.names import NAME_KEYWORDS
 from vfx_transcode.oiio_info import Rational, parse_oiio_xml_output, split_imagespecs, write_info_json
 from vfx_transcode.presets import LEGACY_H264, load_presets, transfer_for
 from vfx_transcode.sequence import fill_holes, find_sequence, format_frames
@@ -18,7 +20,9 @@ from vfx_transcode.tools import resolve_path, split_args
 
 
 REPO = Path(__file__).resolve().parent.parent
-PRESETS = load_presets(REPO / "presets.json")
+# the repo's presets.json, with the default burn-in taken out: it is a user choice, and the
+# tests expect none unless they ask for one
+PRESETS = replace(load_presets(REPO / "presets.json"), default_burnin="")
 
 
 def _info(*subimage_channels):
@@ -645,7 +649,7 @@ class MetadataTests(unittest.TestCase):
 
 class ReelNameTests(unittest.TestCase):
     def setUp(self):
-        self.seq = type("S", (), {"clean_name": "sh010", "start": 1001, "end": 1010})()
+        self.seq = type("S", (), {"clean_name": "sh010", "start": 1001, "end": 1010, "is_exr": True})()
 
     def reel(self, source, arg="", info=None, attr="owner"):
         cfg = _cfg(reelid_source=source, reelid=arg, reelid_attr=attr)
@@ -703,7 +707,7 @@ class MetadataPresetTests(unittest.TestCase):
     def test_conform_preset_and_overrides(self):
         cfg = self.parse("-metadata_preset", "conform")
         self.assertEqual((cfg.timecode_source, cfg.reelid_source, cfg.reelid_attr), ("exr", "exr", "owner"))
-        self.assertEqual(cfg.preset_tags, {"title": "{clean_name}"})
+        self.assertEqual(cfg.preset_tags["title"], "{clean_name}")
         cfg = self.parse("-metadata_preset", "conform", "-reelid_source", "off", "-timecode", "02:00:00:00")
         self.assertEqual((cfg.reelid_source, cfg.timecode_source), ("off", "arg"))   # command line wins
         cfg = self.parse("-metadata_preset", "archive", "-metadata_copy", "")
@@ -737,14 +741,16 @@ class PresetFileTests(unittest.TestCase):
     def test_repo_file(self):
         self.assertEqual(PRESETS.default, "h264")
         self.assertIn("prores422hq", PRESETS.presets)
-        self.assertEqual(PRESETS.default_burnin, "")          # "none" in the file
+        default_burnin = load_presets(REPO / "presets.json").default_burnin
+        self.assertTrue(default_burnin == "" or default_burnin in PRESETS.burnins)
         self.assertEqual(PRESETS.get_burnin("client").size, "1.1%")
         self.assertIsNone(PRESETS.get_burnin("none"))
         for b in PRESETS.burnins.values():                    # every keyword is a known one
             for text in b.corners.values():
                 for _lit, fieldname, _spec, _conv in __import__("string").Formatter().parse(text):
                     if fieldname:
-                        self.assertIn(fieldname, ffmpeg.BURN_KEYWORDS)
+                        self.assertIn(fieldname, set(ffmpeg.BURN_KEYWORDS) | set(NAME_KEYWORDS)
+                                      | set(PRESETS.name_rules))
 
     def test_old_key_names_still_load(self):
         from vfx_transcode.channels import PREFERRED_CHANNELS
@@ -1702,3 +1708,189 @@ class PreviewOptionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NameRuleTests(unittest.TestCase):
+    def args(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_rule_group_and_default(self):
+        from vfx_transcode import names, metadata as md
+        rules = names.rules_from_json({
+            "shot": r"^([A-Z0-9]+_\d+)",
+            "task": {"regex": r"_(comp|lgt)_", "default": "none"},
+            "whole": r"\d{3}",
+            "roll": {"regex": r"^(\w+?)_", "source": "{meta:owner|}"},
+            "combo": {"regex": ".*", "source": "{shot}-{task}"}}, "test")
+        ctx = {"clean_name": "ICOI2_005_lgt_v003", "meta": {"Copyright": "A001_C002"}}
+        out = names.custom_tokens(rules, ctx, md.expand)
+        self.assertEqual(out, {"shot": "ICOI2_005", "task": "lgt", "whole": "005",
+                               "roll": "A001", "combo": "ICOI2_005-lgt"})
+        out = names.custom_tokens(rules, {"clean_name": "plate", "meta": {}}, md.expand)
+        self.assertEqual((out["shot"], out["task"]), ("", "none"))
+
+    def test_bad_rules(self):
+        from vfx_transcode import names
+        for data in ({"clean_name": "x"}, {"1a": "x"}, {"ok": "("}, {"ok": {"source": "x"}},
+                     {"ok": {"regex": "x", "bogus": 1}}, {"namesplit3": "x"}):
+            with self.assertRaises(TranscodeError, msg=str(data)):
+                names.rules_from_json(data, "test")
+
+    def test_cli_merge_and_output_template(self):
+        cfg = self.args("-name_token", "shot=^([a-z]+\\d+)", "-o", "./{shot}_v{version_number}.mov")
+        self.assertEqual(list(cfg.name_rules), ["shot", "task"])     # presets.json + override
+        self.assertEqual(cfg.name_rules["shot"].regex, "^([a-z]+\\d+)")
+        self.assertEqual(list(self.args("-name_token", "shot=").name_rules), ["task"])
+        self.assertEqual(list(self.args("-name_token", "seq=x").name_rules), ["shot", "task", "seq"])
+        with self.assertRaises(TranscodeError):
+            self.args("-o", "./{seq}.mov")                   # unknown without the rule
+        with self.assertRaises(TranscodeError):
+            self.args("-name_token", "noequals")
+
+    def test_add_custom_tokens(self):
+        cfg = self.args("-name_token", "seq=^([a-z]+)")
+        cfg.name_tokens = {"version_string": ""}
+        seq = type("S", (), {"clean_name": "abc010_comp", "start": 1, "end": 2})()
+        cli.add_custom_tokens(cfg, seq)
+        self.assertEqual((cfg.name_tokens["seq"], cfg.name_tokens["task"]), ("abc", "comp"))
+
+
+class FilterCheckTests(unittest.TestCase):
+    def cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_needed(self):
+        need = cli.needed_filters(self.cfg("-burn_tl", "x", "-slate", "generic"))
+        self.assertIn("burn-ins", need["drawtext"])
+        self.assertIn("the slate", need["drawtext"])
+        self.assertIn("overlay", need)
+        self.assertNotIn("drawtext", cli.needed_filters(self.cfg("-burn_preset", "none")))
+
+    def test_missing_drawtext_stops(self):
+        cfg = self.cfg("-burn_tl", "x")
+        old = cli.ffmpeg_filters
+        try:
+            cli.ffmpeg_filters = lambda _f: {"scale", "setparams", "overlay", "color"}
+            with self.assertRaises(TranscodeError) as err:
+                cli.check_ffmpeg_filters(cfg)
+            self.assertIn("drawtext", str(err.exception))
+            cli.ffmpeg_filters = lambda _f: {"drawtext", "setparams"}
+            cli.check_ffmpeg_filters(cfg)                    # all there
+            cli.ffmpeg_filters = lambda _f: None
+            cli.check_ffmpeg_filters(cfg)                    # cannot tell: warns only
+        finally:
+            cli.ffmpeg_filters = old
+
+    def test_filter_list_parsing(self):
+        from vfx_transcode import tools
+        m = tools._FILTER_LINE.match
+        self.assertEqual(m(" T.C drawtext          V->V       Draw text").group(1), "drawtext")
+        self.assertEqual(m(" ..C color             |->V       Provide").group(1), "color")
+        self.assertEqual(m(" TSC overlay           VV->V      Overlay").group(1), "overlay")
+        self.assertIsNone(m("  T.. = Timeline support"))
+
+
+class DeliveryKeywordTests(unittest.TestCase):
+    def test_metadata_context(self):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-burn_tl", "x",
+                                                   "-slate", "generic"])
+        cfg = cli.config_from_args(ns, PRESETS)
+        seq = type("S", (), {"clean_name": "sh", "start": 1001, "end": 1100, "is_exr": True})()
+        ctx = cli.metadata_context(cfg, seq, "01:00:00:00")
+        self.assertEqual((ctx["frames"], ctx["slate_length"], ctx["burnins"]), (100, 1, "true"))
+        self.assertIn("->", ctx["colour"])
+        preset = PRESETS.get_metadata_preset("delivery")
+        from vfx_transcode import metadata as md
+        tags = md.build({}, {}, ctx, [preset.tags])
+        self.assertEqual(tags["slate_length"], "1")
+        self.assertEqual(tags["watermarking"], "true")
+
+
+class SmartTokenTests(unittest.TestCase):
+    def preset(self, tokens):
+        from vfx_transcode.smart_tokens import parse_smart_token_presets
+        return parse_smart_token_presets({"p": {"tokens": tokens}}, "test")["p"]
+
+    def run_tokens(self, tokens, context):
+        from vfx_transcode.smart_tokens import evaluate_preset
+        from vfx_transcode import metadata as md
+        return evaluate_preset(self.preset(tokens), context, md.expand)
+
+    def test_repo_example(self):
+        from vfx_transcode.smart_tokens import evaluate_preset
+        from vfx_transcode import metadata as md, names
+        name = "ICOI2_005_033_renderCompSecondary_v000"
+        ctx = dict(names.name_tokens(name), clean_name=name)
+        out = evaluate_preset(PRESETS.get_smart_tokens("example_project"), ctx, md.expand)
+        self.assertEqual(dict(out), {"project": "ICOI2", "shot": "ICOI2_005_033",
+                                     "shot_label": "ICOI2 005 033", "task": "comp",
+                                     "version": "v000"})
+        name = "abc_010_020_plate_v001"
+        ctx = dict(names.name_tokens(name), clean_name=name)
+        out = evaluate_preset(PRESETS.get_smart_tokens("example_project"), ctx, md.expand)
+        self.assertEqual((out["project"], out["task"]), ("ABC", "plate"))
+        name = "abc_010_020_lookdev"
+        ctx = dict(names.name_tokens(name), clean_name=name)
+        out = evaluate_preset(PRESETS.get_smart_tokens("example_project"), ctx, md.expand)
+        self.assertEqual((out["task"], out["version"]), ("other", "noversion"))
+
+    def test_top_down_conditions_and_skips(self):
+        tokens = [
+            {"name": "a", "source": "first"},
+            {"name": "a", "conditions": [{"left": "{x}", "op": "==", "right": "1"}], "source": "second"},
+            {"name": "a", "regex": "(nomatch)"},                         # skipped: no match
+            {"name": "b", "source": "{a}-{x}", "case": "upper"},         # sees the earlier token
+            {"name": "c", "conditions": [{"left": "{x}", "op": "!=", "right": "1"}], "source": "c"}]
+        out = self.run_tokens(tokens, {"clean_name": "n", "x": "1"})
+        self.assertEqual(dict(out), {"a": "second", "b": "SECOND-1"})     # c never applied
+        out = self.run_tokens(tokens, {"clean_name": "n", "x": "2"})
+        self.assertEqual(dict(out), {"a": "first", "b": "FIRST-2", "c": "c"})
+
+    def test_repl_modes_and_case(self):
+        ctx = {"clean_name": "my_Shot_010", "proj": "XY", "meta": {"Copyright": "A001_C002"}}
+        out = self.run_tokens([
+            {"name": "g1", "regex": r"_(\w+?)_(\d+)"},                           # default \1
+            {"name": "whole", "regex": r"\d+"},                                  # no group: match
+            {"name": "swap", "regex": r"_(\w+?)_(\d+)", "repl": r"\2-\1", "case": "lower"},
+            {"name": "named", "regex": r"(?P<num>\d+)", "repl": r"{proj}_\g<num>"},
+            {"name": "dots", "regex": "_", "repl": ".", "mode": "replace", "case": "title"},
+            {"name": "cam", "source": "{meta:owner|}", "regex": r"^(\w+?)_"}], ctx)
+        self.assertEqual(dict(out), {"g1": "Shot", "whole": "010", "swap": "010-shot",
+                                     "named": "XY_010", "dots": "My.Shot.010", "cam": "A001"})
+
+    def test_bad_definitions(self):
+        for tokens in ([{"source": "x"}], [{"name": "clean_name"}], [{"name": "a", "regex": "("}],
+                       [{"name": "a", "regex": "(x)", "repl": r"\2"}],
+                       [{"name": "a", "mode": "replace"}], [{"name": "a", "case": "shout"}],
+                       [{"name": "a", "bogus": 1}],
+                       [{"name": "a", "conditions": [{"left": "x", "op": "<", "right": "y"}]}], []):
+            with self.assertRaises(TranscodeError, msg=str(tokens)):
+                self.preset(tokens)
+
+    def test_cli_selection(self):
+        def cfg(*argv):
+            ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+            return cli.config_from_args(ns, PRESETS)
+        self.assertIsNone(cfg().smart_tokens)                         # default "none"
+        self.assertEqual(cfg("-smart_tokens", "example_project").smart_tokens.name, "example_project")
+        cfg("-smart_tokens", "example_project", "-o", "./{shot_label}_{task}.mov")   # known names
+        with self.assertRaises(TranscodeError):
+            cfg("-o", "./{shot_label}.mov")                            # not without the preset
+        with self.assertRaises(TranscodeError):
+            cfg("-smart_tokens", "nope")
+
+    def test_run_context(self):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "/shots/ICOI2/x_v003.1001.exr",
+                                                   "-smart_tokens", "example_project"])
+        cfg = cli.config_from_args(ns, PRESETS)
+        from vfx_transcode.smart_tokens import parse_smart_token_presets
+        cfg.smart_tokens = parse_smart_token_presets({"p": [
+            {"name": "folder", "source": "{input_folder}", "case": "lower"},
+            {"name": "big", "conditions": [{"left": "{input_width}", "op": "==", "right": "4096"}],
+             "source": "yes"}]}, "t")["p"]
+        cfg.name_tokens = {"version_string": "003"}
+        seq = type("S", (), {"clean_name": "x_v003", "start": 1, "end": 5})()
+        cli.add_custom_tokens(cfg, seq, [{"width": 4096, "height": 2160}])
+        self.assertEqual((cfg.name_tokens["folder"], cfg.name_tokens["big"]), ("icoi2", "yes"))

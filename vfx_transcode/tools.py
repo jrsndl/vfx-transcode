@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -81,3 +82,21 @@ def run_tool(cmd, what, verbose=0, check=True):
         output = _tail("\n".join(s for s in (result.stdout, result.stderr) if s))
         raise ToolError("{} failed with exit code {}.".format(what, result.returncode), output)
     return result
+
+
+_FILTER_LINE = re.compile(r"^\s*[A-Z.]{2,3}\s+(\w+)\s+[AVN|]*->[AVN|]*\s")
+_filters_cache = {}
+
+
+def ffmpeg_filters(ffmpeg):
+    """Names of the filters (and sources) an ffmpeg build has; None if it cannot be asked."""
+    if ffmpeg not in _filters_cache:
+        names = None
+        try:
+            result = run_tool([ffmpeg, "-hide_banner", "-filters"], "ffmpeg -filters", check=False)
+            found = {m.group(1) for m in map(_FILTER_LINE.match, result.stdout.splitlines()) if m}
+            names = found or None
+        except ToolError as exc:
+            log.debug("Could not list the ffmpeg filters: %s", exc)
+        _filters_cache[ffmpeg] = names
+    return _filters_cache[ffmpeg]

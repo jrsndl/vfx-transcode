@@ -48,6 +48,8 @@
 | `-i PATH` | *(required)* | Any file of the input sequence. See the sequence rules below. |
 | `-o PATH` | `<input folder>/<name>.<ext>` | Output movie: a file or a folder, with keywords. See [Output path](#output-path) below. `<name>` is the sequence name without its frame number and separator (`shot_010.1001.exr` → `shot_010`). |
 | `-version_regex REGEX` | `_v(\d\d\d)` | How the version is found in the sequence name for the [name keywords](#name-keywords). |
+| `-smart_tokens NAME` | the presets file's `default_smart_tokens` (`none`) | A [smart tokens](#smart-tokens) preset: per-project keyword rules with conditions, regex replacement and case change. `none` means none. |
+| `-name_token NAME=REGEX` | the presets file's `name_tokens` | A [custom keyword](#custom-name-tokens) `{NAME}` cut out of the sequence name by a regex. Repeatable; `NAME=` removes one from the presets file. |
 
 **How the sequence is found.** The frame number is the run of digits at the end of the file name, just before the extension:
 - `shot_010.1001.exr` → name `shot_010.`, frame 1001, 4-digit padding.
@@ -198,6 +200,8 @@ Colour conversion applies to EXR input only. Other formats are assumed to be dis
 
 If the configured path doesn't exist, the tool looks for `oiiotool` / `ffmpeg` on the `PATH`. If it isn't there either, the run stops with an error that names both places it looked.
 
+Before converting any frame, the tool asks ffmpeg for its filter list (`ffmpeg -filters`) and stops if a filter the movie needs is missing, naming what needs it. The usual case is `drawtext`, which burn-ins and the slate need: it comes with libfreetype, and some ffmpeg builds (minimal or "essentials" static builds) leave it out. Use a "full" build (gyan.dev, BtbN) or turn off the burn-ins and the slate. The other filters checked are `color`, `overlay`, `drawbox`, `premultiply` and `setparams`, each only when used. If the list can't be read, the check is skipped with a warning.
+
 ## EXR conversion (oiiotool)
 
 | Option | Default | Description |
@@ -334,7 +338,7 @@ With a [slate](#slate) the movie starts one frame earlier, so its timecode track
 | Option | Default | Description |
 |---|---|---|
 | `-metadata_preset NAME` | the presets file's `default_metadata` (`none`) | A [metadata preset](#metadata-presets): tags, copy rules, reel name and timecode settings in one name. `none` means no preset. |
-| `-metadata KEY=VALUE` | *(none)* | Write a tag. Repeatable. The value may use `{clean_name}`, `{frame_start}`, `{frame_end}`, `{timecode}`, `{fps}`, `{preset}`, `{date}`, [`{meta:ATTR}`](#header-values-metaattr) and the [name keywords](#name-keywords). `KEY=` with no value removes a tag that a preset would write. |
+| `-metadata KEY=VALUE` | *(none)* | Write a tag. Repeatable. The value may use `{clean_name}`, `{frame_start}`, `{frame_end}`, `{frames}`, `{timecode}`, `{fps}`, `{preset}`, `{date}`, [`{meta:ATTR}`](#header-values-metaattr), the [name keywords](#name-keywords) and the [delivery keywords](#delivery-keywords). `KEY=` with no value removes a tag that a preset would write. |
 | `-metadata_copy SPEC` | the metadata preset's `copy`, else none | Copy attributes from the first frame's EXR header. See below. `-metadata_copy ""` switches off a preset's copying. |
 
 Examples:
@@ -363,6 +367,19 @@ Examples:
 
 An empty value at any level removes the key. mov and mp4 need `-movflags +use_metadata_tags` to keep custom keys; the tool adds it, merged with any `-movflags` the preset already has. mkv keeps any key as it is. The log lists the keys that were written.
 
+### Delivery keywords
+
+Some delivery specs (streaming services in particular) want the movie to say how it was made. These keywords work in `-metadata` values and metadata preset `tags`:
+
+| Keyword | Value |
+|---|---|
+| `{frames}` | Number of frames, `{frame_end} - {frame_start} + 1`. |
+| `{slate_length}` | `1` with a slate, `0` without. |
+| `{burnins}` | `true` if any burn-in or watermark is drawn, else `false`. |
+| `{colour}` | The colour conversion, e.g. `ACEScg -> display "sRGB - Display", view "ACES 1.0 - SDR Video"` or `CLF show_lut.clf`. Empty for non-EXR input, and an empty tag is not written. |
+
+The `delivery` metadata preset writes them all, as `source_frame_rate`, `first_frame`, `last_frame`, `frame_count`, `slate_length`, `display_type` and `watermarking`. Rename the keys in `presets.json` if your spec uses other names.
+
 ### Metadata presets
 
 A metadata preset bundles the metadata settings under one name in `presets.json`: tags, copy rules, the reel name settings and the timecode source. Select one with `-metadata_preset NAME`. Every command-line option overrides the matching preset field on its own:
@@ -378,6 +395,7 @@ The log names the preset in its metadata line, e.g. `Metadata: title, comment (p
 | `review` | `title={clean_name}`, `comment={clean_name} {frame_start}-{frame_end} @ {fps} fps, start TC {timecode}` | reel name `auto` | Internal review. |
 | `conform` | `title={clean_name}` | `timecode_source exr`, `reelid_source exr`, `reelid_attr owner` | Editorial / conform: timecode and reel name from the renders. |
 | `client` | `title={clean_name}` | nothing copied, `reelid_source off` | Client delivery with nothing from the render headers. |
+| `delivery` | `title`, `source_frame_rate={fps}`, `first_frame`, `last_frame`, `frame_count`, `slate_length`, `display_type={colour}`, `watermarking={burnins}` | nothing copied, reel name `auto` | Delivery tags, see [delivery keywords](#delivery-keywords). |
 | `archive` | `title={clean_name}`, `comment=transcoded {date}, preset {preset}` | `copy all,-husk:*,-nuke/*,-MEDIA_PATH`, reel name `auto` | Keep header information, minus command lines and internal paths. |
 
 ## Reel name
@@ -472,6 +490,7 @@ Keywords in the text:
 | `{preset}` | Name of the encode preset. |
 | `{meta:ATTR}` | An attribute of the source header, e.g. `{meta:owner}`, `{meta:cameraModel}`, `{meta:nuke/input/filename}`. See [Header values](#header-values-metaattr). |
 | `{version_string}`, `{version_number}`, `{namesplit1}` … `{namesplit-9}` | Parts of the sequence name; see [Name keywords](#name-keywords). |
+| `{shot}`, `{task}`, … | Your own [name tokens](#custom-name-tokens) and [smart tokens](#smart-tokens). |
 
 **New lines.** `\n` in a text starts a new line, e.g. `-burn_bc "{clean_name}\nTC {tc}"` or in `presets.json` `"tl": "{clean_name}\n{date}"`. A real line break in the JSON string (`"\n"` as JSON writes it) works too.
 
@@ -504,6 +523,91 @@ Both are empty if the name has no version, so a slate row `"Version": "{version_
 | `{namesplit-N}` | `DD` | `C` | `BBB` | `AA` | *(empty)* |
 
 For example, for `ICOI2_005_033_renderCompSecondary_v000`, `-burn_tl "{namesplit2}_{namesplit3}"` burns in `005_033` and `-reelid "{namesplit1}"` gives the reel `ICOI2`.
+
+### Custom name tokens
+
+When the name keywords aren't enough, define your own keyword with a regular expression. `{NAME}` is group 1 of the first match (the whole match if the regex has no group). If nothing matches, it is empty, or the rule's `default`.
+
+On the command line, the regex runs on the clean name:
+
+```
+-name_token "shot=^([A-Z0-9]+_\d+_\d+)"      ICOI2_005_033_comp_v002 -> {shot} = ICOI2_005_033
+-name_token "pass=render([A-Za-z]+)_v"         ..._renderCompSecondary_v000 -> {pass} = CompSecondary
+```
+
+In `presets.json`, the top-level `name_tokens` object holds rules that always apply. A rule is either the regex, or an object that can also read another text:
+
+```json
+"name_tokens": {
+  "shot": "^([A-Za-z0-9]+_\\d+_\\d+)",
+  "task": {"regex": "_(comp|lgt|fx)(?:_|$)", "default": "none"},
+  "camera": {"regex": "^(\\w+?)_", "source": "{meta:owner|}", "notes": "A001 from A001_C003_..."}
+}
+```
+
+- `source` is the text searched, with keywords (default `{clean_name}`). It can use `{meta:ATTR}`, the name keywords and tokens defined earlier in the list.
+- In JSON, a backslash is written twice: `\\d` for `\d`.
+- `-name_token` adds a rule or replaces one of the same name; `-name_token NAME=` removes it.
+- Names are letters, digits and `_`; built-in keyword names can't be reused.
+
+The shipped `presets.json` defines `shot` (`SHOW_SEQ_SHOT` at the start of the name) and `task` (a department word such as `comp` or `lgt`). The log shows each token's value. Tokens work wherever the name keywords do: burn-ins, slate, metadata, `-reelid`, `-o` and `-ot`.
+
+### Smart tokens
+
+Smart tokens are custom keywords with more control than `-name_token`: conditions, any source text, a regex replacement and a case change. They live in `presets.json` only, grouped into named presets, typically one per project since each project names things its own way. Select one with `-smart_tokens NAME`, or set `default_smart_tokens`.
+
+A preset is a list of definitions, processed **top to bottom**:
+
+- Each definition sets one keyword. The same name may appear several times with different conditions; the last definition that applies wins.
+- A definition is skipped if a condition fails, or if its regex doesn't match (in extract mode). The token then keeps what it had: an earlier value, or nothing.
+- A later definition can use the tokens set above it, in its source, conditions and repl.
+- A token that no definition sets is left as typed (`{task}`), with a warning.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `name` | *(required)* | The keyword: `"shot"` makes `{shot}`. Built-in keyword names can't be used. |
+| `conditions` | none (always applies) | As in [OIIO transforms](#oiio-transforms): `[{"left": "{input_width}", "op": "==", "right": "4096"}]`, `==` or `!=`, keywords on both sides, all must hold. |
+| `source` | `{clean_name}` | The text to work on. Any keyword, see below. |
+| `regex` | none | Without a regex the value is the source (after the case change). |
+| `repl` | `\1` | Python replacement: `\1`, `\2`, `\g<name>`; keywords are expanded, e.g. `{project}_\1`. Without a group in the regex, the default is the whole match. |
+| `mode` | `extract` | `extract`: the first match, turned into `repl`. `replace`: every match in the source replaced by `repl` (`re.sub`); needs a regex. |
+| `case` | `as_is` | `as_is`, `lower`, `upper` or `title` (`Title Case`), applied last. |
+| `notes` | | Free text. |
+
+Remember to double backslashes in JSON: `"\\d+"`, `"\\1"`.
+
+**Keywords in sources, repl and conditions.** Smart tokens are worked out once the first frame's header is read, before any frame is converted, so they can be used in the [OIIO transform](#oiio-transforms) conditions too. Available then: `{clean_name}`, `{frame_start}`, `{frame_end}`, `{frames}`, `{date}`, `{user}`, `{preset}`, `{input}` (first file name), `{input_path}` (its full path, with `/`), `{input_folder}` (its folder name), `{input_width}`, `{input_height}`, `{input_par}` and the other input sizes, `{meta:ATTR}`, the [name keywords](#name-keywords), the `-name_token` / `name_tokens` keywords, and smart tokens set above. Timecode, fps and reel name are worked out later and can't be used.
+
+**Where they work.** Everywhere the name keywords do: burn-ins, slate, metadata tags, `-reelid`, `-o`, `-ot`, and OIIO transform conditions and arguments. They are applied after `name_tokens` / `-name_token`, so a smart token with the same name replaces those.
+
+The shipped `presets.json` has an `example_project` preset for names like `ICOI2_005_033_renderCompSecondary_v000`:
+
+```json
+"smart_tokens": {
+  "example_project": {
+    "tokens": [
+      {"name": "project", "source": "{namesplit1}", "case": "upper"},
+      {"name": "shot", "regex": "^([A-Za-z0-9]+)_(\\d+)_(\\d+)", "repl": "\\1_\\2_\\3"},
+      {"name": "shot_label", "source": "{shot}", "regex": "_", "repl": " ", "mode": "replace"},
+      {"name": "task", "source": "other"},
+      {"name": "task", "regex": "_render([A-Z][a-z]+)", "case": "lower"},
+      {"name": "task", "conditions": [{"left": "{namesplit-2}", "op": "==", "right": "plate"}],
+       "source": "plate"},
+      {"name": "version", "source": "v{version_string}"},
+      {"name": "version", "conditions": [{"left": "{version_string}", "op": "==", "right": ""}],
+       "source": "noversion"}
+    ]
+  }
+}
+```
+
+| Name | `{project}` | `{shot}` | `{shot_label}` | `{task}` | `{version}` |
+|---|---|---|---|---|---|
+| `ICOI2_005_033_renderCompSecondary_v000` | `ICOI2` | `ICOI2_005_033` | `ICOI2 005 033` | `comp` | `v000` |
+| `abc_010_020_plate_v001` | `ABC` | `abc_010_020` | `abc 010 020` | `plate` | `v001` |
+| `abc_010_020_lookdev` | `ABC` | `abc_010_020` | `abc 010 020` | `other` | `noversion` |
+
+The pattern for a fallback is to put it first and the specific cases after it, as `task` does. The log lists each token's final value; `-v` shows every definition, applied or skipped, and why.
 
 ### Header values `{meta:ATTR}`
 
@@ -751,6 +855,8 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
 | `default_thumbnail` | Thumbnail preset used without `-thumbnail_preset`. |
 | `thumbnail_presets` | The [thumbnail](#thumbnail) presets, see below. |
 | `oiio_transforms` | A list of [OIIO transform](#oiio-transforms) presets: `{"name": ..., "description": ..., "subs": [{"name": ..., "description": ..., "conditions": [...], "transforms": [...]}]}`. Optional. The name `none` is reserved. |
+| `smart_tokens`, `default_smart_tokens` | [Smart tokens](#smart-tokens) presets, `{"name": {"notes": ..., "tokens": [...]}}`, and the one used without `-smart_tokens` (`none` = none). Optional. |
+| `name_tokens` | [Custom name tokens](#custom-name-tokens): `{"name": "regex"}` or `{"name": {"regex": ..., "source": ..., "default": ...}}`. Optional. |
 | `channel_preferences` | Ordered channel sets for the [automatic channel choice](#exr-conversion-oiiotool). Each set is a string `"R,G,B"` or a list `["R", "G", "B"]`. Put your studio's beauty-layer names first. Optional; if it's missing, the built-in list shown there is used. |
 
 Encode preset fields:

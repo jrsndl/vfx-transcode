@@ -24,7 +24,9 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - OIIO transform presets: resize/crop rules chosen per input (size, pixel aspect, header values), first matching rule wins.
 - Pixel aspect ratio from an argument or the header; output with the same pixel aspect (tagged), reformatted to square pixels, or to a given pixel aspect.
 - Frame rate and timecode from an argument or the EXR header, with a switch for which one wins; timecode is written as a real timecode track in mov/mp4/mxf.
-- Metadata: your own `KEY=VALUE` tags, optional copying from the EXR header, and metadata presets (`review`, `conform`, `client`, `archive`).
+- Metadata: your own `KEY=VALUE` tags, optional copying from the EXR header, and metadata presets (`review`, `conform`, `client`, `delivery`, `archive`); `delivery` writes the tags delivery specs ask for (source frame rate, frame range, slate length, display colour, burn-ins present).
+- Keywords from the sequence name: version, name parts, your own regex tokens (`{shot}`, `{task}` …), and per-project smart token presets (conditions, regex replacement, case change) for burn-ins, slate, metadata, output paths and transform conditions.
+- Checks before converting that ffmpeg has the filters the movie needs (e.g. `drawtext` for burn-ins and the slate).
 - Reel name for conforming (explicit, or from the EXR `owner` or any other attribute), written into the mov timecode track and mxf source package.
 - Burn-ins in six places (corners plus top/bottom centre) and a centred watermark, with name, frame counter, frame range, running timecode, fps and date; colour, opacity, size and black box per preset or per place.
 - Letterbox or pillarbox bars for a target ratio, optionally see-through and with an edge line; burn-ins stay on top.

@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 from .burnin import (BURN_PLACES, MARGIN_FIELDS, PLACE_NAMES, STYLE_FIELDS, BurnStyle,
                      margins_from_values, parse_size, style_from_values)
 from .errors import TranscodeError
+from .names import NameRule, rules_from_json
+from .smart_tokens import NO_SMART_TOKENS, SmartTokenPreset, parse_smart_token_presets
 from .slate import (NO_SLATE, SLATE_PRESET_FIELDS, SlateSpec, parse_fields, parse_thumbnail,
                     style_values)
 from .tools import split_args
@@ -91,6 +93,19 @@ class PresetFile:
     default_transform: str = ""
     thumbnails: "OrderedDict[str, ThumbnailPreset]" = field(default_factory=OrderedDict)
     default_thumbnail: str = ""
+    name_rules: "OrderedDict[str, NameRule]" = field(default_factory=OrderedDict)
+    smart_tokens: "OrderedDict[str, SmartTokenPreset]" = field(default_factory=OrderedDict)
+    default_smart_tokens: str = ""
+
+    def get_smart_tokens(self, name):
+        """Smart token preset by name; None for "" or "none"."""
+        if not name or name == NO_SMART_TOKENS:
+            return None
+        try:
+            return self.smart_tokens[name]
+        except KeyError:
+            raise TranscodeError('Unknown smart tokens preset "{}". Available: {} (from {})'.format(
+                name, ", ".join(list(self.smart_tokens) + [NO_SMART_TOKENS]), self.path))
 
     def get_thumbnail(self, name):
         """Thumbnail preset by name; the built-in defaults for "" when the file has none."""
@@ -152,7 +167,7 @@ class PresetFile:
     def describe(self):
         width = max(len(n) for n in list(self.presets) + list(self.burnins)
                     + list(self.metadata_presets) + list(self.slates) + list(self.transforms)
-                    + list(self.thumbnails))
+                    + list(self.thumbnails) + list(self.smart_tokens))
         lines = ["Encode presets (-preset), default {}:".format(self.default)]
         lines += ["  {:<{}}  .{:<4} {}{}".format(p.name, width, p.ext, p.notes,
                                                  " [alpha]" if p.alpha_pix_fmt else "")
@@ -207,6 +222,25 @@ class PresetFile:
                     when = " and ".join(c.describe() for c in sub.conditions) or "always"
                     lines.append("  {:<{}}    {}: if {} -> {}".format(
                         "", width, sub.name, when, " ".join(sub.transforms)))
+        if self.name_rules:
+            lines += ["", "Name tokens (name_tokens; -name_token adds or overrides):"]
+            for r in self.name_rules.values():
+                lines.append("  {{{}}} = regex {} on {}{}".format(
+                    r.name, r.regex, r.source, ", default {!r}".format(r.default) if r.default else ""))
+        if self.smart_tokens:
+            lines += ["", "Smart tokens (-smart_tokens), default {}; top to bottom, last applied wins:"
+                      .format(self.default_smart_tokens or NO_SMART_TOKENS)]
+            for st in self.smart_tokens.values():
+                lines.append("  {:<{}}  {}".format(st.name, width, st.notes))
+                for t in st.tokens:
+                    what = t.source
+                    if t.regex:
+                        what += " ~ {}{}{}".format("s/" if t.mode == "replace" else "", t.regex,
+                                                   " -> '{}'".format(t.repl) if t.repl else "")
+                    when = " and ".join(c.describe() for c in t.conditions)
+                    lines.append("  {:<{}}    {{{}}} = {}{}{}".format(
+                        "", width, t.name, what, "" if t.case == "as_is" else ", " + t.case,
+                        "  if " + when if when else ""))
         if self.channel_preferences:
             lines += ["", "Automatic channel choice (channel_preferences), first found wins:"]
             lines += ["  " + ",".join(chans) for chans in self.channel_preferences]
@@ -428,12 +462,19 @@ def load_presets(path):
     if default_transform and default_transform != NO_TRANSFORM and default_transform not in transforms:
         raise TranscodeError('{}: default oiio transform "{}" is not defined.'.format(
             path, default_transform))
+    name_rules = rules_from_json(data["name_tokens"], path) if "name_tokens" in data else OrderedDict()
+    smart = parse_smart_token_presets(data["smart_tokens"], path) if data.get("smart_tokens") else OrderedDict()
+    default_smart = data.get("default_smart_tokens") or ""
+    if default_smart and default_smart != NO_SMART_TOKENS and default_smart not in smart:
+        raise TranscodeError('{}: default smart tokens preset "{}" is not defined.'.format(
+            path, default_smart))
     return PresetFile(str(path), default, presets, burnins,
                       "" if default_burnin == NO_BURNIN else default_burnin, channel_preferences,
                       metadata_presets, "" if default_metadata == NO_BURNIN else default_metadata,
                       slates, "" if default_slate == NO_SLATE else default_slate,
                       transforms, "" if default_transform == NO_TRANSFORM else default_transform,
-                      thumbnails, default_thumbnail)
+                      thumbnails, default_thumbnail, name_rules, smart,
+                      "" if default_smart == NO_SMART_TOKENS else default_smart)
 
 
 def transfer_for(colorout):
