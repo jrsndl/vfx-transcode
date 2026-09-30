@@ -44,8 +44,20 @@ def process_args(cfg, pick, depth=None):
         if pick.deep:
             args += ["--flatten"]
         args += ["--ch", str(pick)]
+        if cfg.oiio_transform_args is not None:
+            # transform preset: on the scene-linear (and still premultiplied) image
+            args += cfg.oiio_transform_args
+        if pick.alpha:
+            # EXR colour is premultiplied: resize as it is, then divide by alpha so the colour
+            # transform sees straight colour. The intermediates stay straight (as PNG expects);
+            # ffmpeg premultiplies again with -alpha_premult 1.
+            if cfg.width > 0 and cfg.oiio_transform_args is None:
+                args += ["--resize", "{}x0".format(cfg.width)]
+            args += ["--unpremult"]
         args += colour_args(cfg)
-    if cfg.width > 0:
+    if depth is not None and cfg.oiio_transform_args is not None:
+        args += cfg.oiio_transform_args
+    elif cfg.width > 0 and cfg.oiio_transform_args is None and not (depth is None and pick.alpha):
         args += ["--resize", "{}x0".format(cfg.width)]
     args += cfg.oiio_command
     if cfg.mezzanine_ext != ".exr":
@@ -55,8 +67,12 @@ def process_args(cfg, pick, depth=None):
 
 
 def colour_args(cfg):
-    """--colorconvert IN OUT, or --ociodisplay:from=IN[:looks=..] DISPLAY VIEW.
-    An empty display or view means the config's default."""
+    """--ociofiletransform CLF, --colorconvert IN OUT, or --ociodisplay:from=IN[:looks=..]
+    DISPLAY VIEW. An empty display or view means the config's default."""
+    if cfg.clf:
+        if not cfg.clf_path:
+            raise ValueError("colour_args: the CLF path is not resolved yet")
+        return ["--ociofiletransform", Path(cfg.clf_path).as_posix()]
     if cfg.display_mode:
         option = "--ociodisplay:from=" + cfg.colorin
         if cfg.ocio_looks:

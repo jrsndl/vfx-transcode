@@ -240,7 +240,7 @@ class BurnStyleTests(unittest.TestCase):
         vf = ffmpeg.build_drawtext("x", "bc", _ctx(), "", BurnStyle("white", 1.0, "36", False))
         self.assertIn("fontsize=36", vf)
         self.assertIn("shadowcolor=black@1", vf)
-        self.assertIn("y=h-(2*lh)", vf)
+        self.assertIn("y=h-(h*0.015)-lh", vf)
 
     def test_preset_file_styles(self):
         base = '{"encode_presets": {"x": {"ext": "mp4", "encode": "{videofilter}"}}, "burnin_presets": {"b": %s}}'
@@ -412,16 +412,16 @@ class BurnInTests(unittest.TestCase):
         self.assertEqual(opts["text"], "shot 010\nTC ")                  # real newline, TC appended
         self.assertEqual(dict(ffmpeg.expand_burn_template("a\nb", _ctx()))["text"], "a\nb")  # JSON "\n"
         vf = ffmpeg.build_drawtext(r"a\nb\nc", "br", _ctx(), "", DEFAULT_STYLE)
-        self.assertIn("y=h-(4*lh)", vf)                                   # 3 lines grow upwards
+        self.assertIn("y=h-(h*0.015)-3*lh", vf)                           # 3 lines grow upwards
         self.assertIn("text_align=R", vf)
         vf = ffmpeg.build_drawtext(r"a\nb", "tc", _ctx(), "", DEFAULT_STYLE)
         self.assertIn("text_align=C", vf)
-        self.assertIn("y=lh", vf)
+        self.assertIn("y=h*0.015", vf)
         vf = ffmpeg.build_drawtext(r"a\nb", "tl", _ctx(), "", DEFAULT_STYLE)
         self.assertNotIn("text_align", vf)                                # left is the default
         vf = ffmpeg.build_drawtext("one line", "br", _ctx(), "", DEFAULT_STYLE)
         self.assertNotIn("text_align", vf)                                # single line: unchanged
-        self.assertIn("y=h-(2*lh)", vf)
+        self.assertIn("y=h-(h*0.015)-lh", vf)
 
     def test_percent_and_unknown(self):
         opts = dict(ffmpeg.expand_burn_template("100% {nope}", _ctx()))
@@ -819,7 +819,7 @@ class CliTests(unittest.TestCase):
     def test_burn_preset_and_overrides(self):
         cfg = self.parse()
         self.assertEqual(set(cfg.burn.values()), {""})                       # default: none
-        self.assertEqual(sorted(cfg.burn), sorted(["tl", "tc", "tr", "bl", "bc", "br"]))
+        self.assertEqual(sorted(cfg.burn), sorted(["tl", "tc", "tr", "bl", "bc", "br", "wm"]))
         self.assertTrue(cfg.burn_font.endswith("DroidSansMono.ttf"))
         cfg = self.parse("-burn_preset", "review", "-burn_tl", "{clean_name} v2", "-burn_bl", "")
         self.assertEqual({k: v for k, v in cfg.burn.items() if v},
@@ -1274,6 +1274,405 @@ class NameKeywordTests(unittest.TestCase):
         self.assertEqual(ext(), "mp4")
         self.assertEqual(ext("-o", "out/x.mov"), "mov")
         self.assertEqual(ext("-o", "x.mov", "-ff_out_ext", "mxf"), "mxf")
+
+
+class BurnMarginTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_parse_and_expression(self):
+        from vfx_transcode.burnin import margin_expression, parse_margin
+        self.assertEqual([parse_margin(v) for v in ("20", 20, "2%", "0", 0, "h/50")],
+                         ["20", "20", "2%", "0", "0", "h/50"])
+        for bad in ("-5", "wide", "200%"):
+            with self.assertRaises(TranscodeError):
+                parse_margin(bad)
+        self.assertEqual(margin_expression("2%", "left"), "w*0.02")     # sides: of the width
+        self.assertEqual(margin_expression("2%", "top"), "h*0.02")      # top/bottom: of the height
+        self.assertEqual(margin_expression("30", "right"), "30")
+
+    def test_positions(self):
+        margins = {"top": "40", "bottom": "3%", "left": "0", "right": "25"}
+        self.assertEqual(ffmpeg.burn_position("tl", margins), ("0", "40"))
+        self.assertEqual(ffmpeg.burn_position("tc", margins), ("(w-tw)/2", "40"))
+        self.assertEqual(ffmpeg.burn_position("br", margins), ("w-25-tw", "h-(h*0.03)-lh"))
+        self.assertEqual(ffmpeg.burn_position("bl", margins, 3), ("0", "h-(h*0.03)-3*lh"))
+
+    def test_layers(self):
+        cfg = self._cfg()
+        self.assertEqual(cfg.burn_margins, {"top": "1.5%", "bottom": "1.5%", "left": "1%", "right": "1%"})
+        cfg = self._cfg("-burn_margin", "30", "-burn_margin_left", "5%")
+        self.assertEqual(cfg.burn_margins, {"top": "30", "bottom": "30", "left": "5%", "right": "30"})
+        with tempfile.TemporaryDirectory() as tmp:
+            base = json.loads((REPO / "presets.json").read_text(encoding="utf-8"))
+            base["burnin_presets"]["m"] = {"tl": "x", "margin": "2%", "margin_bottom": 50}
+            path = Path(tmp) / "p.json"
+            path.write_text(json.dumps(base), encoding="utf-8")
+            presets = load_presets(path)
+            self.assertEqual(presets.burnins["m"].margins,
+                             {"top": "2%", "bottom": "50", "left": "2%", "right": "2%"})
+            ns = cli.build_parser(presets).parse_args(["-i", "x.1001.exr", "-burn_preset", "m",
+                                                       "-burn_margin_top", "0"])
+            cfg = cli.config_from_args(ns, presets)
+            self.assertEqual(cfg.burn_margins, {"top": "0", "bottom": "50", "left": "2%", "right": "2%"})
+            ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24))
+            vf = ffmpeg.build_video_filter(cfg, ctx, 0)
+            self.assertIn("x=w*0.02:y=0", vf)
+            base["burnin_presets"]["m"] = {"tl": "x", "margin_middle": 5}
+            path.write_text(json.dumps(base), encoding="utf-8")
+            with self.assertRaises(TranscodeError):
+                load_presets(path)
+
+
+class WatermarkTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_position_ignores_margins(self):
+        self.assertEqual(ffmpeg.burn_position("wm", {"top": "300", "left": "300"}), ("(w-tw)/2", "(h-lh)/2"))
+        self.assertEqual(ffmpeg.burn_position("wm", None, 2), ("(w-tw)/2", "(h-2*lh)/2"))
+        vf = ffmpeg.build_drawtext(r"A\nB", "wm", _ctx(), "", ffmpeg.DEFAULT_STYLE)
+        self.assertIn("text_align=C", vf)
+
+    def test_own_size_and_opacity(self):
+        from vfx_transcode.burnin import BurnStyle, resolve_styles
+        styles = resolve_styles(BurnStyle(size="1.1%", opacity=0.8, color="yellow", box=True))
+        self.assertEqual((styles["wm"].size, styles["wm"].opacity), ("8%", 0.25))
+        self.assertEqual((styles["wm"].color, styles["wm"].box), ("yellow", True))   # inherited
+        self.assertEqual(styles["tl"].size, "1.1%")
+        styles = resolve_styles(None, {"wm": BurnStyle(size="12%")}, BurnStyle(opacity=0.5),
+                                {"wm": BurnStyle(opacity=0.1)})
+        self.assertEqual((styles["wm"].size, styles["wm"].opacity), ("12%", 0.1))
+
+    def test_cli_and_preset(self):
+        cfg = self._cfg("-burn_wm", "DRAFT", "-burn_size", "2%")
+        self.assertEqual(cfg.burn["wm"], "DRAFT")
+        self.assertEqual(cfg.burn_styles["wm"].size, "8%")
+        cfg = self._cfg("-burn_wm", "DRAFT", "-burn_style", "wm:size=5%,opacity=0.5,color=red")
+        self.assertEqual((cfg.burn_styles["wm"].size, cfg.burn_styles["wm"].opacity,
+                          cfg.burn_styles["wm"].color), ("5%", 0.5, "red"))
+        cfg = self._cfg("-burn_preset", "confidential")
+        self.assertEqual(cfg.burn["wm"], "CONFIDENTIAL")
+        ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24), lead_frames=1)
+        vf = ffmpeg.build_video_filter(cfg, ctx, 0)
+        wm = [f for f in vf.split(",drawtext") if "CONFIDENTIAL" in f][0]
+        self.assertIn("fontsize=h*0.08", wm)
+        self.assertIn("white@0.25", wm)
+        self.assertIn("enable=gte(n", wm)                                      # not on the slate
+
+
+class AlphaTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_find_alpha(self):
+        from vfx_transcode.channels import ChannelPick, find_alpha
+        info = [{"channelnames": ["rgba.R", "rgba.G", "rgba.B", "rgba.A", "Z"]},
+                {"channelnames": ["beauty.R", "beauty.G", "beauty.B", "beauty.A"]}]
+        self.assertEqual(find_alpha(ChannelPick(0, ["rgba.R", "rgba.G", "rgba.B", "rgba.A"], "p"), info), "rgba.A")
+        self.assertEqual(find_alpha(ChannelPick(0, ["rgba.R", "rgba.G", "rgba.B"], "p"), info), "rgba.A")
+        self.assertEqual(find_alpha(ChannelPick(1, ["beauty.R", "beauty.G", "beauty.B"], "p"), info), "beauty.A")
+        self.assertIsNone(find_alpha(ChannelPick(0, ["Z"], "p"), info))
+        pick = ChannelPick(0, ["rgba.R", "rgba.G", "rgba.B", "rgba.A"], "p")
+        self.assertEqual(str(pick), "rgba.R,rgba.G,rgba.B")                  # dropped by default
+        pick.alpha = "rgba.A"
+        self.assertEqual(str(pick), "rgba.R,rgba.G,rgba.B,rgba.A")
+        mono = ChannelPick(0, ["Y", "A"], "p", alpha="A")
+        self.assertEqual(str(mono), "Y,Y,Y,A")
+
+    def test_oiiotool_order(self):
+        from vfx_transcode.channels import ChannelPick
+        cfg = self._cfg("-preset", "prores4444", "-alpha", "keep", "-width", "1280")
+        pick = ChannelPick(0, ["R", "G", "B", "A"], "p", alpha="A")
+        args = oiio.process_args(cfg, pick)
+        order = [args.index(a) for a in ("--ch", "--resize", "--unpremult", "--colorconvert")]
+        self.assertEqual(order, sorted(order))                              # resize premultiplied
+        self.assertEqual(args.count("--resize"), 1)
+        plain = oiio.process_args(self._cfg("-width", "1280"), ChannelPick(0, ["R", "G", "B"], "p"))
+        self.assertNotIn("--unpremult", plain)
+        self.assertLess(plain.index("--colorconvert"), plain.index("--resize"))   # unchanged
+
+    def test_validation(self):
+        self.assertEqual(self._cfg().alpha, "drop")
+        cfg = self._cfg("-preset", "prores4444", "-alpha", "keep", "-alpha_premult")
+        self.assertEqual((cfg.alpha, cfg.alpha_premult), ("keep", True))
+        with self.assertRaises(TranscodeError):
+            self._cfg("-alpha", "keep")                                      # h264: no alpha
+        with self.assertRaises(TranscodeError):
+            self._cfg("-preset", "prores4444", "-alpha", "keep", "-mezzanine", "jpg")
+        self._cfg("-alpha", "keep", "-ff_encode", "-pix_fmt yuva420p {videofilter} -c:v libvpx-vp9")
+
+    def test_encode_and_filter(self):
+        cfg = self._cfg("-preset", "prores4444", "-alpha", "keep", "-alpha_premult")
+        ctx = ffmpeg.BurnContext("sh", 1001, 1010, "00:00:41:17", Fraction(24))
+        self.assertIn("yuv444p10le", ffmpeg.encode_args(cfg, "vf"))            # no alpha found yet
+        cfg.alpha_active = True
+        args = ffmpeg.encode_args(cfg, "vf")
+        self.assertEqual(args[args.index("-pix_fmt") + 1], "yuva444p10le")
+        vf = ffmpeg.build_video_filter(cfg, ctx, 0)
+        self.assertTrue(vf.startswith("format=pix_fmts=gbrap16le,premultiply=inplace=1,"))
+        cfg.alpha_premult = False
+        self.assertNotIn("premultiply", ffmpeg.build_video_filter(cfg, ctx, 0))
+
+    def test_letterbox_with_alpha(self):
+        from vfx_transcode.letterbox import LetterboxSpec, filters, plan
+        lb = plan(LetterboxSpec(ratio=2.39, fill=(0, 0, 0, 128)), 1920, 1080)
+        plain = filters(lb, 1)
+        self.assertTrue(all(f.startswith("drawbox") for f in plain))
+        graph = filters(lb, 1, alpha=True)
+        self.assertEqual(len(graph), 1)
+        g = graph[0]
+        self.assertTrue(g.startswith("format=pix_fmts=yuva444p10le[lbm0];"))
+        self.assertIn("s=1936x138", g)                                        # full width + spare
+        self.assertIn("y=main_h-138", g)
+        self.assertIn("[lbm0][lbs0]overlay=", g)
+        self.assertFalse(g.endswith("]"))                                     # chain continues
+        self.assertEqual(g.count("overlay="), 2)
+
+    def test_has_alpha(self):
+        from vfx_transcode.slate import has_alpha
+        for fmt, expected in (("rgba", True), ("rgba64be", True), ("ya8", True), ("gbrap16le", True),
+                              ("yuva444p10le", True), ("rgb24", False), ("rgb48be", False),
+                              ("yuv420p", False), ("gray", False)):
+            self.assertEqual(has_alpha(fmt), expected, fmt)
+
+
+class OiioTransformTests(unittest.TestCase):
+    PRESET = {"name": "p", "description": "d", "subs": [
+        {"name": "uhd", "conditions": [{"left": "{input_width}x{input_height}", "op": "==", "right": "3840x2160"}],
+         "transforms": ["--rangecompress", "--resize 1920x1080", "--rangeexpand"]},
+        {"name": "239", "conditions": [{"left": "{input_width}", "op": "==", "right": "4080"},
+                                       {"left": "{input_height}", "op": "==", "right": "2160"}],
+         "transforms": ["--cut 3840x2160+120+0", "--resize 1920x1080"]},
+        {"name": "not-anamorphic", "conditions": [{"left": "{input_par}", "op": "!=", "right": "2"},
+                                                  {"left": "{meta:owner|}", "op": "!=", "right": ""}],
+         "transforms": ["--resize {namesplit1}x0"]},
+        {"name": "other", "conditions": [], "transforms": ["--resize 0x1080", "--crop 1920x1080"]}]}
+
+    def _pick(self, width, height, par=1, owner="", name="1280_x_v001"):
+        from vfx_transcode import metadata as md
+        from vfx_transcode.names import name_tokens
+        from vfx_transcode.transforms import input_tokens, parse_transform_presets, select, transform_args
+        preset = parse_transform_presets([self.PRESET], "test")["p"]
+        context = dict(name_tokens(name))
+        context["meta"] = {"owner": owner} if owner else {}
+        context.update(input_tokens([{"width": width, "height": height}], Fraction(par)))
+        sub, _details = select(preset, context, md.expand)
+        return (sub.name, transform_args(sub, context, md.expand)) if sub else (None, None)
+
+    def test_first_match_wins(self):
+        self.assertEqual(self._pick(3840, 2160), ("uhd", ["--rangecompress", "--resize", "1920x1080",
+                                                           "--rangeexpand"]))
+        self.assertEqual(self._pick(4080, 2160)[0], "239")
+        self.assertEqual(self._pick(4080, 1716)[0], "other")        # AND: one condition fails
+        self.assertEqual(self._pick(2048, 858, owner="A001")[1], ["--resize", "1280x0"])  # keywords
+        self.assertEqual(self._pick(2048, 858, par=2, owner="A001")[0], "other")        # != fails
+
+    def test_input_tokens(self):
+        from vfx_transcode.transforms import input_tokens, number_text
+        t = input_tokens([{"width": 4400, "height": 2300, "full_width": 4096, "full_height": 2160}],
+                         Fraction(4, 3))
+        self.assertEqual((t["input_width"], t["input_height"], t["input_data_width"], t["input_par"]),
+                         ("4096", "2160", "4400", "1.3333"))
+        self.assertEqual([number_text(v) for v in (Fraction(2), Fraction(1), Fraction(3, 2))],
+                         ["2", "1", "1.5"])
+
+    def test_no_match(self):
+        from vfx_transcode import metadata as md
+        from vfx_transcode.transforms import parse_transform_presets, select
+        preset = parse_transform_presets([{"name": "x", "subs": [{"name": "a", "conditions": [
+            {"left": "{input_width}", "op": "==", "right": "1"}], "transforms": []}]}], "t")["x"]
+        self.assertEqual(select(preset, {"input_width": "2"}, md.expand), (None, []))
+
+    def test_parse_errors(self):
+        from vfx_transcode.transforms import parse_transform_presets
+        good = {"name": "x", "subs": [{"name": "a", "transforms": ["--resize 10x10"]}]}
+        parse_transform_presets([good], "t")
+        for bad in ([{"subs": good["subs"]}],                                      # no name
+                    [good, good],                                                  # duplicate
+                    [{"name": "x", "subs": []}],                                   # no subs
+                    [{"name": "x", "subs": [{"conditions": [{"left": "a", "op": ">", "right": "b"}]}]}],
+                    [{"name": "x", "subs": [{"conditions": [{"left": "a", "op": "=="}]}]}],
+                    [{"name": "x", "subs": [{"transforms": [1, 2]}]}],
+                    [{"name": "none", "subs": good["subs"]}]):
+            with self.assertRaises(TranscodeError):
+                parse_transform_presets(bad, "t")
+
+    def test_oiiotool_args_and_ffmpeg_width(self):
+        from vfx_transcode.channels import ChannelPick
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr", "-oiio_transform",
+                                                   "mygreatproject_editorial", "-width", "1280"])
+        cfg = cli.config_from_args(ns, PRESETS)
+        self.assertEqual(cfg.oiio_transform.name, "mygreatproject_editorial")
+        cfg.oiio_transform_args = ["--resize", "1920x1080"]
+        args = oiio.process_args(cfg, ChannelPick(0, ["R", "G", "B"], "p"))
+        self.assertEqual(args.count("--resize"), 1)                               # no -width resize
+        self.assertLess(args.index("1920x1080"), args.index("--colorconvert"))    # scene-linear
+        alpha = oiio.process_args(cfg, ChannelPick(0, ["R", "G", "B", "A"], "p", alpha="A"))
+        self.assertLess(alpha.index("1920x1080"), alpha.index("--unpremult"))
+        self.assertIsNone(PRESETS.get_transform("none"))
+        with self.assertRaises(TranscodeError):
+            PRESETS.get_transform("nope")
+
+
+class ClfTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_colour_args(self):
+        from vfx_transcode.channels import ChannelPick
+        cfg = self._cfg("-clf", "./luts/{namesplit1}.clf", "-display", "sRGB - Display")
+        self.assertEqual(cfg.clf, "./luts/{namesplit1}.clf")
+        cfg.clf_path = "D:/luts/sh010.clf"
+        args = oiio.process_args(cfg, ChannelPick(0, ["R", "G", "B"], "p"))
+        self.assertEqual(args[args.index("--ociofiletransform") + 1], "D:/luts/sh010.clf")
+        self.assertNotIn("--ociodisplay:from=ACEScg", " ".join(args))
+        self.assertNotIn("--colorconvert", args)
+        self.assertEqual(cli.describe_colour(cfg), 'CLF "D:/luts/sh010.clf"')
+        cfg.clf_path = ""
+        with self.assertRaises(ValueError):
+            oiio.colour_args(cfg)                       # never silently without the CLF
+
+    def test_resolve(self):
+        from vfx_transcode.names import name_tokens
+        from vfx_transcode.sequence import Sequence
+        with tempfile.TemporaryDirectory() as tmp:
+            lut = Path(tmp) / "sh010" / "DJI_comp.clf"
+            lut.parent.mkdir()
+            lut.write_text("<ProcessList/>")
+            cfg = self._cfg("-clf", str(Path(tmp)) + "/{namesplit1}/{meta:camera}_{namesplit2}.clf")
+            cfg.name_tokens = name_tokens("sh010_comp_v003")
+            cfg.header_attribs = {"camera": "DJI"}
+            seq = Sequence(Path(tmp), "sh010_comp_v003.", ".exr", 4, [1001, 1002])
+            info = [{"width": 1920, "height": 1080}]
+            self.assertEqual(Path(cli.resolve_clf(cfg, seq, info)), lut)
+            cfg.clf = str(Path(tmp)) + "/{namesplit1}/{nope}.clf"
+            with self.assertRaises(TranscodeError) as err:
+                cli.resolve_clf(cfg, seq, info)
+            self.assertIn("{nope}", str(err.exception))
+
+
+class OutputPathTests(unittest.TestCase):
+    def _resolve(self, template, ext="mp4", folder=None):
+        from vfx_transcode.sequence import Sequence
+        cfg = Config(input="x", output=template, ff_out_ext=ext)
+        seq = Sequence(Path(folder or "/shows/abc/sh010/comp/v003"), "sh010_comp_v003.", ".exr", 4,
+                       (1001, 1002))
+        context = {"clean_name": "sh010_comp_v003", "namesplit1": "sh010", "version_number": "3",
+                   "ext": ext, "input_width": "4096", "meta": {"owner": "A001"}}
+        return cli.resolve_output(cfg, seq, "sh010_comp_v003", context)
+
+    def test_source_relative(self):
+        self.assertEqual(self._resolve("./review.mp4"), Path("/shows/abc/sh010/comp/v003/review.mp4"))
+        self.assertEqual(self._resolve("./../../review/"),
+                         Path("/shows/abc/sh010/review/sh010_comp_v003.mp4"))
+        self.assertEqual(self._resolve("../out/{namesplit1}_v{version_number}"),
+                         Path("/shows/abc/sh010/comp/out/sh010_v3.mp4"))
+        self.assertEqual(self._resolve(".."), Path("/shows/abc/sh010/comp/sh010_comp_v003.mp4"))
+
+    def test_absolute_keywords_and_extension(self):
+        self.assertEqual(self._resolve("/dailies/{meta:owner}/{clean_name}_{input_width}.{ext}", "mov"),
+                         Path("/dailies/A001/sh010_comp_v003_4096.mov"))
+        self.assertEqual(self._resolve("/dailies/x.MP4"), Path("/dailies/x.MP4"))     # kept
+        self.assertEqual(self._resolve("/dailies/x.mp4", "mov"), Path("/dailies/x.mp4"))  # warns
+        self.assertEqual(self._resolve("/dailies/sh010.v3"), Path("/dailies/sh010.v3.mp4"))
+        with tempfile.TemporaryDirectory() as tmp:                                   # existing folder
+            self.assertEqual(self._resolve(tmp), Path(tmp) / "sh010_comp_v003.mp4")
+        self.assertEqual(self._resolve(""), Path("/shows/abc/sh010/comp/v003/sh010_comp_v003.mp4"))
+
+    def test_checks(self):
+        cli.check_output_template("./../{clean_name}_{meta:owner}_{namesplit-2}.{ext}")
+        for bad in ("./{nope}.mp4", "./{clean_name"):
+            with self.assertRaises(TranscodeError):
+                cli.check_output_template(bad)
+        self.assertEqual(cli.container_from_output("./{clean_name}.mov"), ".mov")
+        self.assertEqual(cli.container_from_output("./{clean_name}.v{version_number}"), "")
+        self.assertEqual(cli.container_from_output("./{clean_name}.{ext}"), "")
+
+
+class ThumbnailTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_what_is_made(self):
+        cfg = self._cfg()
+        self.assertEqual((cfg.movie, cfg.thumbnail), (True, None))            # movie, default place
+        cfg = self._cfg("-ot")
+        self.assertEqual((cfg.movie, cfg.thumbnail.name, cfg.thumbnail_output), (False, "middle1280", ""))
+        cfg = self._cfg("-o", "./", "-ot", "./thumbs/")
+        self.assertTrue(cfg.movie)
+        self.assertEqual(cfg.thumbnail_output, "./thumbs/")
+        cfg = self._cfg("-ot", "-thumbnail_preset", "start512", "-thumbnail_frame", "1010")
+        self.assertEqual((cfg.thumbnail.name, cfg.thumbnail.frame, cfg.thumbnail.width), ("start512", "1010", 512))
+        for bad in (["-ot", "./{nope}"], ["-ot", "-thumbnail_preset", "nope"],
+                    ["-ot", "-thumbnail_frame", "centre"]):
+            with self.assertRaises(TranscodeError):
+                self._cfg(*bad)
+
+    def test_choose_frame(self):
+        from vfx_transcode.thumbnails import choose_frame
+        frames = [1001, 1002, 1003, 1005, 1006, 1007]
+        self.assertEqual(choose_frame("middle", frames)[0], 1003)       # 1004 is a hole: nearest
+        self.assertEqual(choose_frame("first", frames)[0], 1001)
+        self.assertEqual(choose_frame("last", frames)[0], 1007)
+        self.assertEqual(choose_frame("1004", frames)[0], 1003)
+        self.assertEqual(choose_frame("largest", frames, {1001: 10, 1005: 99, 1006: 50})[0], 1005)
+        frame, how = choose_frame("largest", frames, {1001: 10, 1002: 10})
+        self.assertEqual(frame, 1003)
+        self.assertIn("same size", how)
+        self.assertIn("needs the movie", choose_frame("largest", frames, None)[1])
+
+    def test_oiiotool_command(self):
+        from vfx_transcode.thumbnails import ThumbnailPreset, oiiotool_command
+        movie = ["--ch", "R,G,B,A", "--unpremult", "--colorconvert", "ACEScg", "out_srgb", "-d", "uint16"]
+        cmd = oiiotool_command("oiiotool", "a.1005.exr", "t.jpg", movie,
+                               ThumbnailPreset("t", width=640, quality=80), Fraction(2), alpha=True)
+        self.assertNotIn("uint16", cmd)                                   # the movie's depth is gone
+        self.assertEqual(cmd[-2:], ["-o", "t.jpg"])
+        self.assertIn("0,1,2", cmd)                                       # jpg: no alpha
+        self.assertLess(cmd.index("--pixelaspect"), cmd.index("640x0"))   # un-squeeze, then size
+        self.assertIn("jpeg:80", cmd)
+        png = oiiotool_command("oiiotool", "a.exr", "t.png", movie,
+                               ThumbnailPreset("t", format="png", compression=9, bits=16), alpha=True)
+        self.assertNotIn("0,1,2", png)                                    # png keeps alpha
+        self.assertNotIn("--resize", png)                                 # movie size
+        self.assertEqual(png[png.index("png:compressionLevel") + 1], "9")
+        self.assertEqual(png[png.index("-d") + 1], "uint16")
+
+    def test_ffmpeg_command(self):
+        from vfx_transcode.thumbnails import ThumbnailPreset, ffmpeg_command, jpeg_qscale
+        cmd = ffmpeg_command("ffmpeg", "p.1001.png", "t.jpg", ThumbnailPreset("t", height=300), Fraction(2))
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("scale=w=trunc(iw*2/1/2)*2:h=ih", vf)
+        self.assertIn("scale=w=-1:h=300", vf)
+        self.assertEqual((jpeg_qscale(100), jpeg_qscale(1)), (2, 31))
+        png = ffmpeg_command("ffmpeg", "p.png", "t.png", ThumbnailPreset("t", format="png"), keep_alpha=True)
+        self.assertIn("format=pix_fmts=rgba", png[png.index("-vf") + 1])
+
+    def test_presets(self):
+        from vfx_transcode.thumbnails import presets_from_json
+        self.assertEqual(PRESETS.default_thumbnail, "middle1280")
+        self.assertEqual(PRESETS.thumbnails["largest1920"].frame, "largest")
+        for bad in ({"x": {"format": "gif"}}, {"x": {"quality": 0}}, {"x": {"compression": 10}},
+                    {"x": {"format": "jpg", "bits": 16}}, {"x": {"width": -1}}, {"x": {"size": 5}}):
+            with self.assertRaises(TranscodeError):
+                presets_from_json(bad, "t")
+
+    def test_path(self):
+        from vfx_transcode.sequence import Sequence
+        seq = Sequence(Path("/shows/sh010/v003"), "sh010_v003.", ".exr", 4, (1001, 1002))
+        context = {"clean_name": "sh010_v003", "frame": 1002, "ext": "jpg", "meta": {}}
+        resolve = lambda t, folder=None: cli.resolve_path_template(
+            t, seq, "sh010_v003.jpg", "jpg", cli._THUMB_EXT_RE, "-ot", context, folder)
+        self.assertEqual(resolve(""), Path("/shows/sh010/v003/sh010_v003.jpg"))
+        self.assertEqual(resolve("", "/movies"), Path("/movies/sh010_v003.jpg"))     # next to movie
+        self.assertEqual(resolve("./../thumbs/{clean_name}_{frame}"), Path("/shows/sh010/thumbs/sh010_v003_1002.jpg"))
+        self.assertEqual(resolve("/t/x.jpeg"), Path("/t/x.jpeg"))
 
 
 if __name__ == "__main__":

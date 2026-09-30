@@ -5,6 +5,7 @@ later), so paths and burn-in text may contain spaces, quotes, colons and commas.
 """
 
 import logging
+import re
 import string
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -12,21 +13,38 @@ from pathlib import Path
 
 from .errors import TranscodeError
 from . import metadata as md
-from .burnin import BURN_PLACES, DEFAULT_STYLE, BurnStyle, size_expression, size_pixels
+from .burnin import (BURN_PLACES, DEFAULT_STYLE, BurnStyle, margin_expression, resolve_margins,
+                     size_expression, size_pixels)
 from .presets import colour_tags, transfer_for
 from .timecode import fps_display, fps_to_str
 from .tools import run_tool, split_args
 
 log = logging.getLogger(__name__)
 
-BURN_POSITIONS = {                       # x, y; tc/bc are centred on the text width
-    "tl": ("w*0.01", "lh"),
-    "tc": ("(w-tw)/2", "lh"),
-    "tr": ("w-w*0.01-tw", "lh"),
-    "bl": ("w*0.01", "h-(2*lh)"),
-    "bc": ("(w-tw)/2", "h-(2*lh)"),
-    "br": ("w-w*0.01-tw", "h-(2*lh)"),
-}
+def burn_position(place, margins=None, lines=1):
+    """x, y drawtext expressions for a place; tc/bc are centred on the text width.
+    Bottom places grow upwards: the last line keeps the bottom margin."""
+    if place == "wm":          # watermark: centred both ways, margins do not apply
+        return "(w-tw)/2", "(h-{})/2".format("lh" if lines == 1 else "{}*lh".format(lines))
+    m = {side: margin_expression(value, side)
+         for side, value in resolve_margins(margins).items()}
+    column, row = place[1], place[0]
+    if column == "l":
+        x = m["left"]
+    elif column == "c":
+        x = "(w-tw)/2"
+    else:
+        x = "w-{}-tw".format(_group(m["right"]))
+    if row == "t":
+        y = m["top"]
+    else:
+        y = "h-{}-{}".format(_group(m["bottom"]), "lh" if lines == 1 else "{}*lh".format(lines))
+    return x, y
+
+
+def _group(expression):
+    """Parenthesise an expression that is not a plain number."""
+    return expression if re.fullmatch(r"[\d.]+", expression) else "(" + expression + ")"
 
 
 # --- escaping (see "Notes on filtergraph escaping" in the ffmpeg-filters docs) ---
@@ -147,7 +165,7 @@ def _alpha(opacity):
     return "{:.3g}".format(opacity)
 
 
-def build_drawtext(template, place, ctx, font, style, picture_height=1080):
+def build_drawtext(template, place, ctx, font, style, picture_height=1080, margins=None):
     """One drawtext filter. style: a fully resolved burnin.BurnStyle."""
     options = []
     if font:
@@ -164,12 +182,10 @@ def build_drawtext(template, place, ctx, font, style, picture_height=1080):
     text_options = expand_burn_template(template, ctx)
     options += text_options
     lines = dict(text_options)["text"].count("\n") + 1
-    x, y = BURN_POSITIONS[place]
+    x, y = burn_position(place, margins, lines)
     if lines > 1:
-        if place.startswith("b"):
-            y = "h-({}*lh)".format(lines + 1)      # grow upwards, same bottom margin as one line
-        if place[1] in "cr":
-            options.append(("text_align", "C" if place[1] == "c" else "R"))   # ffmpeg 6.1+
+        if place == "wm" or place[1] in "cr":
+            options.append(("text_align", "R" if place[1:] == "r" else "C"))   # ffmpeg 6.1+
     options += [("x", x), ("y", y)]
     if ctx.lead_frames and ctx.skip_lead:
         # the counters still run on the skipped frames, so the first picture shows the right values
@@ -187,7 +203,12 @@ def build_video_filter(cfg, ctx, scale_width):
     if scale_width > 0:
         scale = [("w", str(scale_width)), ("h", "-2")] + scale
     from .aspect import reformat_filters, sar_filter
-    filters = reformat_filters(cfg.par_in, cfg.par_out_value)
+    filters = []
+    if cfg.alpha_active and cfg.alpha_premult:
+        # the intermediates are straight; premultiply in 16-bit planar RGB (exact, no chroma)
+        filters += [make_filter("format", [("pix_fmts", "gbrap16le")]),
+                    make_filter("premultiply", [("inplace", "1")])]
+    filters += reformat_filters(cfg.par_in, cfg.par_out_value)
     filters += [make_filter("scale", scale),
                 make_filter("pad", [("width", "ceil(iw/2)*2"), ("height", "ceil(ih/2)*2")]),
                 sar_filter(cfg.par_out_value)]         # also tags 1:1, so nothing is inherited
@@ -200,7 +221,8 @@ def build_video_filter(cfg, ctx, scale_width):
             ("color_trc", transfer_for(cfg.output_colour)), ("colorspace", "bt709")]))
     if cfg.letterbox_plan is not None:
         from .letterbox import filters as letterbox_filters
-        filters += letterbox_filters(cfg.letterbox_plan, ctx.lead_frames)   # not on the slate
+        filters += letterbox_filters(cfg.letterbox_plan, ctx.lead_frames,   # not on the slate
+                                     alpha=cfg.alpha_active)
     if cfg.ff_filter.strip():
         filters.append(cfg.ff_filter.strip())   # user's raw filtergraph, used as given
 
@@ -214,7 +236,8 @@ def build_video_filter(cfg, ctx, scale_width):
         template = cfg.burn.get(place)
         if template:
             style = cfg.burn_styles.get(place) or DEFAULT_STYLE.over(BurnStyle(size=str(cfg.burn_size)))
-            filters.append(build_drawtext(template, place, ctx, font, style, height))
+            filters.append(build_drawtext(template, place, ctx, font, style, height,
+                                          cfg.burn_margins))
     return ",".join(filters)
 
 
@@ -238,6 +261,8 @@ def encode_args(cfg, video_filter):
     """Codec arguments: -ff_encode if given (used as is), else the preset + colour tags."""
     user = bool(cfg.ff_encode.strip())
     tokens = split_args(cfg.ff_encode) if user else list(cfg.preset.encode)
+    if not user and cfg.alpha_active and cfg.preset.alpha_pix_fmt:
+        tokens = _with_pix_fmt(tokens, cfg.preset.alpha_pix_fmt)
     args = []
     placed = False
     for token in tokens:
@@ -253,6 +278,16 @@ def encode_args(cfg, video_filter):
     if not user and cfg.preset.colour_tags:
         args += colour_tags(cfg.output_colour)
     return args
+
+
+def _with_pix_fmt(tokens, pix_fmt):
+    """The preset's -pix_fmt value replaced (or added before the filter)."""
+    tokens = list(tokens)
+    for i, token in enumerate(tokens[:-1]):
+        if token == "-pix_fmt":
+            tokens[i + 1] = pix_fmt
+            return tokens
+    return ["-pix_fmt", pix_fmt] + tokens
 
 
 def build_command(cfg, list_file, output_file, video_filter, timecode, metadata=None, reel_name=""):

@@ -16,6 +16,8 @@
 - [Burn-ins](#burn-ins)
 - [Slate](#slate)
 - [Letterbox](#letterbox)
+- [Alpha](#alpha)
+- [Thumbnail](#thumbnail)
 - [Encoding (ffmpeg)](#encoding-ffmpeg)
 - [Presets file](#presets-file)
 - [Logging and exit codes](#logging-and-exit-codes)
@@ -43,7 +45,7 @@
 | Option | Default | Description |
 |---|---|---|
 | `-i PATH` | *(required)* | Any file of the input sequence. See the sequence rules below. |
-| `-o PATH` | `<input folder>/<name>.<ext>` | Output movie. `<name>` is the sequence name without its frame number and separator (`shot_010.1001.exr` → `shot_010`). `<ext>` comes from the preset or `-ff_out_ext`. Missing folders are created. The container follows `-ff_out_ext`, else the extension of `-o` (`-o review.mov` makes a mov even with the h264 preset), else the preset's `ext`. |
+| `-o PATH` | `<input folder>/<name>.<ext>` | Output movie: a file or a folder, with keywords. See [Output path](#output-path) below. `<name>` is the sequence name without its frame number and separator (`shot_010.1001.exr` → `shot_010`). |
 | `-version_regex REGEX` | `_v(\d\d\d)` | How the version is found in the sequence name for the [name keywords](#name-keywords). |
 
 **How the sequence is found.** The frame number is the run of digits at the end of the file name, just before the extension:
@@ -53,6 +55,32 @@
 Every file in the same folder with the same name, the same extension (case-insensitive) and the same padding belongs to the sequence. Numbers longer than the padding also count, so frame 10000 belongs to a 4-digit sequence.
 
 A file without a frame number (`plate.exr`) is treated as a one-frame sequence at frame 0.
+
+### Output path
+
+`-o` is a template:
+
+- **Keywords** work in folders and file name:
+  - `{clean_name}`, `{frame_start}`, `{frame_end}`, `{timecode}`, `{fps}`, `{preset}`, `{date}`, `{reel}`;
+  - `{ext}` (the container extension);
+  - `{input_width}`, `{input_height}`, `{input_par}` (EXR input);
+  - [`{meta:ATTR}`](#header-values-metaattr) and the [name keywords](#name-keywords).
+  
+  An unknown keyword stops the run before anything is converted.
+- **`./` and `../` are relative to the input sequence's folder**, and `..` steps up from there: `-o "./../review/"` writes next to the frames' folder, in `review`. This differs from `-ffmpeg`, `-ocio`, `-presets_file` and `-clf`, where `./` means the application folder. Absolute paths are used as they are; other relative paths (`out/x.mov`) are relative to the folder the command runs in.
+- **A folder** gets the default file name `<name>.<ext>`. An `-o` ends in a folder when it ends in `/` or `\`, is `.` or `..`, or names an existing folder.
+- **The extension is added** when the name doesn't end in a container extension (mov, mp4, mxf, mkv, webm, …): `-o "./{clean_name}.v{version_number}"` gives `sh010_comp.v3.mp4`.
+- **The container** follows `-ff_out_ext`, else a container extension written in `-o` (`-o review.mov` makes a mov even with the h264 preset), else the preset's `ext`. If the name ends in a different container extension than `-ff_out_ext`, the name is kept and a warning printed, because ffmpeg picks the container from the file name.
+- Missing folders are created. The log shows the result, e.g. `Output: "./../review/{namesplit1}/" -> D:/shots/sh010/review/sh010/sh010_comp_v003.mp4`.
+
+Examples, for frames in `D:/shows/abc/sh010/comp/v003/sh010_comp_v003.1001.exr`:
+
+| `-o` | Movie |
+|---|---|
+| *(none)* | `D:/shows/abc/sh010/comp/v003/sh010_comp_v003.mp4` |
+| `./../../review/` | `D:/shows/abc/sh010/review/sh010_comp_v003.mp4` |
+| `./../review/{namesplit1}_v{version_number}` | `D:/shows/abc/sh010/comp/review/sh010_v3.mp4` |
+| `D:/dailies/{date}/{clean_name}.mov` | `D:/dailies/2026-09-30/sh010_comp_v003.mov` (a mov) |
 
 ## Frame rate
 
@@ -114,7 +142,7 @@ Output:
 
 ## Colour
 
-EXRs are converted with OCIO in one of two ways.
+EXRs are converted in one of three ways: colourspace to colourspace, display / view, or a CLF file.
 
 **Colourspace to colourspace** (the default): `oiiotool --colorconvert IN OUT`.
 
@@ -130,6 +158,19 @@ EXRs are converted with OCIO in one of two ways.
 | `-display NAME` | *(not used)* | OCIO display, e.g. `"sRGB - Display"`, `"Rec.1886 Rec.709 - Display"`. `""` means the config's default display. |
 | `-view NAME` | the display's default | OCIO view, e.g. `"ACES 1.0 - SDR Video"`, `"Un-tone-mapped"`. |
 | `-looks LOOKS` | *(none)* | OCIO looks applied with the display transform, e.g. `"ACES 1.3 Reference Gamut Compression"`; separate several with commas. |
+
+**CLF file**: `oiiotool --ociofiletransform FILE`, for a show LUT delivered as CLF (Common LUT Format, the ACES/ASC LUT file). The CLF replaces the colour conversion; it is either a CLF or `-ci`/`-co` / display-view, never both.
+
+| Option | Default | Description |
+|---|---|---|
+| `-clf PATH` | *(not used)* | CLF file to apply. The path may use keywords: the [name keywords](#name-keywords), `{clean_name}`, `{frame_start}`, `{frame_end}`, `{input_width}`, `{input_height}`, `{input_par}` and [`{meta:ATTR}`](#header-values-metaattr), e.g. `"D:/show/luts/{namesplit1}/{namesplit2}.clf"` or `"./luts/{meta:reel}.clf"`. `./` is relative to the application folder. |
+
+- The path is expanded with the first frame's header and checked before any frame is converted. A missing file stops the run, and the error shows the expanded path and any unknown keyword.
+- The log shows both, e.g. `CLF "D:/show/luts/{namesplit1}.clf" -> D:/show/luts/sh010.clf`.
+- The CLF gets the image as it comes from the EXR (after the channel choice and any [OIIO transform](#oiio-transforms); with [alpha](#alpha) kept, un-premultiplied), so it must expect that input, usually scene-linear, and output display-ready values.
+- `-display`, `-view` and `-looks` are ignored with a warning. `-co` only names the output for the movie's colour tags: a name with "srgb" gives sRGB tags, anything else Rec.709.
+- No OCIO config is needed; a missing `-ocio` file is not an error with `-clf`.
+- The slate's `{colour}` shows `CLF <file name>`.
 
 Example with the ACES 1.3 studio config that is built into OCIO 2.2+:
 
@@ -162,7 +203,7 @@ If the configured path doesn't exist, the tool looks for `oiiotool` / `ffmpeg` o
 |---|---|---|
 | `-oiio_channel LIST` | *(automatic)* | Channels to show, comma separated: `R,G,B` or `diffuse.R,diffuse.G,diffuse.B`. If they aren't in the image, a warning is printed and the tool tries them anyway. |
 | `-oiio_channel_use_first 0\|1` | `0` | Skip the automatic search (`channel_preferences`, below) and use the first layer. |
-| `-width PIXELS` | `1920` | Output width. The height follows the aspect ratio and is rounded to an even number. `0` keeps the original size. EXRs are resized by oiiotool; other input is resized by ffmpeg. |
+| `-width PIXELS` | `1920` | Output width. The height follows the aspect ratio and is rounded to an even number. `0` keeps the original size. EXRs are resized by oiiotool; other input is resized by ffmpeg. With an [OIIO transform](#oiio-transforms), ffmpeg scales the transform's output to this width. |
 | `-mezzanine EXT` | `png` | Format of the intermediate frames: `png`, `tif`, `jpg`, … `tif` is often faster than `png` because it skips PNG compression. |
 | `-mezzanine_16bit 0\|1` | `0` | Write 16-bit intermediates. The default 8-bit is faster and is all an 8-bit h264 needs. Turn this on for 10-bit presets (`h265`, `prores*`, `dnxhr-hqx`) if you want real 10-bit input. |
 | `-oiio_command ARGS` | *(none)* | Extra oiiotool arguments, added after the colour conversion and resize, e.g. `-oiio_command "--ociolook \"Film Look\""`. Quotes group words; backslashes are kept as typed. |
@@ -195,6 +236,41 @@ If no set matches, the tool takes the first layer with at least three channels, 
 Multi-part EXRs are supported: the part that holds the chosen channels is selected with `--subimage`.
 
 **Batching.** EXRs are converted with one `oiiotool --parallel-frames` call for each run of frames without a hole. This avoids starting oiiotool and loading the OCIO config once per frame. Single frames, and names containing `%`, `#` or `@`, are converted one file at a time.
+
+### OIIO transforms
+
+VFX projects often need a different resize or crop for each kind of input: UHD plates scaled to 1080p, 4080-wide plates cut to 3840 first, everything else fitted to 1080 lines. A transform preset in `presets.json` (`oiio_transforms`) holds these rules, and `-oiio_transform NAME` picks one. EXR input only.
+
+| Option | Default | Description |
+|---|---|---|
+| `-oiio_transform NAME` | the presets file's `default_oiio_transform` (`none`) | Transform preset. `none` = off, the usual `-width` resize. `--help` lists the presets with their sub-presets and conditions. |
+
+**How a sub-preset is chosen.** A preset has a list of sub-presets (`subs`). They are checked from top to bottom, and the **first** one whose conditions **all** hold (logical AND) is used; the rest are not checked. A sub-preset without conditions always matches, so put one last as the catch-all. If none matches, a warning is printed and the normal `-width` resize is used.
+
+**Conditions** compare two strings, after [keyword](#burn-ins) expansion:
+
+```json
+{"left": "{input_width}x{input_height}", "op": "==", "right": "3840x2160"}
+```
+
+- `op` is `==` (equal) or `!=` (not equal). Both sides are trimmed of spaces at the ends; otherwise the comparison is exact text.
+- Keywords:
+  - `{input_width}` and `{input_height}` are the size of the first frame's display window.
+  - `{input_data_width}` and `{input_data_height}` are the size of its data window.
+  - `{input_par}` is the [input pixel aspect](#pixel-aspect-ratio) as a plain number: `1`, `2`, `1.3333`.
+  - Also available: `{clean_name}`, `{frame_start}`, `{frame_end}`, [`{meta:ATTR}`](#header-values-metaattr) and the [name keywords](#name-keywords).
+- An unknown keyword is compared as typed, with a warning.
+
+**Transforms** are oiiotool arguments. Each list entry can hold one argument or several words (`"--resize 1920x1080"`), and keywords work there too (`"--cut {input_width}x2000+0+80"`). They run on the scene-linear image, right after the channels are picked and before the colour transform. With [alpha](#alpha) they run while the image is still premultiplied. They replace oiiotool's `-width` resize.
+
+**The final size.** After the transform, ffmpeg scales the result to `-width`, whatever size the transform produced; the height follows the aspect. `-width 0` keeps the transform's output size. With the default `-width 1920` and a transform that already makes 1920×1080, nothing changes. The slate and letterbox follow the real size of the converted frames.
+
+The log shows the choice, e.g. `OIIO transform "mygreatproject_editorial": 4080x2160 input -> sub "239" (4080 == 4080; 2160 == 2160): --rangecompress --cut 3840x2160+120+0 --resize 1920x1080 --rangeexpand`. With `-v 1`, every sub-preset that was checked is listed.
+
+oiiotool notes:
+- `--rangecompress` / `--rangeexpand` around a resize reduce ringing on bright HDR highlights.
+- **`--crop` vs `--cut`.** `--crop` only shrinks the *data window*; the display window keeps its size. PNG (and the other intermediate formats) can't store windows, so the frame is written at the full display size, with black outside the crop. For example, `--resize 0x1080 --crop 1920x1080` on a 4312×2160 plate gives a 2156×1080 frame. `--cut` crops and makes the result the new picture size (origin and display window reset), so use `--cut` to change the size.
+- **Centred cut.** oiiotool can compute the offset itself with its own `{...}` expressions, which pass through the keyword expansion untouched: `"--cut 1920x1080+{(TOP.width-1920)/2}+0"` cuts the centre 1920 pixels of the current image. The shipped `other` / `1080p` subs do this after `--resize 0x1080`.
 
 ## Missing and failed frames
 
@@ -333,17 +409,25 @@ mov and mxf also get the file-level `reel_name` tag. The value is written as giv
 
 ## Burn-ins
 
-Burn-ins can go in six places: `tl` `tc` `tr` along the top and `bl` `bc` `br` along the bottom. `tc` and `bc` are centred.
+Burn-ins can go in seven places: `tl` `tc` `tr` along the top, `bl` `bc` `br` along the bottom, and `wm`, the watermark, in the middle of the picture. `tc` and `bc` are centred.
+
+**Watermark (`wm`).** Usually big, see-through text across the picture, e.g. `-burn_wm "CONFIDENTIAL"`.
+- It is centred horizontally and vertically; multi-line text (`\n`) is centred line by line. Margins do not apply.
+- By default it is 8% of the picture height at opacity 0.25. The preset-wide size and opacity (and `-burn_size` / `-burn_opacity`) do **not** change it, so a preset with small corner text still gets a big watermark. Set its own size and opacity in the preset (`"wm": {"text": "DRAFT", "size": "12%", "opacity": 0.15}`) or with `-burn_style "wm:size=12%,opacity=0.15"`.
+- Colour and box follow the preset and the all-place options like any other place.
+- Like the other burn-ins it is drawn over the letterbox and not on the slate.
 
 | Option | Default | Description |
 |---|---|---|
 | `-burn_preset NAME` | the presets file's `default_burnin` (`none`) | Burn-in preset from the [presets file](#presets-file). `none` means no burn-ins. `--help` lists the presets, their text and styles. |
-| `-burn_tl`, `-burn_tc`, `-burn_tr`, `-burn_bl`, `-burn_bc`, `-burn_br TEXT` | from the burn-in preset | Text for one place. An empty value (`-burn_tl ""`) clears the preset's text there. |
+| `-burn_tl`, `-burn_tc`, `-burn_tr`, `-burn_bl`, `-burn_bc`, `-burn_br`, `-burn_wm TEXT` | from the burn-in preset | Text for one place. An empty value (`-burn_tl ""`) clears the preset's text there. |
 | `-burn_color COLOR` | preset, else `white` | Text colour for all places: a name (`white`, `yellow`, `red`, …) or `#RRGGBB` / `0xRRGGBB`. |
 | `-burn_opacity 0-1` | preset, else `1` | Opacity of text, shadow and box, for all places. `1` is solid, `0.5` half transparent. |
 | `-burn_size SIZE` | preset, else `1.33%` | Text size for all places; see [Text size](#text-size). |
 | `-burn_box 0\|1` | preset, else `0` | A black box behind the text instead of a drop shadow, for all places. The box has the place's opacity. |
-| `-burn_style PLACE:KEY=VALUE,...` | *(none)* | Style for one place, e.g. `-burn_style "tc:color=yellow,size=2.5%,box=1"`. PLACE is `tl` … `br` or `all`; keys are `color`, `opacity`, `size` and `box`. Repeatable; later ones win. |
+| `-burn_style PLACE:KEY=VALUE,...` | *(none)* | Style for one place, e.g. `-burn_style "tc:color=yellow,size=2.5%,box=1"`. PLACE is `tl` … `br`, `wm` or `all`; keys are `color`, `opacity`, `size` and `box`. Repeatable; later ones win. |
+| `-burn_margin SIZE` | preset, else 1.5% top/bottom, 1% left/right | Empty space between the picture edge and the text, all four sides. Pixels (`20`) or percent: `2%` is 2% of the picture **width** for left and right, 2% of the **height** for top and bottom. `0` puts the text right at the edge. |
+| `-burn_margin_top`, `-burn_margin_bottom`, `-burn_margin_left`, `-burn_margin_right SIZE` | as above | One side only; wins over `-burn_margin`. Top applies to `tl` `tc` `tr`, bottom to `bl` `bc` `br`, left to `tl` `bl`, right to `tr` `br`; the centred places ignore left and right. |
 | `-burn_font PATH` | the burn-in preset's `font`, else `./fonts/DroidSansMono.ttf` | Font file. If it's missing, a warning is printed and ffmpeg's default font is used. |
 
 **Style layers.** Each place gets its colour, opacity, size and box from these layers, field by field; later ones win:
@@ -355,6 +439,8 @@ Burn-ins can go in six places: `tl` `tc` `tr` along the top and `bl` `bc` `br` a
 5. `-burn_style` for that place
 
 For example, `-burn_preset wip -burn_style "tc:color=red"` keeps the WIP stamp's size and box but makes it red. The log lists every place with its text and final style.
+
+**Margins** are layered the same way, side by side: defaults (1.5% top and bottom, 1% left and right) < the preset's `margin` < the preset's `margin_top` … `margin_right` < `-burn_margin` < `-burn_margin_top` … The margin is measured to the text itself; with `box`, the box border reaches a little further. Multi-line text at the bottom grows upwards, so its last line keeps the bottom margin. Margins other than the defaults are listed in the log.
 
 ### Text size
 
@@ -511,6 +597,62 @@ The bars are drawn on the encoded size, after scaling, pixel aspect reformat and
 
 The log shows the result, e.g. `Letterbox 2.39: letterbox, bars of 138 px top and bottom, line 2 px`.
 
+## Alpha
+
+By default the movie has no alpha channel, whatever the input has. `-alpha keep` carries the input's alpha into the movie, e.g. for comp elements in ProRes 4444.
+
+| Option | Default | Description |
+|---|---|---|
+| `-alpha drop\|keep` | `drop` | `keep` writes the input alpha to the movie. The encode preset must be able to store alpha: presets with `alpha_pix_fmt` (shipped: `prores4444`, marked `[alpha]` in `--help`), or `-ff_encode` with an alpha pixel format (e.g. `-pix_fmt yuva420p … -c:v libvpx-vp9` for WebM). Otherwise the tool stops with an error before converting anything. The intermediates must be `png` or `tif`. |
+| `-alpha_premult 0\|1` | `0` | Only with `-alpha keep`. `0`: the colour is written **straight** (unpremultiplied), which is what most players and editors expect in a mov. `1`: the colour is **premultiplied** by alpha. |
+
+How it works:
+
+- **EXR input.** The alpha channel next to the chosen colour channels is used (`rgba.A` for `rgba.R,G,B`, `A` for `R,G,B`, `beauty.A` …). EXR colour is premultiplied, so oiiotool resizes first, then divides by alpha (`--unpremult`), then applies the colour transform to the straight colour. The intermediate PNGs are straight, as PNG expects. If there is no alpha channel, or the picture is a deep depth view, a warning is printed and the movie gets no alpha.
+- **Other input** (PNG, TIFF …) is used as it is and taken to be straight, as PNG defines. Whether it has alpha is read from the first frame.
+- **Premultiplied output** is done by ffmpeg (`premultiply`, in 16-bit RGB) at the start of the filter chain.
+- **Burn-ins** are drawn opaque where their text is, also over transparent parts. **Letterbox bars** are composited over the picture with their own opacity, so they also show over transparent parts. The **slate** is fully opaque.
+- Colour in fully transparent pixels (alpha 0) can't survive straight output: additive glows with no alpha disappear. That is a property of straight alpha, not of the tool.
+
+The log shows the result, e.g. `Alpha: kept (rgba.A), written straight (unpremultiplied), yuva444p10le`.
+
+## Thumbnail
+
+A thumbnail is a still image (jpg or png) that goes with the movie, or is made on its own.
+
+- **Same look as the movie.** For EXRs it is a separate oiiotool run on one source frame, with the same processing: channels, alpha, [OIIO transform](#oiio-transforms), [colour or CLF](#colour) and `-oiio_command`. After that come the thumbnail's own size and file format. Burn-ins, letterbox and slate are not part of it. It doesn't use the movie's intermediate files. Other input (PNG, JPG …) is scaled by ffmpeg.
+- **Thumbnail only.** `-ot` without `-o` makes only the thumbnail: no movie, no intermediate frames.
+
+| Options | Result |
+|---|---|
+| neither `-o` nor `-ot` | the movie, at its default place |
+| `-o …` | the movie |
+| `-ot …` | only the thumbnail |
+| `-o … -ot …` | movie and thumbnail; `-o ./` = the movie at its default place |
+
+| Option | Default | Description |
+|---|---|---|
+| `-ot [PATH]` | *(no thumbnail)* | Write a thumbnail. PATH works like [`-o`](#output-path): file or folder, `./` and `../` relative to the input folder, keywords, plus `{frame}` (the frame used). The extension (`.jpg` / `.png`) is added if missing. `-ot` without PATH puts `<name>.<ext>` next to the movie, or in the input folder when there is no movie. |
+| `-thumbnail_preset NAME` | the presets file's `default_thumbnail` (`middle1280`) | Thumbnail preset: frame, size, format and compression. `--help` lists them. |
+| `-thumbnail_frame middle\|first\|last\|largest\|FRAME` | the preset's | Which frame. `middle` (the frame nearest the middle of the range), `first`, `last`, a frame number (the nearest existing frame), or `largest`, described below. |
+
+**`largest`.** After oiiotool has converted the movie's frames, the tool picks the frame whose converted image is the biggest file. File size roughly follows detail, so this is the busiest frame. It falls back to `middle` when all files are the same size, and when there is no movie (thumbnail only), because the converted frames are needed. The log says which.
+
+**Size.** The preset's `width` / `height` replace the movie's `-width` resize, so there is one resize, not two; an OIIO transform still applies. `0` means "follow the other side"; both `0` gives the movie's size. Anamorphic input is made square-pixel (oiiotool `--pixelaspect 1`), since thumbnails are viewed as plain images.
+
+**Alpha.** With `-alpha keep`, a png thumbnail keeps the alpha (straight). A jpg thumbnail has none.
+
+The log shows the choice and the file, e.g. `Thumbnail: frame 1005 (middle), 1280xauto, jpg quality 90 -> D:/shots/sh010/sh010_comp_v003.jpg`.
+
+Shipped thumbnail presets:
+
+| Preset | Frame | Size | Format |
+|---|---|---|---|
+| `middle1280` (default) | middle | 1280 wide | jpg, quality 90 |
+| `start512` | first | 512 wide | jpg, quality 85 |
+| `largest1920` | largest | 1920 wide | jpg, quality 92 |
+| `middle_png` | middle | the movie's size | png, compression 6 |
+
 ## Encoding (ffmpeg)
 
 | Option | Default | Description |
@@ -589,6 +731,10 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
 | `metadata_presets` | The metadata presets. Optional. The name `none` is reserved. |
 | `default_slate` | Slate preset used without `-slate`. `none` (or leaving it out) means no slate. |
 | `slate_presets` | The slate presets. Optional. The name `none` is reserved. |
+| `default_oiio_transform` | Transform preset used without `-oiio_transform`. `none` (or leaving it out) means none. |
+| `default_thumbnail` | Thumbnail preset used without `-thumbnail_preset`. |
+| `thumbnail_presets` | The [thumbnail](#thumbnail) presets, see below. |
+| `oiio_transforms` | A list of [OIIO transform](#oiio-transforms) presets: `{"name": ..., "description": ..., "subs": [{"name": ..., "description": ..., "conditions": [...], "transforms": [...]}]}`. Optional. The name `none` is reserved. |
 | `channel_preferences` | Ordered channel sets for the [automatic channel choice](#exr-conversion-oiiotool). Each set is a string `"R,G,B"` or a list `["R", "G", "B"]`. Put your studio's beauty-layer names first. Optional; if it's missing, the built-in list shown there is used. |
 
 Encode preset fields:
@@ -600,6 +746,7 @@ Encode preset fields:
 | `notes` | no | Description shown in `--help`. |
 | `ten_bit` | no | `true` for 10-bit codecs. It only enables the `-mezzanine_16bit` tip. |
 | `metadata` | no | Tags this codec always gets, as `{"key": "value"}`, e.g. `{"vendor_id": "appl"}` for ProRes. Keywords work. The metadata preset's tags and `-metadata` can override them. |
+| `alpha_pix_fmt` | no | Pixel format used instead of the `-pix_fmt` in `encode` when [alpha](#alpha) is kept, e.g. `"yuva444p10le"` for ProRes 4444. Without it the preset cannot store alpha. |
 | `colour_tags` | no, default `true` | Append `-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc …`. The transfer tag follows `-colorout`: `iec61966-2-1` when it contains "srgb", `bt709` otherwise. |
 
 Metadata preset fields (all optional; any other field is an error; each has the command-line option of the same name):
@@ -616,11 +763,12 @@ Burn-in preset fields (all optional; any other field is an error):
 
 | Field | Description |
 |---|---|
-| `tl`, `tc`, `tr`, `bl`, `bc`, `br` | Each place is either its text (with the [keywords](#burn-ins)), or an object that also styles it: `{"text": "TC {tc}", "color": "yellow", "opacity": 0.8, "size": "2.2%", "box": true}`. An object without `text` only styles the place, for text that comes from the command line. Leave a place out to keep it empty. |
+| `tl`, `tc`, `tr`, `bl`, `bc`, `br`, `wm` | Each place is either its text (with the [keywords](#burn-ins)), or an object that also styles it: `{"text": "TC {tc}", "color": "yellow", "opacity": 0.8, "size": "2.2%", "box": true}`. An object without `text` only styles the place, for text that comes from the command line. Leave a place out to keep it empty. |
 | `color` | Text colour for the whole preset. |
 | `opacity` | 0–1 for text, shadow and box, for the whole preset. |
 | `size` | [Text size](#text-size) for the whole preset: `"1.5%"`, `40` (pixels) or `"h/75"`. Default `"1.33%"`. |
 | `box` | `true` for a black box behind the text, for the whole preset. |
+| `margin`, `margin_top`, `margin_bottom`, `margin_left`, `margin_right` | Space between the picture edge and the text: pixels (`20`) or percent (`"2%"`, of the width for left/right, of the height for top/bottom). `margin` sets all four; a side wins over it. |
 | `font` | Font file; `./` paths are relative to the application folder. |
 | `notes` | Description shown in `--help`. |
 
@@ -645,6 +793,18 @@ Slate preset fields (all optional; any other field is an error):
 | `font` | Font file; default the burn-in font. |
 | `notes` | Description shown in `--help`. |
 
+Thumbnail preset fields (all optional; any other field is an error):
+
+| Field | Description |
+|---|---|
+| `frame` | `middle` (default), `first`, `last`, `largest` or a frame number. |
+| `width`, `height` | Size in pixels; `0` follows the other side, both `0` = the movie's size. |
+| `format` | `jpg` (default) or `png`. |
+| `quality` | jpg quality 1–100, default 90. |
+| `compression` | png compression 0 (fastest, biggest) – 9 (slowest, smallest), default 6. |
+| `bits` | png bit depth 8 (default) or 16. jpg is always 8-bit. |
+| `notes` | Description shown in `--help`. |
+
 Shipped encode presets, based on the [ASWF Encoding Guidelines](https://github.com/AcademySoftwareFoundation/EncodingGuidelines):
 
 | Preset | Ext | Notes |
@@ -653,7 +813,7 @@ Shipped encode presets, based on the [ASWF Encoding Guidelines](https://github.c
 | `h264-web` | mp4 | 8-bit, long GOP, small files. |
 | `h265` | mp4 | 10-bit HEVC, CRF 22, `hvc1` tag for Apple players. Not playable in Firefox. |
 | `prores422hq` | mov | ProRes 422 HQ, 10-bit. |
-| `prores4444` | mov | ProRes 4444, 10-bit. |
+| `prores4444` | mov | ProRes 4444, 10-bit. Keeps alpha with `-alpha keep` (`yuva444p10le`). |
 
 The ProRes presets add `-vendor apl0`, which marks the ProRes frames themselves as Apple-made, and `"metadata": {"vendor_id": "appl"}`. With ffmpeg 6.1 the latter only ends up as a file-level `vendor_id` tag. The vendor field of the mov video track stays `FFMP`, because ffmpeg's mov writer hard-codes it ([ffmpeg-user, 2021](https://ffmpeg.org/pipermail/ffmpeg-user/2021-May/053003.html)). Test 14 in `test_conversion.bat` reports what your ffmpeg writes. Custom keys like this are kept in mov/mp4 because the tool adds `-movflags +use_metadata_tags` whenever it writes tags.
 | `dnxhr-sq` | mov | DNxHR SQ, 8-bit 4:2:2. |
@@ -669,6 +829,7 @@ Shipped burn-in presets:
 | `dailies` | left: `{clean_name}`, right: `{date}` | centre: `TC {tc}` (big, boxed), right: `{current_frame} / {frame_end}` | |
 | `editorial` | | left: `{clean_name}`, right: `TC {tc}` | |
 | `client` | | centre: `{clean_name}   {date}` | small (1.1%), opacity 0.8 |
+| `confidential` | | centre: `{clean_name}   {date}`; watermark `CONFIDENTIAL` | as `client`; watermark 8%, opacity 0.25 |
 | `wip` | left: `{clean_name}`, centre: `WIP - NOT FOR APPROVAL` (yellow, big, boxed), right: `TC {tc}` | right: `{current_frame}` | |
 
 ## Logging and exit codes

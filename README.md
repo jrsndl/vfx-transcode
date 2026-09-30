@@ -21,12 +21,15 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - Fast EXR conversion: one `oiiotool --parallel-frames` call per run of frames without a hole, falling back to one file at a time, with intermediate files in your local user temp folder (or next to the sources).
 - Encode and burn-in presets in an editable [`presets.json`](presets.json); the encode presets are based on the [ASWF Encoding Guidelines](https://github.com/AcademySoftwareFoundation/EncodingGuidelines).
 - OCIO colour conversion by input/output colourspace, or by display/view (ACES 1.3+ configs, built-in `ocio://` configs), with `-ocio_info` to list the names.
+- OIIO transform presets: resize/crop rules chosen per input (size, pixel aspect, header values), first matching rule wins.
 - Pixel aspect ratio from an argument or the header; output with the same pixel aspect (tagged), reformatted to square pixels, or to a given pixel aspect.
 - Frame rate and timecode from an argument or the EXR header, with a switch for which one wins; timecode is written as a real timecode track in mov/mp4/mxf.
 - Metadata: your own `KEY=VALUE` tags, optional copying from the EXR header, and metadata presets (`review`, `conform`, `client`, `archive`).
 - Reel name for conforming (explicit, or from the EXR `owner` or any other attribute), written into the mov timecode track and mxf source package.
-- Burn-ins in six places (corners plus top/bottom centre) with name, frame counter, frame range, running timecode, fps and date; colour, opacity, size and black box per preset or per place.
+- Burn-ins in six places (corners plus top/bottom centre) and a centred watermark, with name, frame counter, frame range, running timecode, fps and date; colour, opacity, size and black box per preset or per place.
 - Letterbox or pillarbox bars for a target ratio, optionally see-through and with an edge line; burn-ins stay on top.
+- Alpha: dropped by default, or kept into ProRes 4444 (or any alpha codec), straight or premultiplied.
+- Thumbnails (jpg/png) with the same look as the movie, from the middle, first, last or busiest frame; or thumbnails only.
 - VFX slate: one frame before the pictures (frame and timecode start − 1), same size and pixel aspect as the pictures, with a shot thumbnail and rows from presets, header values or the command line.
 
 ## Layout

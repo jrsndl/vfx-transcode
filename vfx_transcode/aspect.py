@@ -55,8 +55,15 @@ def header_par(attribs):
     return None, None
 
 
-def resolve_par(cfg):
+def resolve_par(cfg, quiet=False):
     """(input PAR, source) following -par_source; 1 as the last resort."""
+    if quiet:
+        previous = log.disabled
+        log.disabled = True
+        try:
+            return resolve_par(cfg)
+        finally:
+            log.disabled = previous
     header, name = (None, None)
     if cfg.par_source != "arg_only":
         header, name = header_par(cfg.header_attribs)

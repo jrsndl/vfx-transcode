@@ -3,7 +3,7 @@
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,17 @@ class ChannelPick:
     channels: List[str]
     reason: str
     deep: bool = False
+    alpha: Optional[str] = None      # alpha channel to keep (-alpha keep), None = drop it
+
+    @property
+    def output_channels(self):
+        """--ch list: RGB (mono repeated to RGB when there is alpha), plus alpha if kept."""
+        colour = self.without_alpha
+        if not self.alpha:
+            return colour
+        if len(colour) == 1:
+            colour = colour * 3
+        return colour + [self.alpha]
 
     @property
     def without_alpha(self):
@@ -37,7 +48,7 @@ class ChannelPick:
         return kept[:3] if len(kept) >= 3 else kept[:1]
 
     def __str__(self):
-        return ",".join(self.without_alpha)
+        return ",".join(self.output_channels)
 
 
 def is_alpha(channel):
@@ -54,6 +65,21 @@ def group_layers(channels):
     for channel in channels:
         layers.setdefault(layer_of(channel), []).append(channel)
     return layers
+
+
+def find_alpha(pick, info):
+    """The alpha channel belonging to the picked colour channels: one in the pick, else A/a
+    of the same layer in the same subimage. None if there is none."""
+    in_pick = [c for c in pick.channels if is_alpha(c)]
+    if in_pick:
+        return in_pick[0]
+    names = (info[pick.subimage].get("channelnames") or []) if pick.subimage < len(info) else []
+    layer = layer_of(pick.without_alpha[0]) if pick.without_alpha else ""
+    for letter in ("A", "a"):
+        name = "{}.{}".format(layer, letter) if layer else letter
+        if name in names:
+            return name
+    return None
 
 
 def pick_channels(info, requested=None, use_first=False, preferences=None):

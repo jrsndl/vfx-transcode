@@ -13,6 +13,8 @@
     "  colour_tags  true to append -color_range/-colorspace/-color_primaries/-color_trc",
     "               matching -colorout (sRGB outputs get iec61966-2-1, others bt709)",
     "  metadata     optional: tags this codec always gets, e.g. {\"vendor_id\": \"appl\"} for ProRes.",
+    "  alpha_pix_fmt  optional: pixel format used instead of -pix_fmt with -alpha keep, e.g.",
+    "               \"yuva444p10le\" for ProRes 4444. Presets without it cannot store alpha.",
     "  Timecode and reel name are added automatically; do not put them in \"encode\".",
     "  Starting points: ASWF Encoding Guidelines,",
     "  https://github.com/AcademySoftwareFoundation/EncodingGuidelines",
@@ -21,12 +23,19 @@
     "  notes              free text, shown in --help",
     "  tl, tc, tr         top left / top centre / top right, the centre ones centre-justified",
     "  bl, bc, br         bottom left / bottom centre / bottom right",
+    "  wm                 watermark: centred in the picture, margins do not apply. Big and",
+    "                     see-through by default (size 8%, opacity 0.25); the preset-wide",
+    "                     size/opacity do not change it, set them in \"wm\": {\"text\": ..., \"size\": ...}",
     "                     each is either the text, or {\"text\": ..., \"color\": ..., \"opacity\": ...,",
     "                     \"size\": ..., \"box\": ...} to style that place differently",
     "  color              text colour for the whole preset: white, yellow, #ffcc00 ... (default white)",
     "  opacity            0-1 for text, shadow and box; 1 = solid (default 1)",
     "  size               text size: \"1.5%\" of the picture height, 40 (pixels) or \"h/75\" (default 1.33%)",
     "  box                true = black box behind the text instead of a shadow (default false)",
+    "  margin             space between picture edge and text, all sides: 20 (pixels) or \"2%\"",
+    "                     (of the width for left/right, of the height for top/bottom);",
+    "                     margin_top / margin_bottom / margin_left / margin_right for one side.",
+    "                     Default 1.5% top and bottom, 1% left and right",
     "  font               optional: font file (default ./fonts/DroidSansMono.ttf)",
     "  Keywords: {clean_name} {current_frame} {frame_start} {frame_end} {tc} (running timecode)",
     "            {timecode} (start timecode) {fps} {date} {preset} (encode preset name)",
@@ -37,6 +46,7 @@
     "            (these name keywords work in slate, metadata tags and -reelid as well)",
     "  \\n in a text starts a new line (lines follow the place: left, centred or right-aligned).",
     "  Text after {tc} in the same place is dropped: ffmpeg always puts the timecode last.",
+    "  Margins: preset margin < margin_<side> < -burn_margin < -burn_margin_<side>.",
     "  Style layers, later wins: defaults < preset < preset place < -burn_color/-burn_opacity/",
     "  -burn_size/-burn_box < -burn_style PLACE:key=value. -burn_tl ... -burn_br replace a text;",
     "  an empty value (-burn_tl \"\") clears that place.",
@@ -87,12 +97,44 @@
     "            \\n starts a new line.",
     "  -slate_title, -slate_subtitle, -slate_field \"Label=value\", -slate_scale, -slate_valign,",
     "  -slate_*_size, -slate_value_color, -slate_label_color, -slate_rule and -slate_style override a preset;",
-    "  -slate_field \"Label=\" removes a row."
+    "  -slate_field \"Label=\" removes a row.",
+    "",
+    "OIIO TRANSFORMS (-oiio_transform NAME), default: default_oiio_transform (\"none\" = -width resize)",
+    "  Resize / crop / reformat per input, EXR only. A preset has \"subs\", checked top to bottom;",
+    "  the first sub whose conditions ALL hold is used, the rest are skipped. A sub without",
+    "  conditions always matches (put it last as the catch-all). No match: -width is used.",
+    "  name, description   of the preset and of each sub",
+    "  conditions   [{\"left\": \"{input_width}x{input_height}\", \"op\": \"==\", \"right\": \"3840x2160\"}]",
+    "               op is == or !=; both sides are text with keywords, compared as strings",
+    "  transforms   oiiotool arguments, e.g. [\"--resize 1920x1080\"]; keywords work here too.",
+    "               They run on the scene-linear image, right after the channels are chosen and",
+    "               before the colour transform, and replace the -width resize.",
+    "  Keywords: {input_width} {input_height} (display window of the first frame) {input_data_width}",
+    "            {input_data_height} (data window) {input_par} (1, 2, 1.3333) {clean_name}",
+    "            {frame_start} {frame_end} {meta:ATTR} and the name keywords ({namesplit1} ...)",
+    "  --crop only shrinks the data window; a PNG intermediate is still written at the full",
+    "  (display) size. Use --cut to crop to a new picture size. oiiotool expressions work:",
+    "  \"--cut 1920x1080+{(TOP.width-1920)/2}+0\" cuts the centre after a resize.",
+    "",
+    "THUMBNAIL PRESETS (-thumbnail_preset NAME, used with -ot), default: default_thumbnail",
+    "  A still image made from one source frame with the same oiiotool processing as the movie",
+    "  (channels, transform / -width resize, colour or CLF), without burn-ins, letterbox or slate.",
+    "  notes        free text, shown in --help",
+    "  frame        middle (default) | first | last | largest | a frame number. largest = the frame",
+    "               whose converted image is the biggest file; needs the movie, else middle",
+    "  width, height  thumbnail size after the movie's processing; 0 = follows the other side,",
+    "               both 0 = the movie's size. Anamorphic input is made square-pixel",
+    "  format       jpg (default) or png",
+    "  quality      jpg quality 1-100 (default 90)",
+    "  compression  png compression 0 (fastest) - 9 (smallest), default 6",
+    "  bits         png bit depth 8 (default) or 16"
   ],
   "default_encode": "h264",
   "default_burnin": "none",
   "default_metadata": "none",
   "default_slate": "none",
+  "default_oiio_transform": "none",
+  "default_thumbnail": "middle1280",
   "channel_preferences": [
     "rgba.R,rgba.G,rgba.B,rgba.A",
     "rgba.R,rgba.G,rgba.B",
@@ -138,9 +180,10 @@
       }
     },
     "prores4444": {
-      "notes": "ProRes 4444, 10-bit 4:4:4.",
+      "notes": "ProRes 4444, 10-bit 4:4:4; keeps alpha with -alpha keep.",
       "ext": "mov",
       "encode": "-pix_fmt yuv444p10le {videofilter} -c:v prores_ks -profile:v 4444 -vendor apl0",
+      "alpha_pix_fmt": "yuva444p10le",
       "ten_bit": true,
       "colour_tags": true,
       "metadata": {
@@ -205,6 +248,13 @@
       "size": "1.1%",
       "opacity": 0.8,
       "bc": "{clean_name}   {date}"
+    },
+    "confidential": {
+      "notes": "Client review with a big see-through CONFIDENTIAL watermark and the shot name at the bottom.",
+      "size": "1.1%",
+      "opacity": 0.8,
+      "bc": "{clean_name}   {date}",
+      "wm": "CONFIDENTIAL"
     },
     "wip": {
       "notes": "Work in progress: yellow WIP stamp centred on top, review info elsewhere.",
@@ -297,6 +347,109 @@
         "Date": "{date}"
       },
       "thumbnail": "none"
+    }
+  },
+  "oiio_transforms": [
+    {
+      "name": "mygreatproject_editorial",
+      "description": "Resizes vfx outputs to 1080p for editorial, depending on source resolution",
+      "subs": [
+        {
+          "name": "uhd",
+          "description": "just scale to 1080p",
+          "conditions": [
+            {
+              "left": "{input_width}x{input_height}",
+              "op": "==",
+              "right": "3840x2160"
+            }
+          ],
+          "transforms": [
+            "--rangecompress",
+            "--resize 1920x1080",
+            "--rangeexpand"
+          ]
+        },
+        {
+          "name": "239",
+          "description": "crop to 3840, then just scale to 1080p",
+          "conditions": [
+            {
+              "left": "{input_width}",
+              "op": "==",
+              "right": "4080"
+            },
+            {
+              "left": "{input_height}",
+              "op": "==",
+              "right": "2160"
+            }
+          ],
+          "transforms": [
+            "--rangecompress",
+            "--cut 3840x2160+120+0",
+            "--resize 1920x1080",
+            "--rangeexpand"
+          ]
+        },
+        {
+          "name": "other",
+          "description": "fit height to 1080p, centre cut to 1920 wide",
+          "conditions": [],
+          "transforms": [
+            "--rangecompress",
+            "--resize 0x1080",
+            "--cut 1920x1080+{(TOP.width-1920)/2}+0",
+            "--rangeexpand"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "someotherproject",
+      "description": "Resizes 1080p",
+      "subs": [
+        {
+          "name": "1080p",
+          "description": "fit height to 1080p, centre cut to 1920 wide",
+          "conditions": [],
+          "transforms": [
+            "--rangecompress",
+            "--resize 0x1080",
+            "--cut 1920x1080+{(TOP.width-1920)/2}+0",
+            "--rangeexpand"
+          ]
+        }
+      ]
+    }
+  ],
+  "thumbnail_presets": {
+    "middle1280": {
+      "notes": "Middle frame, 1280 wide jpg: review tools, trackers.",
+      "frame": "middle",
+      "width": 1280,
+      "format": "jpg",
+      "quality": 90
+    },
+    "start512": {
+      "notes": "First frame, 512 wide jpg: small icons.",
+      "frame": "first",
+      "width": 512,
+      "format": "jpg",
+      "quality": 85
+    },
+    "largest1920": {
+      "notes": "The busiest frame (largest converted file), 1920 wide jpg.",
+      "frame": "largest",
+      "width": 1920,
+      "format": "jpg",
+      "quality": 92
+    },
+    "middle_png": {
+      "notes": "Middle frame at the movie's size, png (keeps alpha with -alpha keep).",
+      "frame": "middle",
+      "format": "png",
+      "compression": 6
     }
   }
 }

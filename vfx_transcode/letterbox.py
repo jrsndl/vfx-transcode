@@ -44,6 +44,8 @@ class LetterboxPlan:
     kind: str              # "letterbox", "pillarbox" or "none"
     bar: int               # bar size in pixels (height for letterbox, width for pillarbox)
     boxes: List[Box]
+    width: int = 0         # the movie size the plan was made for
+    height: int = 0
 
 
 _RATIO_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:[:/]\s*(\d+(?:\.\d+)?))?\s*$")
@@ -114,12 +116,16 @@ def plan(spec, width, height, par=Fraction(1)):
                       Box("iw-{}".format(bar), "0", str(line), "ih", line_color)]
     if bar <= 0:
         return LetterboxPlan("none", 0, [])
-    return LetterboxPlan(kind, bar, boxes)
+    return LetterboxPlan(kind, bar, boxes, width, height)
 
 
-def filters(letterbox_plan, skip_frames=0):
-    """drawbox filters for the plan; skip_frames leading frames (the slate) are left alone."""
+def filters(letterbox_plan, skip_frames=0, alpha=False):
+    """drawbox filters for the plan; skip_frames leading frames (the slate) are left alone.
+    alpha: the movie keeps an alpha channel. drawbox leaves alpha as it is, so bars over
+    transparent parts would stay invisible; the bars are then composited with overlay."""
     from .ffmpeg import make_filter        # ffmpeg.py imports this module
+    if alpha and letterbox_plan.boxes:
+        return [_overlay_graph(letterbox_plan, skip_frames, make_filter)]
     out = []
     for box in letterbox_plan.boxes:
         options = [("x", box.x), ("y", box.y), ("w", box.w), ("h", box.h),
@@ -128,3 +134,35 @@ def filters(letterbox_plan, skip_frames=0):
             options.append(("enable", "gte(n,{})".format(skip_frames)))
         out.append(make_filter("drawbox", options))
     return out
+
+
+ALPHA_WORK_FORMAT = "yuva444p10le"
+
+
+def _overlay_graph(letterbox_plan, skip_frames, make_filter):
+    """One filtergraph piece: the main chain ends in [lbm0], each bar is a colour source
+    overlaid on it; the last overlay has no output label, so the chain continues after it.
+    Bar sources are a little larger than needed: the far bars are placed from the real edge
+    (main_w / main_h), and whatever sticks out is clipped."""
+    def size(value, full):
+        return full + 16 if value in ("iw", "ih") else int(value)
+
+    def position(value):
+        return value.replace("iw", "main_w").replace("ih", "main_h")
+
+    parts = [make_filter("format", [("pix_fmts", ALPHA_WORK_FORMAT)]) + "[lbm0]"]
+    count = len(letterbox_plan.boxes)
+    for i, box in enumerate(letterbox_plan.boxes):
+        w = size(box.w, letterbox_plan.width)
+        h = size(box.h, letterbox_plan.height)
+        parts.append(",".join([
+            make_filter("color", [("c", box.color), ("s", "{}x{}".format(w, h))]),
+            make_filter("format", [("pix_fmts", "rgba")]),
+            make_filter("scale", [("out_color_matrix", "bt709"), ("out_range", "tv")]),
+            make_filter("format", [("pix_fmts", ALPHA_WORK_FORMAT)])]) + "[lbs{}]".format(i))
+        options = [("x", position(box.x)), ("y", position(box.y)), ("shortest", "1")]
+        if skip_frames:
+            options.append(("enable", "gte(n,{})".format(skip_frames)))
+        out = "" if i == count - 1 else "[lbm{}]".format(i + 1)
+        parts.append("[lbm{}][lbs{}]".format(i, i) + make_filter("overlay", options) + out)
+    return ";".join(parts)

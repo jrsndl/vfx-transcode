@@ -526,6 +526,137 @@ call :expect "%OUT%\34_name_keywords_probe.txt" "005_033 v0" "34 name_keywords m
 if exist "%OUT%\34_name_keywords.png" (>> "%SUMMARY%" echo [INFO] 34 name_keywords - 34_name_keywords.png: slate row Version 0, burn-ins 005_033 and v000 / renderCompSecondary)
 
 echo.
+echo ==== 35  burn-in margins: 5%% all round, bottom 100 px, right 200 px, multi-line bottom left ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -burn_preset review-boxed -burn_bl "{clean_name}\n{frame_start}-{frame_end}" ^
+  -burn_margin 5%% -burn_margin_bottom 100 -burn_margin_right 200 ^
+  -o "%OUT%\35_burn_margins.mp4" > "%OUT%\35_burn_margins.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\35_burn_margins.mp4" -frames:v 1 "%OUT%\35_burn_margins.png" >nul 2>&1
+type "%OUT%\35_burn_margins.log"
+call :check %RC% "35 burn_margins"
+call :expect "%OUT%\35_burn_margins.log" "margins: top 5" "35 burn_margins"
+if exist "%OUT%\35_burn_margins.png" (>> "%SUMMARY%" echo [INFO] 35 burn_margins - 35_burn_margins.png: text inset 5 percent, bottom 100 px, right 200 px)
+
+echo.
+echo ==== 36  watermark: confidential preset, plus a red two-line watermark over the letterbox ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -slate generic -burn_preset confidential ^
+  -o "%OUT%\36_watermark.mp4" > "%OUT%\36_watermark.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -burn_preset review -burn_wm "{namesplit1}\nINTERNAL v{version_number}" -burn_style "wm:color=red,size=6%%,opacity=0.4" ^
+  -letterbox 1 -o "%OUT%\36_watermark_red.mp4" >> "%OUT%\36_watermark.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\36_watermark.mp4" -vf "select=eq(n\,1)" -frames:v 1 "%OUT%\36_watermark.png" >nul 2>&1
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\36_watermark_red.mp4" -frames:v 1 "%OUT%\36_watermark_red.png" >nul 2>&1
+type "%OUT%\36_watermark.log"
+call :check %RC% "36 watermark"
+call :expect "%OUT%\36_watermark.log" "wm 'CONFIDENTIAL'" "36 watermark"
+if exist "%OUT%\36_watermark.png" (>> "%SUMMARY%" echo [INFO] 36 watermark - 36_watermark.png and 36_watermark_red.png: centred see-through watermark)
+
+echo.
+echo ==== 37  alpha: DB beauty into ProRes 4444 with alpha, straight and premultiplied ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\DB_000_0030_lgt_explosion_v47_beauty\DB_000_0030_lgt_explosion_v47_beauty.1001.exr" ^
+  -preset prores4444 -alpha keep -burn_preset review ^
+  -o "%OUT%\37_alpha_straight.mov" > "%OUT%\37_alpha.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\DB_000_0030_lgt_explosion_v47_beauty\DB_000_0030_lgt_explosion_v47_beauty.1001.exr" ^
+  -preset prores4444 -alpha keep -alpha_premult 1 ^
+  -o "%OUT%\37_alpha_premult.mov" >> "%OUT%\37_alpha.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\37_alpha_straight.mov" > "%OUT%\37_alpha_probe.txt" 2>&1
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\37_alpha_straight.mov" -vf "select=eq(n\,3),alphaextract" -frames:v 1 "%OUT%\37_alpha_matte.png" >nul 2>&1
+type "%OUT%\37_alpha.log"
+call :check %RC% "37 alpha"
+call :expect "%OUT%\37_alpha.log" "Alpha: kept" "37 alpha"
+call :expect "%OUT%\37_alpha.log" "written premultiplied" "37 alpha premult"
+call :expect "%OUT%\37_alpha_probe.txt" "yuva444p" "37 alpha movie"
+if exist "%OUT%\37_alpha_matte.png" (>> "%SUMMARY%" echo [INFO] 37 alpha - 37_alpha_matte.png is the movie alpha of frame 1004, should match the render alpha)
+
+echo.
+echo ==== 38  oiio transform: mygreatproject_editorial on the 4312x2160 ICOI2 plate, falls to the fit-to-1080 centre-cut sub ====
+"%PY%" vfx-transcode.py -v 1 ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -oiio_transform mygreatproject_editorial -width 0 -burn_preset review ^
+  -o "%OUT%\38_oiio_transform.mp4" > "%OUT%\38_oiio_transform.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\38_oiio_transform.mp4" > "%OUT%\38_oiio_transform_probe.txt" 2>&1
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\38_oiio_transform.mp4" -frames:v 1 "%OUT%\38_oiio_transform.png" >nul 2>&1
+type "%OUT%\38_oiio_transform.log"
+call :check %RC% "38 oiio_transform"
+call :expect "%OUT%\38_oiio_transform.log" "4312x2160 input" "38 oiio_transform"
+call :expect "%OUT%\38_oiio_transform.log" "--resize 0x1080 --cut 1920x1080" "38 oiio_transform sub other"
+call :expect "%OUT%\38_oiio_transform_probe.txt" "1920x1080" "38 oiio_transform movie"
+if exist "%OUT%\38_oiio_transform.png" (>> "%SUMMARY%" echo [INFO] 38 oiio_transform - 38_oiio_transform.png: 1920x1080, the centre of the plate)
+
+echo.
+echo ==== 39  CLF: a small CLF written here, path with keywords, applied with --ociofiletransform ====
+if not exist "%OUT%\luts" mkdir "%OUT%\luts"
+set "CLF=%OUT%\luts\ICOI2_005.clf"
+> "%CLF%" echo ^<?xml version="1.0" encoding="UTF-8"?^>
+>> "%CLF%" echo ^<ProcessList id="half" compCLFversion="3"^>
+>> "%CLF%" echo ^<Matrix inBitDepth="32f" outBitDepth="32f"^>^<Array dim="3 3"^>0.5 0 0 0 0.5 0 0 0 0.5^</Array^>^</Matrix^>
+>> "%CLF%" echo ^</ProcessList^>
+"%PY%" vfx-transcode.py -v 1 ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -clf "%OUT%\luts\{namesplit1}_{namesplit2}.clf" -slate generic ^
+  -o "%OUT%\39_clf.mp4" > "%OUT%\39_clf.log" 2>&1
+set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -v error -y -i "%OUT%\39_clf.mp4" -vf "select=lt(n\,2),scale=960:-2,tile=1x2" -frames:v 1 "%OUT%\39_clf.png" >nul 2>&1
+type "%OUT%\39_clf.log"
+call :check %RC% "39 clf"
+call :expect "%OUT%\39_clf.log" "--ociofiletransform" "39 clf"
+call :expect "%OUT%\39_clf.log" "ICOI2_005.clf" "39 clf path"
+if exist "%OUT%\39_clf.png" (>> "%SUMMARY%" echo [INFO] 39 clf - 39_clf.png: the test CLF only halves the scene-linear values, so the picture is dark - that is expected)
+
+echo.
+echo ==== 40  output path: relative to the source, up one folder, with keywords, extension added ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "./../_test_output/40_out/{namesplit1}/{namesplit2}_{namesplit3}_v{version_number}" ^
+  > "%OUT%\40_output_path.log" 2>&1
+set RC=%ERRORLEVEL%
+type "%OUT%\40_output_path.log"
+call :check %RC% "40 output_path"
+call :expect "%OUT%\40_output_path.log" "005_033_v0.mp4" "40 output_path"
+if not exist "%OUT%\40_out\ICOI2\005_033_v0.mp4" (
+  >> "%SUMMARY%" echo [FAIL] 40 output_path - movie not in _test_output\40_out\ICOI2
+  set /a FAILED+=1
+)
+
+echo.
+echo ==== 41  thumbnails: with the movie - busiest frame; and thumbnail only - no -o, keyword name ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\41_thumb_movie.mp4" -ot "%OUT%\41_thumb_largest" -thumbnail_preset largest1920 ^
+  > "%OUT%\41_thumbnail.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\DB_000_0030_lgt_explosion_v47_beauty\DB_000_0030_lgt_explosion_v47_beauty.1001.exr" ^
+  -ot "./../_test_output/41_thumb_{namesplit1}_{frame}" -thumbnail_preset start512 ^
+  >> "%OUT%\41_thumbnail.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+type "%OUT%\41_thumbnail.log"
+call :check %RC% "41 thumbnail"
+call :expect "%OUT%\41_thumbnail.log" "Thumbnail: frame" "41 thumbnail"
+call :expect "%OUT%\41_thumbnail.log" "only the thumbnail" "41 thumbnail only"
+if not exist "%OUT%\41_thumb_largest.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 41 thumbnail - 41_thumb_largest.jpg missing
+  set /a FAILED+=1
+)
+if not exist "%OUT%\41_thumb_DB_1001.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 41 thumbnail - 41_thumb_DB_1001.jpg missing
+  set /a FAILED+=1
+)
+if exist "%OUT%\41_thumb_largest.jpg" (>> "%SUMMARY%" echo [INFO] 41 thumbnail - 41_thumb_largest.jpg 1920 wide and 41_thumb_DB_1001.jpg 512 wide, no burn-ins)
+
+echo.
 echo ===========================================================================
 type "%SUMMARY%"
 echo.

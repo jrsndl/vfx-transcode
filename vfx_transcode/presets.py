@@ -6,12 +6,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .burnin import (BURN_PLACES, PLACE_NAMES, STYLE_FIELDS, BurnStyle, parse_size,
-                     style_from_values)
+from .burnin import (BURN_PLACES, MARGIN_FIELDS, PLACE_NAMES, STYLE_FIELDS, BurnStyle,
+                     margins_from_values, parse_size, style_from_values)
 from .errors import TranscodeError
 from .slate import (NO_SLATE, SLATE_PRESET_FIELDS, SlateSpec, parse_fields, parse_thumbnail,
                     style_values)
 from .tools import split_args
+from .transforms import NO_TRANSFORM, TransformPreset, parse_transform_presets
+from .thumbnails import ThumbnailPreset, presets_from_json
 
 DEFAULT_PRESETS_FILE = "./presets.json"
 
@@ -30,6 +32,8 @@ class Preset:
     colour_tags: bool = True
     notes: str = ""
     metadata: Dict[str, str] = field(default_factory=dict)   # codec-level tags, e.g. vendor_id
+    alpha_pix_fmt: str = ""      # pixel format used instead of -pix_fmt when alpha is kept;
+                                 # "" = the codec cannot store alpha
 
 
 # Fields of a metadata preset; the command-line options with the same meaning override them.
@@ -62,6 +66,7 @@ class BurnPreset:
     corners: Dict[str, str] = field(default_factory=dict)   # place -> text template
     style: BurnStyle = field(default_factory=BurnStyle)     # preset-wide color/opacity/size/box
     place_styles: Dict[str, BurnStyle] = field(default_factory=dict)   # place -> overrides
+    margins: Dict[str, str] = field(default_factory=dict)   # side -> value, only those set
     font: Optional[str] = None
     notes: str = ""
 
@@ -82,6 +87,30 @@ class PresetFile:
     default_metadata: str = ""
     slates: "OrderedDict[str, SlateSpec]" = field(default_factory=OrderedDict)
     default_slate: str = ""
+    transforms: "OrderedDict[str, TransformPreset]" = field(default_factory=OrderedDict)
+    default_transform: str = ""
+    thumbnails: "OrderedDict[str, ThumbnailPreset]" = field(default_factory=OrderedDict)
+    default_thumbnail: str = ""
+
+    def get_thumbnail(self, name):
+        """Thumbnail preset by name; the built-in defaults for "" when the file has none."""
+        if not name:
+            return ThumbnailPreset(name="(built-in)")
+        try:
+            return self.thumbnails[name]
+        except KeyError:
+            raise TranscodeError('Unknown thumbnail preset "{}". Available: {} (from {})'.format(
+                name, ", ".join(self.thumbnails) or "none", self.path))
+
+    def get_transform(self, name):
+        """oiio transform preset by name; None for "" or "none"."""
+        if not name or name == NO_TRANSFORM:
+            return None
+        try:
+            return self.transforms[name]
+        except KeyError:
+            raise TranscodeError('Unknown oiio transform "{}". Available: {} (from {})'.format(
+                name, ", ".join(list(self.transforms) + [NO_TRANSFORM]), self.path))
 
     def get_slate(self, name):
         """Slate preset by name; None for "" or "none"."""
@@ -122,9 +151,11 @@ class PresetFile:
 
     def describe(self):
         width = max(len(n) for n in list(self.presets) + list(self.burnins)
-                    + list(self.metadata_presets) + list(self.slates))
+                    + list(self.metadata_presets) + list(self.slates) + list(self.transforms)
+                    + list(self.thumbnails))
         lines = ["Encode presets (-preset), default {}:".format(self.default)]
-        lines += ["  {:<{}}  .{:<4} {}".format(p.name, width, p.ext, p.notes)
+        lines += ["  {:<{}}  .{:<4} {}{}".format(p.name, width, p.ext, p.notes,
+                                                 " [alpha]" if p.alpha_pix_fmt else "")
                   for p in self.presets.values()]
         if self.burnins:
             lines += ["", "Burn-in presets (-burn_preset), default {}:".format(
@@ -133,6 +164,9 @@ class PresetFile:
                 lines.append("  {:<{}}  {}".format(b.name, width, b.notes))
                 if not b.style.is_empty():
                     lines.append("  {:<{}}    style: {}".format("", width, b.style.describe()))
+                if b.margins:
+                    lines.append("  {:<{}}    margins: {}".format("", width, ", ".join(
+                        "{}={}".format(k, v) for k, v in b.margins.items())))
                 for place in BURN_PLACES:
                     if b.corners.get(place):
                         extra = b.place_styles.get(place)
@@ -158,6 +192,21 @@ class PresetFile:
                 rows.append("thumbnail: " + sl.thumbnail)
                 for item in rows:
                     lines.append("  {:<{}}    {}".format("", width, item))
+        if self.thumbnails:
+            lines += ["", "Thumbnail presets (-thumbnail_preset, with -ot), default {}:".format(
+                self.default_thumbnail or "(built-in: middle frame, movie size, jpg 90)")]
+            for t in self.thumbnails.values():
+                lines.append("  {:<{}}  {}".format(t.name, width, t.notes))
+                lines.append("  {:<{}}    {}".format("", width, t.describe()))
+        if self.transforms:
+            lines += ["", "OIIO transforms (-oiio_transform), default {}; first matching sub wins:"
+                      .format(self.default_transform or NO_TRANSFORM)]
+            for t in self.transforms.values():
+                lines.append("  {:<{}}  {}".format(t.name, width, t.description))
+                for sub in t.subs:
+                    when = " and ".join(c.describe() for c in sub.conditions) or "always"
+                    lines.append("  {:<{}}    {}: if {} -> {}".format(
+                        "", width, sub.name, when, " ".join(sub.transforms)))
         if self.channel_preferences:
             lines += ["", "Automatic channel choice (channel_preferences), first found wins:"]
             lines += ["  " + ",".join(chans) for chans in self.channel_preferences]
@@ -188,7 +237,7 @@ def _preset_from_json(name, data, path):
     return Preset(name=name, ext=str(data["ext"]).lstrip("."), encode=tuple(args),
                   ten_bit=bool(data.get("ten_bit", False)),
                   colour_tags=bool(data.get("colour_tags", True)), notes=str(notes),
-                  metadata=metadata)
+                  metadata=metadata, alpha_pix_fmt=str(data.get("alpha_pix_fmt") or ""))
 
 
 def _tags_from_json(data, path, where):
@@ -243,11 +292,13 @@ def _burnin_from_json(name, data, path):
         raise TranscodeError('{}: "{}" is reserved (it switches burn-ins off).'.format(path, name))
     if not isinstance(data, dict):
         raise TranscodeError("{} must be an object.".format(where))
-    allowed = set(BURN_PLACES) | set(STYLE_FIELDS) | {"font", "notes"}
+    allowed = set(BURN_PLACES) | set(STYLE_FIELDS) | set(MARGIN_FIELDS) | {"font", "notes"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise TranscodeError("{}: unknown field(s) {}; use {}.".format(
-            where, ", ".join(unknown), ", ".join(list(BURN_PLACES) + list(STYLE_FIELDS) + ["font", "notes"])))
+            where, ", ".join(unknown), ", ".join(list(BURN_PLACES) + list(STYLE_FIELDS)
+                                                 + list(MARGIN_FIELDS) + ["font", "notes"])))
+    margins = margins_from_values(data, where)
     style = style_from_values({k: data.get(k) for k in STYLE_FIELDS}, where)
     texts, place_styles = OrderedDict(), OrderedDict()
     for place in BURN_PLACES:
@@ -274,7 +325,7 @@ def _burnin_from_json(name, data, path):
     if isinstance(notes, list):
         notes = " ".join(str(n) for n in notes)
     return BurnPreset(name=name, corners=dict(texts), style=style, place_styles=dict(place_styles),
-                      font=data.get("font") or None, notes=str(notes))
+                      margins=margins, font=data.get("font") or None, notes=str(notes))
 
 
 def _slate_from_json(name, data, path):
@@ -366,10 +417,23 @@ def load_presets(path):
     default_slate = data.get("default_slate") or ""
     if default_slate and default_slate != NO_SLATE and default_slate not in slates:
         raise TranscodeError('{}: default slate preset "{}" is not defined.'.format(path, default_slate))
+    thumbnails = presets_from_json(data.get("thumbnail_presets") or {}, path)
+    default_thumbnail = data.get("default_thumbnail") or ""
+    if default_thumbnail and default_thumbnail not in thumbnails:
+        raise TranscodeError('{}: default thumbnail preset "{}" is not defined.'.format(
+            path, default_thumbnail))
+    raw_transforms = data.get("oiio_transforms", data.get("oiiotransforms"))
+    transforms = parse_transform_presets(raw_transforms, path) if raw_transforms else OrderedDict()
+    default_transform = data.get("default_oiio_transform") or ""
+    if default_transform and default_transform != NO_TRANSFORM and default_transform not in transforms:
+        raise TranscodeError('{}: default oiio transform "{}" is not defined.'.format(
+            path, default_transform))
     return PresetFile(str(path), default, presets, burnins,
                       "" if default_burnin == NO_BURNIN else default_burnin, channel_preferences,
                       metadata_presets, "" if default_metadata == NO_BURNIN else default_metadata,
-                      slates, "" if default_slate == NO_SLATE else default_slate)
+                      slates, "" if default_slate == NO_SLATE else default_slate,
+                      transforms, "" if default_transform == NO_TRANSFORM else default_transform,
+                      thumbnails, default_thumbnail)
 
 
 def transfer_for(colorout):

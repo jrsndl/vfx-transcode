@@ -34,11 +34,15 @@ class Config:
     ocio_display: Optional[str] = None # display/view mode when display or view is set
     ocio_view: Optional[str] = None
     ocio_looks: str = ""
+    clf: str = ""                      # -clf path template; set = CLF instead of OCIO colourspaces
+    clf_path: str = ""                 # the expanded, resolved path, set at run time
     oiio_threads: int = 0
     oiio_channel: List[str] = field(default_factory=list)
     oiio_channel_use_first: bool = False
     channel_preferences: List[List[str]] = field(default_factory=list)   # from presets.json
     oiio_command: List[str] = field(default_factory=list)
+    oiio_transform: Any = None          # transforms.TransformPreset, None = -width resize
+    oiio_transform_args: Optional[List[str]] = None   # the matching sub's args, set at run time
     oiio_per_file: bool = False
     mezzanine: str = "png"
     mezzanine_16bit: bool = False
@@ -69,9 +73,20 @@ class Config:
     burn_font: str = ""
     burn: Dict[str, str] = field(default_factory=dict)   # place -> text template
     burn_styles: Dict[str, Any] = field(default_factory=dict)   # place -> resolved BurnStyle
+    burn_margins: Dict[str, str] = field(default_factory=dict)  # side -> "1.5%" / "20"; {} = defaults
 
     # slate
     slate: Any = None                  # slate.SlateSpec, None = no slate
+
+    # alpha
+    alpha: str = "drop"                # drop | keep
+    alpha_premult: bool = False        # with keep: write premultiplied colour (else straight)
+    alpha_active: bool = False         # set at run time: the movie really gets an alpha channel
+
+    # thumbnail / what to make
+    movie: bool = True                 # False: -ot without -o, thumbnail only
+    thumbnail: Any = None              # thumbnails.ThumbnailPreset, None = no thumbnail
+    thumbnail_output: Optional[str] = None   # -ot template; "" = default place and name
 
     # letterbox
     letterbox: Any = None              # letterbox.LetterboxSpec, None = off

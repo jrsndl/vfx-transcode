@@ -415,6 +415,14 @@ def build_slate_command(ffmpeg, spec, fmt, par, lay, thumb_path, out_path, font=
     return cmd
 
 
+_ALPHA_FORMATS = re.compile(r"^(rgba|bgra|argb|abgr|ya\d|gbrap|yuva|pal8)")
+
+
+def has_alpha(pix_fmt):
+    """True for ffmpeg pixel formats with an alpha channel (rgba, rgba64be, ya8, gbrap ...)."""
+    return bool(_ALPHA_FORMATS.match(pix_fmt or ""))
+
+
 def probe_frames(ffmpeg, frame_files, verbose=0):
     """Format of the frames the slate must match (first frame; warns if the last differs)."""
     first, last = min(frame_files), max(frame_files)
