@@ -98,7 +98,8 @@ class TunerCoreTests(unittest.TestCase):
         self.assertEqual(cfg.preview_frame, "middle")
         full, sections = core.output_sections(state, PRESETS)
         self.assertIn("-burn_tl {clean_name}", full)
-        self.assertEqual(set(sections), {"transform", "burnin", "slate", "letterbox", "metadata"})
+        self.assertEqual(set(sections), {"transform", "burnin", "slate", "letterbox", "metadata",
+                                         "filmstrip"})
 
     def test_metadata_rows(self):
         report = {"frame": 1005, "input": {"header": {"owner": "A001", "FramesPerSecond": "24/1"}},
@@ -122,3 +123,42 @@ class TunerCoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TunerFilmstripTests(unittest.TestCase):
+    def test_args_roundtrip(self):
+        state = core.filmstrip_from_preset(PRESETS.filmstrips["grid6x4"], "grid6x4")
+        self.assertEqual(core.filmstrip_args(state, PRESETS), ["-filmstrip_preset", "grid6x4"])
+        state.quality, state.slate, state.source = 70, True, "movie"
+        cfg = parse(["-of"] + core.filmstrip_args(state, PRESETS))
+        f = cfg.filmstrip
+        self.assertEqual((f.layout(), f.quality, f.slate, f.source), ((24, 6, 4), 70, True, "movie"))
+        row = core.FilmstripState(tiles=12)
+        self.assertEqual(parse(["-of"] + core.filmstrip_args(row)).filmstrip.layout(), (12, 12, 1))
+        rows = core.FilmstripState(tiles=10, rows=2)
+        self.assertEqual(parse(["-of"] + core.filmstrip_args(rows)).filmstrip.layout(), (10, 5, 2))
+        json.dumps(core.filmstrip_json(state))
+
+    def test_commands(self):
+        state = core.TunerState()
+        state.input.input1 = "x.1001.exr"
+        cmd = core.filmstrip_command(state, "p_filmstrip.jpg", "p_movie.mp4", tool=["vt"])
+        self.assertIn("-of", cmd)
+        self.assertNotIn("-o", cmd)                                   # source tiles: no movie
+        parse(cmd[3:])
+        state.filmstrip.source = "movie"
+        cmd = core.filmstrip_command(state, "p_filmstrip.jpg", "p_movie.mp4", tool=["vt"])
+        self.assertEqual(cmd[cmd.index("-o") + 1], "p_movie.mp4")
+        self.assertTrue(parse(cmd[3:]).movie)
+        state.filmstrip = core.FilmstripState(slate=True)
+        self.assertIn("-o", core.filmstrip_command(state, "f.jpg", "m.mp4", tool=["vt"]))
+
+    def test_output_sections(self):
+        state = core.TunerState()
+        state.input.input1 = "x.1001.exr"
+        full, sections = core.output_sections(state, PRESETS)
+        self.assertNotIn("-of", full)
+        self.assertIn("-of", sections["filmstrip"][0])
+        state.filmstrip.enabled = True
+        full, _sections = core.output_sections(state, PRESETS)
+        self.assertIn("-of -filmstrip_tiles 24", full)

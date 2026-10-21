@@ -25,16 +25,18 @@ Every refresh runs `vfx-transcode ... -preview FILE.png` (see [OPTIONS.md](OPTIO
 
 The frame is picked like a thumbnail: middle by default, or first, last or a frame number on the Input tab. The converted frame is cached, so changes to burn-ins, slate, letterbox or metadata refresh in about a second, without running oiiotool again.
 
+The **Filmstrip** view runs `vfx-transcode ... -of FILE.jpg` instead (see [OPTIONS.md](OPTIONS.md#filmstrip)) with the Filmstrip tab's settings. With tiles from the `source` frames only the filmstrip is made, which is quick. With tiles from the `intermediates` or the `movie`, or with the slate as the first tile, the whole movie is made as well (in the tuner's temp folder), with the burn-ins, slate and letterbox, so that refresh takes as long as a real run.
+
 The command the tuner runs is shown in the log under the viewer. By default it is this Python with `vfx-transcode.py` from the same folder; the **vfx-transcode command** field on the Input tab can point to a built `vfx-transcode.exe` instead.
 
 ## Viewer
 
 - **Pan**: drag. **Zoom**: mouse wheel (under the cursor). **Fit** and **1:1** in the toolbar.
-- **Slate**: shows the slate frame instead of the picture (switch the slate on in the Slate tab).
-- **Compare mix**: with a compare image, 0 shows the result and 100 the compare image. Values in between dissolve. The compare image is scaled to the result's size.
+- **View**: **Image** (the previewed frame), **Slate** (the slate frame; switch the slate on in the Slate tab) or **Filmstrip**. Image and Slate come from the same preview run, so switching between them is instant. Switching to a view whose settings changed since its last run refreshes it (with **Refresh after edit** on). The view is fitted to the window when it changes.
+- **Compare mix** (Image and Slate views): with a compare image, 0 shows the result and 100 the compare image. Values in between dissolve. The compare image is scaled to the result's size.
 - Anamorphic output (pixel aspect other than 1) is shown un-squeezed.
 - The log under the viewer shows each vfx-transcode run; **Clear** empties it. The window uses a dark theme.
-- **Refresh** runs the preview; **Refresh after edit** runs it half a second after each change. A change made while a preview is running restarts it.
+- **Refresh** runs the preview of the view on screen; **Refresh after edit** runs it half a second after each change. A change made while a preview is running restarts it.
 
 ## Tabs
 
@@ -49,11 +51,12 @@ The command the tuner runs is shown in the log under the viewer. By default it i
   - Tick **own** on a place to give it its own style.
   - Margins, font.
 - **Slate**: switch on, load a preset, and edit title, subtitle, rows (add / remove / reorder), thumbnail, sizes, scale, vertical placement, colours, the line under the title, hide-empty, and burn-ins on the slate.
+- **Filmstrip**: load a preset, and edit the number of tiles, tile size, grid (columns x rows, `auto` follows the tiles), jpg quality, where the tiles come from (`source`, `intermediates`, `movie`) and the slate as the first tile. **Add the filmstrip to the full command** puts `-of` and these settings into the Output tab's full command.
 - **Letterbox**: ratio, bar colour and opacity, line thickness, colour and opacity.
 - **Metadata**: metadata preset, extra tags, timecode and reel name settings.
 - **Output**: what to copy.
   - **Full command**: the whole vfx-transcode command for the movie with these settings (`-o ./` = next to the source).
-  - One box per area with its command-line options, and for transform, burn-in and slate a `presets.json` snippet (the edited sub-preset or preset) to paste into your presets file.
+  - One box per area with its command-line options, and for transform, burn-in, slate and filmstrip a `presets.json` snippet (the edited sub-preset or preset) to paste into your presets file.
   - A loaded preset that was not changed is written as its name (`-burn_preset review`, `-slate generic`, `-oiio_transform NAME` when the loaded sub-preset is the one that would be chosen). Otherwise the settings are written out in full.
   - **For a .bat file** writes `%` as `%%`.
 - **Info**: the metadata viewer, with a search box that filters keys and values (any case; a section name shows the whole section).

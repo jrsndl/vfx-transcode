@@ -18,6 +18,7 @@
 - [Letterbox](#letterbox)
 - [Alpha](#alpha)
 - [Thumbnail](#thumbnail)
+- [Filmstrip](#filmstrip)
 - [Preview](#preview)
 - [Encoding (ffmpeg)](#encoding-ffmpeg)
 - [Presets file](#presets-file)
@@ -193,12 +194,26 @@ Colour conversion applies to EXR input only. Other formats are assumed to be dis
 
 ## Tools
 
+The paths to the executables can be set in the [presets file](#presets-file)'s `tools` section, so a studio or project presets file can point to its own builds:
+
+```json
+"tools": {
+  "ffmpeg": "D:/apps/ffmpeg-7.1/bin/ffmpeg.exe",
+  "ffprobe": "D:/apps/ffmpeg-7.1/bin/ffprobe.exe",
+  "oiiotool": "%OIIO_ROOT%/bin/oiiotool.exe"
+}
+```
+
 | Option | Default | Description |
 |---|---|---|
-| `-oiio PATH` | `./oiio/oiiotool.exe` | oiiotool executable. |
-| `-ffmpeg PATH` | `./ffmpeg/ffmpeg.exe` | ffmpeg executable. |
+| `-oiio PATH` | the presets file's `tools.oiiotool`, else `./oiio/oiiotool.exe` | oiiotool executable. |
+| `-ffmpeg PATH` | the presets file's `tools.ffmpeg`, else `./ffmpeg/ffmpeg.exe` | ffmpeg executable. |
+| `-ffprobe PATH` | the presets file's `tools.ffprobe`, else `./ffmpeg/ffprobe.exe` | ffprobe executable. Configured for tools and scripts that need it; vfx-transcode itself reads image sizes with `ffmpeg -i` and doesn't run ffprobe yet. |
 
-If the configured path doesn't exist, the tool looks for `oiiotool` / `ffmpeg` on the `PATH`. If it isn't there either, the run stops with an error that names both places it looked.
+- **Which path wins:** the command-line option, then the presets file's `tools`, then the built-in default. A tool left out of `tools`, or set to `""`, uses the default.
+- **Path forms:** `./` and `../` are relative to the application folder (not the presets file or the current folder). Environment variables (`%VAR%`, `$VAR`, `${VAR}`) and `~` are expanded, on the command line too. In JSON, write Windows paths with `/` or doubled backslashes: `"D:/apps/ffmpeg.exe"` or `"D:\\apps\\ffmpeg.exe"`.
+- **Not found:** if the file doesn't exist, the tool looks for `oiiotool` / `ffmpeg` / `ffprobe` on the `PATH`. If it isn't there either, the run stops with an error that names the path, where it came from (e.g. `presets.json "tools"`) and the PATH. `-v` logs which executable each run uses.
+- `--help` lists the presets file's `tools`.
 
 Before converting any frame, the tool asks ffmpeg for its filter list (`ffmpeg -filters`) and stops if a filter the movie needs is missing, naming what needs it. The usual case is `drawtext`, which burn-ins and the slate need: it comes with libfreetype, and some ffmpeg builds (minimal or "essentials" static builds) leave it out. Use a "full" build (gyan.dev, BtbN) or turn off the burn-ins and the slate. The other filters checked are `color`, `overlay`, `drawbox`, `premultiply` and `setparams`, each only when used. If the list can't be read, the check is skipped with a warning.
 
@@ -759,6 +774,47 @@ Shipped thumbnail presets:
 | `largest1920` | largest | 1920 wide | jpg, quality 92 |
 | `middle_png` | middle | the movie's size | png, compression 6 |
 
+## Filmstrip
+
+A filmstrip is one jpg showing the whole shot at a glance: evenly spaced frames, each in a tile of the same size, laid out in a grid. By default that's 24 frames of 480x270 in one row (11520x270).
+
+- **Same look as the thumbnail.** It is display-referred, in the same output colourspace as the movie and the [thumbnail](#thumbnail). Anamorphic pictures are made square-pixel.
+- **Where the tiles come from** (`-filmstrip_source`):
+
+  | Source | Tiles from | Burn-ins, letterbox | Needs |
+  |---|---|---|---|
+  | `source` (default) | The source frames. EXR: one oiiotool run per tile with the movie's processing (channels, alpha, [OIIO transform](#oiio-transforms), [colour or CLF](#colour), `-oiio_command`); the tile size replaces the movie's `-width` resize. Other input: one ffmpeg run. | no | nothing: also works without a movie |
+  | `intermediates` | The frames oiiotool converted for the movie, before ffmpeg. No second colour conversion, so it's quicker than `source` for EXRs. | no | EXR input, with the movie (`-o`) or `-skipffmpeg`. For other input, the source frames *are* the intermediates. |
+  | `movie` | The encoded movie, read back by ffmpeg (Rec.709 YUV to RGB). Exactly what the movie shows, codec included. | yes | the movie (`-o`, without `-skipffmpeg`) |
+
+  When a source isn't available in a run, the source frames are used, with a warning. EXR tiles are made in parallel (as many at a time as `-oiio_threads`, default all cores) in the intermediate folder, and one more oiiotool run puts them together with `--mosaic`.
+- **Slate.** Left out by default. With `-filmstrip_slate 1` (or `"slate": true`) the slate is the first tile and the frames fill the other tiles; the grid keeps its size. It needs a run that makes the slate: the movie with a slate. Otherwise all tiles are frames, with a warning.
+- **Tiles.** Each frame is fitted into the tile with its aspect ratio kept; the rest of the tile is black (oiiotool `--fit:pad=1`, ffmpeg `scale` + `pad`). Mono EXR channels are shown as grey.
+- **Frames.** The tiles are spread evenly over the frames on disk, from the first frame to the last, both included, and no frame is used twice. A sequence with fewer frames than tiles uses every frame, and the rest of the cells stay black, as do the cells of a grid bigger than the tile count. A tile whose frame fails to convert stays black, with a warning.
+- **Filmstrip only.** `-of` without `-o` makes only the filmstrip (with `-ot` as well: the thumbnail and the filmstrip). Use `-o ./` for the movie too, as with `-ot`.
+
+| Option | Default | Description |
+|---|---|---|
+| `-of [PATH]` | *(no filmstrip)* | Write a filmstrip. PATH works like [`-ot`](#thumbnail): file or folder, `./` and `../` relative to the input folder, keywords. The extension `.jpg` is added if missing. `-of` without PATH puts `<name>_filmstrip.jpg` next to the movie, or in the input folder when there is no movie. |
+| `-filmstrip_preset NAME` | the presets file's `default_filmstrip` (`row24`) | Filmstrip preset: tile count, tile size, grid and jpg quality. `--help` lists them. |
+| `-filmstrip_tiles N` | the preset's (`24`) | Number of tiles, i.e. frames, 1–1000. Without `-filmstrip_grid` the strip stays one row (a preset with a full grid keeps its columns). |
+| `-filmstrip_tile WxH` | the preset's (`480x270`) | Size of one tile in pixels. |
+| `-filmstrip_quality 1-100` | the preset's (`90`) | jpg quality. |
+| `-filmstrip_source source\|intermediates\|movie` | the preset's (`source`) | Where the tiles come from, see above. |
+| `-filmstrip_slate 0\|1` | the preset's (`0`) | `1`: the slate is the first tile. |
+| `-filmstrip_grid COLSxROWS` | one row | Layout, filled left to right, then top to bottom. `6x4`; `6x` (or `6x0`) = 6 columns and as many rows as needed; `x2` = 2 rows. Without `-filmstrip_tiles`, a full grid sets the tile count to its cells (`-filmstrip_grid 8x3` = 24 tiles). A grid with fewer cells than tiles is an error. |
+
+The log shows the result, e.g. `Filmstrip: 24 frames (1001-1100 evenly spaced) from the source, 24 tiles of 480x270, 24x1 grid (11520x270), jpg quality 90 -> D:/shots/sh010/sh010_comp_v003_filmstrip.jpg`, or `Filmstrip: slate + 23 frames ... from the movie ...`.
+
+Shipped filmstrip presets:
+
+| Preset | Tiles | Tile | Grid | Size |
+|---|---|---|---|---|
+| `row24` (default) | 24 | 480x270 | 24x1 | 11520x270, jpg 90 |
+| `grid6x4` | 24 | 480x270 | 6x4 | 2880x1080, jpg 90 |
+| `row12_small` | 12 | 320x180 | 12x1 | 3840x180, jpg 85 |
+| `movie6x4` | slate + 23 frames, from the movie | 480x270 | 6x4 | 2880x1080, jpg 85 |
+
 ## Preview
 
 `-preview FILE.png` makes one frame instead of the movie, exactly as the movie would show it. The [tuner](TUNER.md) uses it; it is also handy for checking settings from a script.
@@ -771,7 +827,7 @@ Shipped thumbnail presets:
   - `FILE.png`: the frame.
   - `FILE_slate.png`: the slate, when there is one.
   - `FILE.json`: the input header, the keyword values, the output size, pixel aspect, pixel format, frame rate, timecode, reel name, colour, transform, letterbox and metadata tags.
-- `-o` and `-ot` are ignored with `-preview`.
+- `-o`, `-ot` and `-of` are ignored with `-preview`.
 
 ## Encoding (ffmpeg)
 
@@ -843,6 +899,7 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
 
 | Top-level key | Description |
 |---|---|
+| `tools` | Paths to `ffmpeg`, `ffprobe` and `oiiotool`, see [Tools](#tools). Optional; any other key is an error. |
 | `default_encode` | Encode preset used without `-preset`. Defaults to the first one. |
 | `default_burnin` | Burn-in preset used without `-burn_preset`. `none` (or leaving it out) means no burn-ins. |
 | `encode_presets` | The encode presets. The older key name `presets` (with `default`) is still accepted. |
@@ -854,6 +911,8 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
 | `default_oiio_transform` | Transform preset used without `-oiio_transform`. `none` (or leaving it out) means none. |
 | `default_thumbnail` | Thumbnail preset used without `-thumbnail_preset`. |
 | `thumbnail_presets` | The [thumbnail](#thumbnail) presets, see below. |
+| `default_filmstrip` | Filmstrip preset used without `-filmstrip_preset`. Without one, the built-in default: 24 tiles of 480x270 in one row, jpg 90. |
+| `filmstrip_presets` | The [filmstrip](#filmstrip) presets, see below. The name `none` is reserved. |
 | `oiio_transforms` | A list of [OIIO transform](#oiio-transforms) presets: `{"name": ..., "description": ..., "subs": [{"name": ..., "description": ..., "conditions": [...], "transforms": [...]}]}`. Optional. The name `none` is reserved. |
 | `smart_tokens`, `default_smart_tokens` | [Smart tokens](#smart-tokens) presets, `{"name": {"notes": ..., "tokens": [...]}}`, and the one used without `-smart_tokens` (`none` = none). Optional. |
 | `name_tokens` | [Custom name tokens](#custom-name-tokens): `{"name": "regex"}` or `{"name": {"regex": ..., "source": ..., "default": ...}}`. Optional. |
@@ -925,6 +984,18 @@ Thumbnail preset fields (all optional; any other field is an error):
 | `quality` | jpg quality 1–100, default 90. |
 | `compression` | png compression 0 (fastest, biggest) – 9 (slowest, smallest), default 6. |
 | `bits` | png bit depth 8 (default) or 16. jpg is always 8-bit. |
+| `notes` | Description shown in `--help`. |
+
+Filmstrip preset fields (all optional; any other field is an error):
+
+| Field | Description |
+|---|---|
+| `tiles` | Number of tiles (frames), 1–1000. Default: `columns` × `rows` when both are set, else 24. |
+| `tile_width`, `tile_height` | Size of one tile, default 480 × 270. |
+| `columns`, `rows` | The grid. Both `0` (default): one row. One of them `0`: as many as the tiles need. Both set: must have at least `tiles` cells. |
+| `quality` | jpg quality 1–100, default 90. |
+| `source` | `source` (default), `intermediates` or `movie`: where the tiles come from. |
+| `slate` | `true`: the slate is the first tile (when the run has one). Default `false`. |
 | `notes` | Description shown in `--help`. |
 
 Shipped encode presets, based on the [ASWF Encoding Guidelines](https://github.com/AcademySoftwareFoundation/EncodingGuidelines):

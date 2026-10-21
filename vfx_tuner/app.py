@@ -1,7 +1,9 @@
 """vfx-transcode-tuner: tune presets visually.
 
-The window edits a core.TunerState, runs `vfx-transcode ... -preview FILE.png` for every refresh
-and shows FILE.png (or FILE_slate.png) with pan / zoom and an optional compare image.
+The window edits a core.TunerState and shows one of three views with pan / zoom and an optional
+compare image: Image and Slate run `vfx-transcode ... -preview FILE.png` and show FILE.png or
+FILE_slate.png; Filmstrip runs `vfx-transcode ... -of FILE.jpg` (with the movie when the tiles come
+from it) and shows the filmstrip. A refresh runs the command of the view on screen.
 """
 
 import argparse
@@ -15,11 +17,12 @@ from pathlib import Path
 
 from PySide6.QtCore import QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPalette, QPixmap, QTransform
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QColorDialog, QComboBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsPixmapItem,
                                QGraphicsScene, QGraphicsView, QGridLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+                               QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+                               QRadioButton, QScrollArea,
                                QSlider, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
                                QTabWidget, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
                                QWidget)
@@ -308,6 +311,8 @@ class TunerWindow(QMainWindow):
         self.process = None
         self.pending = False
         self.images = {}
+        self.stale = {"preview": True, "filmstrip": True}    # settings changed since the last run
+        self.shown_mode = "image"
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.refresh)
@@ -341,15 +346,22 @@ class TunerWindow(QMainWindow):
         self.auto_refresh.setChecked(True)
         fit = QPushButton("Fit")
         one = QPushButton("1:1")
-        self.show_slate = QCheckBox("Slate")
-        self.show_slate.toggled.connect(self.show_images)
+        self.view_buttons = QButtonGroup(self)
+        view_widgets = [QLabel("  View")]
+        for mode, label in (("image", "Image"), ("slate", "Slate"), ("filmstrip", "Filmstrip")):
+            button = QRadioButton(label)
+            button.setProperty("mode", mode)
+            button.setChecked(mode == "image")
+            self.view_buttons.addButton(button)
+            view_widgets.append(button)
+        self.view_buttons.buttonToggled.connect(self._view_changed)
         self.mix = QSlider(Qt.Orientation.Horizontal)
         self.mix.setRange(0, 100)
         self.mix.setFixedWidth(160)
         self.mix.valueChanged.connect(lambda v: self.viewer.set_mix(v / 100.0))
         self.status = QLabel("")
-        for widget in (self.refresh_button, self.auto_refresh, fit, one, self.show_slate,
-                       QLabel("  Compare mix"), self.mix, QLabel("  "), self.status):
+        for widget in ([self.refresh_button, self.auto_refresh, fit, one] + view_widgets
+                       + [QLabel("  Compare mix"), self.mix, QLabel("  "), self.status]):
             toolbar.addWidget(widget)
 
         self.viewer = Viewer()
@@ -377,6 +389,7 @@ class TunerWindow(QMainWindow):
         self.tabs = QTabWidget()
         for title, builder in (("Input", self._build_input), ("Transform", self._build_transform),
                                ("Burn-in", self._build_burn), ("Slate", self._build_slate),
+                               ("Filmstrip", self._build_filmstrip),
                                ("Letterbox", self._build_letterbox),
                                ("Metadata", self._build_metadata), ("Output", self._build_output),
                                ("Info", self._build_info)):
@@ -400,6 +413,7 @@ class TunerWindow(QMainWindow):
         if self.loading:
             return
         self._read_all()
+        self.stale = {"preview": True, "filmstrip": True}
         self.update_outputs()
         if self.auto_refresh.isChecked():
             self.timer.start(REFRESH_DELAY_MS)
@@ -672,6 +686,81 @@ class TunerWindow(QMainWindow):
         self._fill_slate()
         self._changed()
 
+    # filmstrip tab
+
+    def _build_filmstrip(self, page):
+        layout = QVBoxLayout(page)
+        top = QHBoxLayout()
+        self.fs_preset = QComboBox()
+        load = QPushButton("Load preset")
+        load.clicked.connect(self._load_filmstrip)
+        top.addWidget(QLabel("Preset"))
+        top.addWidget(self.fs_preset, 1)
+        top.addWidget(load)
+        layout.addLayout(top)
+        form = QFormLayout()
+        self.fs_enabled = QCheckBox("add the filmstrip to the full command (-of)")
+        self.fs_tiles = QSpinBox()
+        self.fs_tiles.setRange(1, 1000)
+        self.fs_width, self.fs_height = QSpinBox(), QSpinBox()
+        for spin in (self.fs_width, self.fs_height):
+            spin.setRange(16, 8192)
+        size = QHBoxLayout()
+        size.addWidget(self.fs_width)
+        size.addWidget(QLabel("x"))
+        size.addWidget(self.fs_height)
+        self.fs_columns, self.fs_rows = QSpinBox(), QSpinBox()
+        for spin in (self.fs_columns, self.fs_rows):
+            spin.setRange(0, 1000)
+            spin.setSpecialValueText("auto")
+        grid = QHBoxLayout()
+        grid.addWidget(self.fs_columns)
+        grid.addWidget(QLabel("x"))
+        grid.addWidget(self.fs_rows)
+        self.fs_quality = QSpinBox()
+        self.fs_quality.setRange(1, 100)
+        self.fs_source = combo(list(core.FILMSTRIP_SOURCES))
+        self.fs_slate = QCheckBox("the slate as the first tile (switch the slate on in the Slate tab)")
+        form.addRow("", self.fs_enabled)
+        form.addRow("Tiles (frames)", self.fs_tiles)
+        form.addRow("Tile size", size)
+        form.addRow("Grid columns x rows", grid)
+        form.addRow("jpg quality", self.fs_quality)
+        form.addRow("Tiles from", self.fs_source)
+        form.addRow("", self.fs_slate)
+        layout.addLayout(form)
+        note = QLabel("Grid: both auto = one row; one auto = as many as needed. "
+                      "<i>source</i>: only the filmstrip is made (fast). <i>intermediates</i>, "
+                      "<i>movie</i> or the slate: the Filmstrip view makes the whole movie too, "
+                      "with burn-ins, slate and letterbox.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch()
+        self._connect(self.fs_enabled, self.fs_tiles, self.fs_width, self.fs_height,
+                      self.fs_columns, self.fs_rows, self.fs_quality, self.fs_source, self.fs_slate)
+
+    def _load_filmstrip(self):
+        name = self.fs_preset.currentText()
+        preset = self.presets.filmstrips.get(name) if self.presets else None
+        self.state.filmstrip = core.filmstrip_from_preset(preset, name if preset else "",
+                                                          self.state.filmstrip.enabled)
+        self._fill_filmstrip()
+        self._changed()
+
+    def _fill_filmstrip(self):
+        self.loading = True
+        f = self.state.filmstrip
+        self.fs_enabled.setChecked(f.enabled)
+        self.fs_tiles.setValue(f.tiles)
+        self.fs_width.setValue(f.tile_width)
+        self.fs_height.setValue(f.tile_height)
+        self.fs_columns.setValue(f.columns)
+        self.fs_rows.setValue(f.rows)
+        self.fs_quality.setValue(f.quality)
+        set_combo(self.fs_source, f.source)
+        self.fs_slate.setChecked(f.slate)
+        self.loading = False
+
     # letterbox tab
 
     def _build_letterbox(self, page):
@@ -732,7 +821,8 @@ class TunerWindow(QMainWindow):
         layout.addWidget(self.out_full)
         self.out_boxes = {}
         for key, title in (("transform", "Transform"), ("burnin", "Burn-in"), ("slate", "Slate"),
-                           ("letterbox", "Letterbox"), ("metadata", "Metadata")):
+                           ("filmstrip", "Filmstrip"), ("letterbox", "Letterbox"),
+                           ("metadata", "Metadata")):
             box = QGroupBox(title)
             inner = QVBoxLayout(box)
             cli_box, json_box = QPlainTextEdit(), QPlainTextEdit()
@@ -768,6 +858,7 @@ class TunerWindow(QMainWindow):
         for box, names in ((self.tr_preset, list(self.presets.transforms)),
                            (self.bu_preset, list(self.presets.burnins)),
                            (self.sl_preset, list(self.presets.slates)),
+                           (self.fs_preset, list(self.presets.filmstrips)),
                            (self.md_preset, ["", "none"] + list(self.presets.metadata_presets)),
                            (self.in_encode, [""] + list(self.presets.presets))):
             current = box.currentText()
@@ -795,6 +886,7 @@ class TunerWindow(QMainWindow):
         self._fill_transform()
         self._fill_burn()
         self._fill_slate()
+        self._fill_filmstrip()
         self._fill_letterbox()
         self._fill_metadata()
 
@@ -917,6 +1009,13 @@ class TunerWindow(QMainWindow):
         for key, button in self.sl_colors.items():
             setattr(s, key, button.value())
 
+        f = self.state.filmstrip
+        f.enabled, f.tiles = self.fs_enabled.isChecked(), self.fs_tiles.value()
+        f.tile_width, f.tile_height = self.fs_width.value(), self.fs_height.value()
+        f.columns, f.rows = self.fs_columns.value(), self.fs_rows.value()
+        f.quality, f.slate = self.fs_quality.value(), self.fs_slate.isChecked()
+        f.source = self.fs_source.currentText() or "source"
+
         lb = self.state.letterbox
         lb.enabled, lb.ratio = self.lb_enabled.isChecked(), self.lb_ratio.currentText().strip()
         lb.color, lb.opacity = QColor(self.lb_color.value()).name(), self.lb_opacity.value()
@@ -945,6 +1044,19 @@ class TunerWindow(QMainWindow):
 
     # running vfx-transcode
 
+    def view_mode(self):
+        button = self.view_buttons.checkedButton()
+        return button.property("mode") if button is not None else "image"
+
+    def _view_changed(self, _button, checked):
+        if not checked:
+            return
+        kind = "filmstrip" if self.view_mode() == "filmstrip" else "preview"
+        if self.stale[kind] and self.state.input.input1 and self.auto_refresh.isChecked():
+            self.refresh()
+        else:
+            self.show_images()
+
     def refresh(self):
         self._read_all()
         if not self.state.input.input1:
@@ -955,15 +1067,22 @@ class TunerWindow(QMainWindow):
             self.process.kill()
             return
         run = next(self.run_counter)
-        image = self.work_dir / "preview_{}.png".format(run)
         tool = split_args(self.in_tool.text()) or core.vfx_transcode_command()
-        cmd = core.preview_command(self.state, image, tool)
+        kind = "filmstrip" if self.view_mode() == "filmstrip" else "preview"
+        if kind == "filmstrip":
+            image = self.work_dir / "preview_{}_filmstrip.jpg".format(run)
+            movie = self.work_dir / "preview_{}_movie.{}".format(run, "mp4")
+            cmd = core.filmstrip_command(self.state, image, movie, tool)
+        else:
+            image = self.work_dir / "preview_{}.png".format(run)
+            cmd = core.preview_command(self.state, image, tool)
         self.log.appendPlainText("\n> " + core.quote(cmd))
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._read_output)
-        self.process.finished.connect(lambda code, _status, image=image: self._finished(code, image))
-        self.status.setText("Processing...")
+        self.process.finished.connect(
+            lambda code, _status, image=image, kind=kind: self._finished(code, image, kind))
+        self.status.setText("Making the filmstrip..." if kind == "filmstrip" else "Processing...")
         self.refresh_button.setEnabled(False)
         self.process.start(cmd[0], cmd[1:])
 
@@ -971,7 +1090,7 @@ class TunerWindow(QMainWindow):
         data = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
         self.log.appendPlainText(data.rstrip())
 
-    def _finished(self, code, image):
+    def _finished(self, code, image, kind="preview"):
         self.refresh_button.setEnabled(True)
         if self.pending:
             self.pending = False
@@ -981,14 +1100,26 @@ class TunerWindow(QMainWindow):
         if code != 0:
             self.status.setText("vfx-transcode failed (exit {}), see the log".format(code))
             return
+        if kind == "filmstrip":
+            pixmap = self._load_pixmap(str(image))
+            if pixmap is None:
+                self.status.setText("No filmstrip written, see the log")
+                return
+            self.images["filmstrip"] = pixmap
+            self.stale["filmstrip"] = False
+            self.show_images()
+            self.status.setText("Filmstrip {}x{}".format(pixmap.width(), pixmap.height()))
+            self._clean_old_previews(image)
+            return
         try:
             with open(str(image.with_suffix(".json")), encoding="utf-8") as fh:
                 self.report = json.load(fh)
         except (OSError, ValueError) as exc:
             self.status.setText("No preview written: {}".format(exc))
             return
-        self.images = {"image": self._load_pixmap(self.report.get("image")),
-                       "slate": self._load_pixmap(self.report.get("slate"))}
+        self.images["image"] = self._load_pixmap(self.report.get("image"))
+        self.images["slate"] = self._load_pixmap(self.report.get("slate"))
+        self.stale["preview"] = False
         self.show_images()
         self._fill_info()
         self._update_active_sub()
@@ -1004,18 +1135,25 @@ class TunerWindow(QMainWindow):
         return QPixmap.fromImage(QImage(path))       # QImage: no stale cache between runs
 
     def show_images(self):
-        want_slate = self.show_slate.isChecked()
-        main = self.images.get("slate" if want_slate else "image")
-        if want_slate and main is None:
+        mode = self.view_mode()
+        main = self.images.get(mode)
+        if mode == "slate" and main is None and not self.stale["preview"]:
             self.status.setText("No slate: switch it on in the Slate tab.")
+        elif mode == "filmstrip" and main is None:
+            self.status.setText("No filmstrip yet: press Refresh.")
         compare = None
         path = self.state.input.input2 or self.in_input2.text().strip()
-        if path and os.path.isfile(path):
+        if path and os.path.isfile(path) and mode != "filmstrip":
             compare = QPixmap.fromImage(QImage(path))
         self.mix.setEnabled(compare is not None and not compare.isNull())
-        par = float((self.report or {}).get("output", {}).get("par", 1.0) or 1.0)
+        # the filmstrip is square-pixel already; the movie frames are shown at their pixel aspect
+        par = 1.0 if mode == "filmstrip" else float(
+            (self.report or {}).get("output", {}).get("par", 1.0) or 1.0)
         self.viewer.set_images(main, compare, par)
         self.viewer.set_mix(self.mix.value() / 100.0 if self.mix.isEnabled() else 0.0)
+        if main is not None and mode != self.shown_mode:
+            self.viewer.fit()                        # a filmstrip and a frame differ in shape
+            self.shown_mode = mode
 
     def _fill_info(self):
         self.info.clear()

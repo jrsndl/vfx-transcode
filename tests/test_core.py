@@ -1681,6 +1681,198 @@ class ThumbnailTests(unittest.TestCase):
         self.assertEqual(resolve("/t/x.jpeg"), Path("/t/x.jpeg"))
 
 
+class ToolPathTests(unittest.TestCase):
+    def _cfg(self, presets, *argv):
+        ns = cli.build_parser(presets).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, presets)
+
+    def test_presets_file_tools(self):
+        from vfx_transcode.presets import parse_tools
+        self.assertEqual(list(PRESETS.tools), ["ffmpeg", "ffprobe", "oiiotool"])
+        self.assertEqual(parse_tools(None, "t"), {})
+        self.assertEqual(parse_tools({"ffmpeg": "D:/ff/ffmpeg.exe", "oiiotool": " ", "notes": "x"}, "t"),
+                         {"ffmpeg": "D:/ff/ffmpeg.exe"})                      # "" = not set
+        for bad in ([], {"ffmpg": "x"}, {"ffmpeg": 1}, {"oiiotool": ["a"]}):
+            with self.assertRaises(TranscodeError):
+                parse_tools(bad, "t")
+
+    def test_precedence(self):
+        presets = replace(PRESETS, tools={"ffmpeg": "D:/ff/ffmpeg.exe", "oiiotool": "D:/oiio/oiiotool.exe"})
+        cfg = self._cfg(presets)
+        self.assertEqual((cfg.ffmpeg, cfg.oiiotool, cfg.ffprobe),
+                         ("D:/ff/ffmpeg.exe", "D:/oiio/oiiotool.exe", "./ffmpeg/ffprobe.exe"))
+        self.assertIn('"tools"', cfg.tool_sources["ffmpeg"])
+        self.assertEqual(cfg.tool_sources["ffprobe"], "default")
+        cfg = self._cfg(presets, "-ffmpeg", "C:/other/ffmpeg.exe", "-ffprobe", "C:/other/ffprobe.exe")
+        self.assertEqual((cfg.ffmpeg, cfg.ffprobe, cfg.oiiotool),
+                         ("C:/other/ffmpeg.exe", "C:/other/ffprobe.exe", "D:/oiio/oiiotool.exe"))
+        self.assertEqual(cfg.tool_sources["ffmpeg"], "-ffmpeg")
+        cfg = self._cfg(replace(PRESETS, tools={}))
+        self.assertEqual((cfg.ffmpeg, cfg.oiiotool), ("./ffmpeg/ffmpeg.exe", "./oiio/oiiotool.exe"))
+
+    def test_resolve(self):
+        import os
+        from vfx_transcode.tools import resolve_tool
+        folder = Path(tempfile.mkdtemp())
+        exe = folder / "mytool.exe"
+        exe.write_text("")
+        os.environ["VT_TEST_TOOLS"] = str(folder)
+        self.assertEqual(Path(resolve_tool("$VT_TEST_TOOLS/mytool.exe", "/app", "mytool")), exe)
+        with self.assertRaises(TranscodeError) as ctx:
+            resolve_tool("/nowhere/nothing_here_xyz.exe", "/app", "nothing_here_xyz", 'presets.json "tools"')
+        self.assertIn('(presets.json "tools")', str(ctx.exception))
+
+
+class FilmstripTests(unittest.TestCase):
+    def _cfg(self, *argv):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))
+        return cli.config_from_args(ns, PRESETS)
+
+    def test_what_is_made(self):
+        cfg = self._cfg()
+        self.assertEqual((cfg.movie, cfg.filmstrip), (True, None))
+        cfg = self._cfg("-of")
+        self.assertEqual((cfg.movie, cfg.filmstrip.name, cfg.filmstrip_output), (False, "row24", ""))
+        cfg = self._cfg("-ot", "-of", "./strips/")
+        self.assertEqual((cfg.movie, cfg.thumbnail.name, cfg.filmstrip_output), (False, "middle1280", "./strips/"))
+        self.assertTrue(self._cfg("-o", "./", "-of").movie)
+        cfg = self._cfg("-preview", "p.png", "-of")
+        self.assertIsNone(cfg.filmstrip)
+        self.assertIsNone(self._cfg("-filmstrip_tiles", "12").filmstrip)        # no -of: ignored
+        for bad in (["-of", "./{nope}"], ["-of", "-filmstrip_preset", "nope"],
+                    ["-of", "-filmstrip_tiles", "0"], ["-of", "-filmstrip_tile", "480"],
+                    ["-of", "-filmstrip_grid", "4x4", "-filmstrip_tiles", "24"]):
+            with self.assertRaises(TranscodeError):
+                self._cfg(*bad)
+
+    def test_defaults_and_layout(self):
+        from vfx_transcode.filmstrip import FilmstripPreset
+        builtin = FilmstripPreset("b")
+        self.assertEqual(builtin.layout(), (24, 24, 1))
+        self.assertEqual(builtin.size(), (11520, 270))
+        self.assertEqual(self._cfg("-of").filmstrip.layout(), (24, 24, 1))
+        self.assertEqual(FilmstripPreset("g", columns=6, rows=4).layout(), (24, 6, 4))
+        self.assertEqual(FilmstripPreset("c", tiles=10, columns=4).layout(), (10, 4, 3))
+        self.assertEqual(FilmstripPreset("r", tiles=10, rows=2).layout(), (10, 5, 2))
+        self.assertEqual(FilmstripPreset("t", tiles=10, columns=4, rows=4).layout(), (10, 4, 4))
+
+    def test_options(self):
+        f = self._cfg("-of", "-filmstrip_tiles", "12").filmstrip
+        self.assertEqual(f.layout(), (12, 12, 1))                               # one row follows
+        f = self._cfg("-of", "-filmstrip_grid", "8x3").filmstrip
+        self.assertEqual(f.layout(), (24, 8, 3))                                # tiles = cells
+        f = self._cfg("-of", "-filmstrip_grid", "5x", "-filmstrip_tiles", "12").filmstrip
+        self.assertEqual(f.layout(), (12, 5, 3))
+        f = self._cfg("-of", "-filmstrip_preset", "grid6x4", "-filmstrip_tiles", "12").filmstrip
+        self.assertEqual(f.layout(), (12, 6, 2))                                # keeps 6 columns
+        f = self._cfg("-of", "-filmstrip_tile", "320X180").filmstrip
+        self.assertEqual((f.tile_width, f.tile_height), (320, 180))
+        f = self._cfg("-of").filmstrip
+        self.assertEqual((f.quality, f.source, f.slate), (90, "source", False))
+        f = self._cfg("-of", "-filmstrip_quality", "75", "-filmstrip_source", "movie",
+                      "-filmstrip_slate").filmstrip
+        self.assertEqual((f.quality, f.source, f.slate), (75, "movie", True))
+        with self.assertRaises(TranscodeError):
+            self._cfg("-of", "-filmstrip_quality", "101")
+
+    def test_choose_frames(self):
+        from vfx_transcode.filmstrip import choose_frames
+        frames = list(range(1001, 1101))
+        picked = choose_frames(frames, 24)
+        self.assertEqual((len(picked), picked[0], picked[-1]), (24, 1001, 1100))
+        self.assertEqual(len(set(picked)), 24)
+        self.assertEqual(choose_frames([1001, 1003, 1004], 24), [1001, 1003, 1004])
+        self.assertEqual(choose_frames(frames, 1), [1050])
+        self.assertEqual(choose_frames(frames, 2), [1001, 1100])
+
+    def test_oiiotool_commands(self):
+        from vfx_transcode.filmstrip import (FilmstripPreset, channel_args, oiiotool_mosaic_command,
+                                             oiiotool_tile_command, source_tile_args)
+        movie = ["--ch", "R,G,B,A", "--unpremult", "--colorconvert", "ACEScg", "out_srgb", "-d", "uint16"]
+        preset = FilmstripPreset("f", tiles=3, columns=2, quality=80)
+        mid = source_tile_args(movie, alpha=True)
+        self.assertNotIn("uint16", mid)
+        self.assertEqual(mid[-2:], ["--ch", "0,1,2"])
+        cmd = oiiotool_tile_command("oiiotool", "a.1005.exr", "t.tif", mid, preset, Fraction(2))
+        self.assertLess(cmd.index("--colorconvert"), cmd.index("--pixelaspect"))
+        self.assertLess(cmd.index("--pixelaspect"), cmd.index("--fit:pad=1"))
+        self.assertEqual(cmd[cmd.index("--fit:pad=1") + 1], "480x270")
+        self.assertEqual(cmd[-2:], ["-o", "t.tif"])
+        self.assertEqual(channel_args(mono=True), ["--ch", "0,0,0"])
+        self.assertEqual(channel_args(), [])
+        inter = oiiotool_tile_command("oiiotool", "w/a.1005.png", "t.tif", channel_args(), preset)
+        self.assertNotIn("--colorconvert", inter)                              # intermediates: no colour
+        self.assertNotIn("--pixelaspect", inter)
+        mosaic = oiiotool_mosaic_command("oiiotool", ["a.tif", None, "c.tif"], "out.jpg", preset)
+        self.assertEqual(mosaic.count("-i"), 2)
+        self.assertEqual(mosaic.count("constant:color=0,0,0"), 2)               # failed + spare cell
+        self.assertLess(mosaic.index("a.tif"), mosaic.index("c.tif"))
+        self.assertEqual(mosaic[mosaic.index("--mosaic") + 1], "2x2")
+        self.assertIn("jpeg:80", mosaic)
+        self.assertEqual(mosaic[-2:], ["-o", "out.jpg"])
+
+    def test_ffmpeg_commands(self):
+        from vfx_transcode.filmstrip import (FilmstripPreset, ffmpeg_files_command,
+                                             ffmpeg_movie_command)
+        preset = FilmstripPreset("f", tiles=2, tile_width=320, tile_height=180, quality=100)
+        cmd = ffmpeg_files_command("ffmpeg", "w/list.txt", "f.jpg", preset, Fraction(2))
+        self.assertEqual(cmd[cmd.index("-f") + 1], "concat")
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("scale=w=trunc(iw*2/1/2)*2:h=ih", vf)
+        self.assertIn("force_original_aspect_ratio=decrease", vf)
+        self.assertIn("pad=w=320:h=180", vf)
+        self.assertIn("tile=layout=2x1", vf)
+        self.assertEqual(cmd[-3:], ["-q:v", "2", "f.jpg"])
+        movie = ffmpeg_movie_command("ffmpeg", "m.mov", [0, 5, 49], "f.jpg", preset)
+        vf = movie[movie.index("-vf") + 1]
+        self.assertTrue(vf.startswith(r"select=expr=eq(n\,0)+eq(n\,5)+eq(n\,49)"))
+        self.assertIn("in_color_matrix=bt709", vf)
+        self.assertNotIn("trunc(iw", vf)                                         # square pixels
+
+    def test_plan(self):
+        from vfx_transcode.filmstrip import FilmstripPreset
+        from vfx_transcode.sequence import Sequence
+        exr = Sequence(Path("/s"), "a.", ".exr", 4, tuple(range(1001, 1101)))
+        png = Sequence(Path("/s"), "a.", ".png", 4, tuple(range(1001, 1101)))
+        inter = {f: "w/a.{}.png".format(f) for f in range(1001, 1101) if f != 1100}
+        plan = lambda preset, seq=exr, movie=None, available=None, slate=None, has=False: \
+            cli.filmstrip_plan(preset, seq, movie, available, slate, has)
+        p = FilmstripPreset("p", tiles=4)
+        self.assertEqual(plan(p), ("source", False, [1001, 1034, 1067, 1100]))
+        self.assertEqual(plan(replace(p, source="movie"))[0], "source")         # no movie: source
+        self.assertEqual(plan(replace(p, source="movie"), movie="m.mp4")[0], "movie")
+        self.assertEqual(plan(replace(p, source="intermediates"))[0], "source")
+        source, _slate, frames = plan(replace(p, source="intermediates"), available=inter)
+        self.assertEqual((source, frames[-1]), ("intermediates", 1099))         # failed 1100
+        self.assertEqual(plan(replace(p, source="intermediates"), png, available=inter)[0], "source")
+        self.assertEqual(plan(replace(p, slate=True), slate="w/a.slate.png")[1:],
+                         (True, [1001, 1051, 1100]))                            # slate + 3 frames
+        self.assertFalse(plan(replace(p, slate=True))[1])                       # no slate: frames
+        self.assertTrue(plan(replace(p, slate=True, source="movie"), movie="m", has=True)[1])
+        self.assertFalse(plan(p, slate="w/a.slate.png")[1])                     # off by default
+
+    def test_presets(self):
+        from vfx_transcode.filmstrip import presets_from_json
+        self.assertEqual(PRESETS.default_filmstrip, "row24")
+        self.assertEqual(PRESETS.filmstrips["grid6x4"].size(), (2880, 1080))
+        self.assertEqual(PRESETS.get_filmstrip("").layout(), (24, 24, 1))
+        for bad in ({"x": {"tiles": 0.5}}, {"x": {"quality": 0}}, {"x": {"tile_width": 0}},
+                    {"x": {"format": "png"}}, {"x": {"tiles": 24, "columns": 4, "rows": 4}},
+                    {"none": {}}, {"x": {"source": "film"}}, {"x": {"slate": 1}}):
+            with self.assertRaises(TranscodeError):
+                presets_from_json(bad, "t")
+
+    def test_path(self):
+        from vfx_transcode.sequence import Sequence
+        seq = Sequence(Path("/shows/sh010/v003"), "sh010_v003.", ".exr", 4, (1001, 1002))
+        context = {"clean_name": "sh010_v003", "ext": "jpg", "meta": {}}
+        resolve = lambda t, folder=None: cli.resolve_path_template(
+            t, seq, "sh010_v003_filmstrip.jpg", "jpg", cli._FILMSTRIP_EXT_RE, "-of", context, folder)
+        self.assertEqual(resolve(""), Path("/shows/sh010/v003/sh010_v003_filmstrip.jpg"))
+        self.assertEqual(resolve("", "/movies"), Path("/movies/sh010_v003_filmstrip.jpg"))
+        self.assertEqual(resolve("./../strips/{clean_name}"), Path("/shows/sh010/strips/sh010_v003.jpg"))
+
+
 class PreviewOptionTests(unittest.TestCase):
     def _cfg(self, *argv):
         ns = cli.build_parser(PRESETS).parse_args(["-i", "x.1001.exr"] + list(argv))

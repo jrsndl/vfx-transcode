@@ -16,6 +16,8 @@ from .slate import (NO_SLATE, SLATE_PRESET_FIELDS, SlateSpec, parse_fields, pars
 from .tools import split_args
 from .transforms import NO_TRANSFORM, TransformPreset, parse_transform_presets
 from .thumbnails import ThumbnailPreset, presets_from_json
+from .filmstrip import FilmstripPreset, presets_from_json as filmstrips_from_json
+from .tools import TOOLS
 
 DEFAULT_PRESETS_FILE = "./presets.json"
 
@@ -96,6 +98,20 @@ class PresetFile:
     name_rules: "OrderedDict[str, NameRule]" = field(default_factory=OrderedDict)
     smart_tokens: "OrderedDict[str, SmartTokenPreset]" = field(default_factory=OrderedDict)
     default_smart_tokens: str = ""
+    filmstrips: "OrderedDict[str, FilmstripPreset]" = field(default_factory=OrderedDict)
+    default_filmstrip: str = ""
+    tools: "OrderedDict[str, str]" = field(default_factory=OrderedDict)   # name -> path
+
+    def get_filmstrip(self, name):
+        """Filmstrip preset by name; the built-in defaults (24 tiles of 480x270 in one row)
+        for "" when the file has none."""
+        if not name:
+            return FilmstripPreset(name="(built-in)")
+        try:
+            return self.filmstrips[name]
+        except KeyError:
+            raise TranscodeError('Unknown filmstrip preset "{}". Available: {} (from {})'.format(
+                name, ", ".join(self.filmstrips) or "none", self.path))
 
     def get_smart_tokens(self, name):
         """Smart token preset by name; None for "" or "none"."""
@@ -167,8 +183,13 @@ class PresetFile:
     def describe(self):
         width = max(len(n) for n in list(self.presets) + list(self.burnins)
                     + list(self.metadata_presets) + list(self.slates) + list(self.transforms)
-                    + list(self.thumbnails) + list(self.smart_tokens))
-        lines = ["Encode presets (-preset), default {}:".format(self.default)]
+                    + list(self.thumbnails) + list(self.filmstrips) + list(self.smart_tokens))
+        lines = []
+        if self.tools:
+            lines += ["Tools (presets file \"tools\"; -ffmpeg / -ffprobe / -oiio override them):"]
+            lines += ["  {:<{}}  {}".format(n, width, p) for n, p in self.tools.items()]
+            lines.append("")
+        lines += ["Encode presets (-preset), default {}:".format(self.default)]
         lines += ["  {:<{}}  .{:<4} {}{}".format(p.name, width, p.ext, p.notes,
                                                  " [alpha]" if p.alpha_pix_fmt else "")
                   for p in self.presets.values()]
@@ -213,6 +234,12 @@ class PresetFile:
             for t in self.thumbnails.values():
                 lines.append("  {:<{}}  {}".format(t.name, width, t.notes))
                 lines.append("  {:<{}}    {}".format("", width, t.describe()))
+        if self.filmstrips:
+            lines += ["", "Filmstrip presets (-filmstrip_preset, with -of), default {}:".format(
+                self.default_filmstrip or "(built-in: 24 tiles of 480x270, one row, jpg 90)")]
+            for f in self.filmstrips.values():
+                lines.append("  {:<{}}  {}".format(f.name, width, f.notes))
+                lines.append("  {:<{}}    {}".format("", width, f.describe()))
         if self.transforms:
             lines += ["", "OIIO transforms (-oiio_transform), default {}; first matching sub wins:"
                       .format(self.default_transform or NO_TRANSFORM)]
@@ -410,6 +437,31 @@ def _channel_preferences_from_json(data, path):
     return out
 
 
+def parse_tools(data, path):
+    """The "tools" section: {"ffmpeg": PATH, "ffprobe": PATH, "oiiotool": PATH}, all optional.
+    An empty path means "not set" (the built-in default)."""
+    if data is None:
+        return OrderedDict()
+    if not isinstance(data, dict):
+        raise TranscodeError('{}: "tools" must be an object like {{"ffmpeg": "./ffmpeg/ffmpeg.exe"}}.'
+                             .format(path))
+    unknown = sorted(k for k in data if k not in TOOLS and k != "notes")
+    if unknown:
+        raise TranscodeError('{}: "tools": unknown tool(s) {}; use {}.'.format(
+            path, ", ".join(unknown), ", ".join(TOOLS)))
+    tools = OrderedDict()
+    for name in TOOLS:
+        value = data.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise TranscodeError('{}: "tools": {} must be a path (text), got {!r}.'.format(
+                path, name, value))
+        if value.strip():
+            tools[name] = value.strip()
+    return tools
+
+
 def load_presets(path):
     try:
         # utf-8-sig: tolerate the BOM Notepad may add
@@ -456,6 +508,11 @@ def load_presets(path):
     if default_thumbnail and default_thumbnail not in thumbnails:
         raise TranscodeError('{}: default thumbnail preset "{}" is not defined.'.format(
             path, default_thumbnail))
+    filmstrips = filmstrips_from_json(data.get("filmstrip_presets") or {}, path)
+    default_filmstrip = data.get("default_filmstrip") or ""
+    if default_filmstrip and default_filmstrip not in filmstrips:
+        raise TranscodeError('{}: default filmstrip preset "{}" is not defined.'.format(
+            path, default_filmstrip))
     raw_transforms = data.get("oiio_transforms", data.get("oiiotransforms"))
     transforms = parse_transform_presets(raw_transforms, path) if raw_transforms else OrderedDict()
     default_transform = data.get("default_oiio_transform") or ""
@@ -474,7 +531,9 @@ def load_presets(path):
                       slates, "" if default_slate == NO_SLATE else default_slate,
                       transforms, "" if default_transform == NO_TRANSFORM else default_transform,
                       thumbnails, default_thumbnail, name_rules, smart,
-                      "" if default_smart == NO_SMART_TOKENS else default_smart)
+                      "" if default_smart == NO_SMART_TOKENS else default_smart,
+                      filmstrips=filmstrips, default_filmstrip=default_filmstrip,
+                      tools=parse_tools(data.get("tools"), path))
 
 
 def transfer_for(colorout):

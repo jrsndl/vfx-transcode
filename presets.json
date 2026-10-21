@@ -153,14 +153,38 @@
     "  format       jpg (default) or png",
     "  quality      jpg quality 1-100 (default 90)",
     "  compression  png compression 0 (fastest) - 9 (smallest), default 6",
-    "  bits         png bit depth 8 (default) or 16"
+    "  bits         png bit depth 8 (default) or 16",
+    "",
+    "FILMSTRIP PRESETS (-filmstrip_preset NAME, used with -of), default: default_filmstrip",
+    "  One jpg of evenly spaced frames, each fitted into an equal tile with black bars.",
+    "  notes        free text, shown in --help",
+    "  tiles        number of tiles (frames), 1-1000; default columns x rows when both are set, else 24",
+    "  tile_width, tile_height  size of one tile, default 480 x 270",
+    "  columns, rows  the grid; both 0 (default) = one row, one of them 0 = as many as needed",
+    "  quality      jpg quality 1-100 (default 90)",
+    "  source       where the tiles come from: source (default, the source frames with the movie's",
+    "               look), intermediates (oiiotool's converted frames; needs the movie or",
+    "               -skipffmpeg) or movie (the encoded movie: burn-ins and letterbox included)",
+    "  slate        true: the slate is the first tile (when the run makes one); default false",
+    "",
+    "TOOLS (paths to the executables; -ffmpeg / -ffprobe / -oiio on the command line win)",
+    "  ffmpeg, ffprobe, oiiotool  a path each, all optional. ./ and ../ are relative to the",
+    "               application folder; %VAR% / $VAR and ~ are expanded. A tool left out (or \"\")",
+    "               uses the built-in default (the paths shown); if the file is missing, the PATH is searched.",
+    "               Use / or \\\\ in JSON for Windows paths, e.g. \"D:/apps/ffmpeg/bin/ffmpeg.exe\""
   ],
+  "tools": {
+    "ffmpeg": "C:/_GFX_library/utils/ffmpeg/9.0.2/ffmpeg.exe",
+    "ffprobe": "C:/_GFX_library/utils/ffmpeg/9.0.2/ffprobe.exe",
+    "oiiotool": "C:/_GFX_library/utils/oiio/3.0.6.1/oiiotool.exe"
+  },
   "default_encode": "h264",
   "default_burnin": "basic",
   "default_metadata": "none",
   "default_slate": "none",
   "default_oiio_transform": "none",
   "default_thumbnail": "middle1280",
+  "default_filmstrip": "row24",
   "channel_preferences": [
     "rgba.R,rgba.G,rgba.B,rgba.A",
     "rgba.R,rgba.G,rgba.B",
@@ -566,6 +590,40 @@
       "frame": "middle",
       "format": "png",
       "compression": 6
+    }
+  },
+  "filmstrip_presets": {
+    "row24": {
+      "notes": "24 frames in one row, 480x270 tiles (11520x270): a strip of the whole shot.",
+      "tiles": 24,
+      "tile_width": 480,
+      "tile_height": 270,
+      "quality": 90
+    },
+    "grid6x4": {
+      "notes": "24 frames as a 6x4 contact sheet, 480x270 tiles (2880x1080).",
+      "columns": 6,
+      "rows": 4,
+      "tile_width": 480,
+      "tile_height": 270,
+      "quality": 90
+    },
+    "row12_small": {
+      "notes": "12 frames in one row, 320x180 tiles (3840x180): trackers, web pages.",
+      "tiles": 12,
+      "tile_width": 320,
+      "tile_height": 180,
+      "quality": 85
+    },
+    "movie6x4": {
+      "notes": "Contact sheet of the finished movie: the slate and 23 frames with their burn-ins and letterbox, 6x4 (2880x1080). Needs -o.",
+      "columns": 6,
+      "rows": 4,
+      "tile_width": 480,
+      "tile_height": 270,
+      "quality": 85,
+      "source": "movie",
+      "slate": true
     }
   }
 }

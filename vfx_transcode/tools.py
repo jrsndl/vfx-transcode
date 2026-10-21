@@ -7,12 +7,18 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections import OrderedDict
 
 from .errors import ToolError, TranscodeError
 
 log = logging.getLogger(__name__)
 
 OUTPUT_TAIL_LINES = 25
+
+# executable name on the PATH -> built-in default path (./ = the application folder)
+TOOLS = OrderedDict([("ffmpeg", "./ffmpeg/ffmpeg.exe"),
+                     ("ffprobe", "./ffmpeg/ffprobe.exe"),
+                     ("oiiotool", "./oiio/oiiotool.exe")])
 
 
 def app_dir():
@@ -33,16 +39,25 @@ def resolve_path(value, base_dir):
     return value
 
 
-def resolve_tool(value, base_dir, fallback_name):
-    """Return an existing executable path: the configured one, else the one on PATH."""
-    path = resolve_path(value, base_dir)
+def expand_path(value):
+    """Environment variables (%VAR%, $VAR, ${VAR}) and ~ expanded."""
+    return os.path.expanduser(os.path.expandvars(value)) if value else value
+
+
+def resolve_tool(value, base_dir, fallback_name, where=""):
+    """Return an existing executable path: the configured one, else the one on PATH.
+    where: where the configured path came from, for the messages."""
+    path = resolve_path(expand_path(value), base_dir)
     if path and os.path.isfile(path):
+        log.debug("%s: %s%s", fallback_name, path, " ({})".format(where) if where else "")
         return path
     found = shutil.which(path or fallback_name) or shutil.which(fallback_name)
     if found:
-        log.debug("%s not found at %s, using %s from PATH", fallback_name, path, found)
+        log.debug("%s not found at %s%s, using %s from PATH", fallback_name, path,
+                  " ({})".format(where) if where else "", found)
         return found
-    raise TranscodeError('{} not found at "{}" and not on PATH.'.format(fallback_name, path))
+    raise TranscodeError('{} not found at "{}"{} and not on PATH.'.format(
+        fallback_name, path, " ({})".format(where) if where else ""))
 
 
 def split_args(text):
@@ -63,7 +78,7 @@ def _tail(text, lines=OUTPUT_TAIL_LINES):
     return "\n".join(parts[-lines:])
 
 
-def run_tool(cmd, what, verbose=0, check=True):
+def run_tool(cmd, what, verbose=0, check=True, cwd=None):
     """Run a command, return CompletedProcess. Raise ToolError with the output tail on failure
     (unless check is False: `ffmpeg -i` alone exits 1 but prints what we need)."""
     cmd = [str(c) for c in cmd]
@@ -71,7 +86,7 @@ def run_tool(cmd, what, verbose=0, check=True):
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="backslashreplace",
-            stdin=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL, cwd=cwd)
     except OSError as exc:
         raise ToolError("{}: could not start {}: {}".format(what, cmd[0], exc))
     if verbose >= 2:

@@ -657,6 +657,64 @@ if not exist "%OUT%\41_thumb_DB_1001.jpg" (
 if exist "%OUT%\41_thumb_largest.jpg" (>> "%SUMMARY%" echo [INFO] 41 thumbnail - 41_thumb_largest.jpg 1920 wide and 41_thumb_DB_1001.jpg 512 wide, no burn-ins)
 
 echo.
+echo ==== 41b filmstrip: with the movie - default 24x1 row; and filmstrip only - 6x4 grid, small tiles ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\41b_strip_movie.mp4" -of "%OUT%\41b_strip_row" ^
+  > "%OUT%\41b_filmstrip.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\DB_000_0030_lgt_explosion_v47_beauty\DB_000_0030_lgt_explosion_v47_beauty.1001.exr" ^
+  -of "./../_test_output/41b_strip_{namesplit1}_grid" -filmstrip_grid 6x4 -filmstrip_tile 320x180 ^
+  >> "%OUT%\41b_filmstrip.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+type "%OUT%\41b_filmstrip.log"
+call :check %RC% "41b filmstrip"
+call :expect "%OUT%\41b_filmstrip.log" "24x1 grid (11520x270)" "41b filmstrip row"
+call :expect "%OUT%\41b_filmstrip.log" "6x4 grid (1920x720)" "41b filmstrip grid"
+call :expect "%OUT%\41b_filmstrip.log" "only the filmstrip" "41b filmstrip only"
+if not exist "%OUT%\41b_strip_row.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 41b filmstrip - 41b_strip_row.jpg missing
+  set /a FAILED+=1
+)
+if not exist "%OUT%\41b_strip_DB_grid.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 41b filmstrip - 41b_strip_DB_grid.jpg missing
+  set /a FAILED+=1
+)
+if exist "%OUT%\41b_strip_row.jpg" (>> "%SUMMARY%" echo [INFO] 41b filmstrip - check 41b_strip_row.jpg 11520x270 and 41b_strip_DB_grid.jpg 1920x720: same colours as the thumbnails, black bars, no burn-ins)
+
+echo.
+echo ==== 41c filmstrip from the movie - slate and burn-ins - and from the intermediates ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\41c_movie.mp4" -slate generic -burn_preset review ^
+  -of "%OUT%\41c_strip_movie" -filmstrip_preset movie6x4 ^
+  > "%OUT%\41c_filmstrip.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\41c_movie2.mp4" -slate generic ^
+  -of "%OUT%\41c_strip_inter" -filmstrip_source intermediates -filmstrip_tiles 12 -filmstrip_quality 75 ^
+  >> "%OUT%\41c_filmstrip.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+type "%OUT%\41c_filmstrip.log"
+call :check %RC% "41c filmstrip"
+call :expect "%OUT%\41c_filmstrip.log" "Filmstrip: slate + 23 frames" "41c filmstrip movie with slate"
+call :expect "%OUT%\41c_filmstrip.log" "from the movie" "41c filmstrip from the movie"
+call :expect "%OUT%\41c_filmstrip.log" "from the intermediates" "41c filmstrip from the intermediates"
+call :expect "%OUT%\41c_filmstrip.log" "jpg quality 75" "41c filmstrip quality"
+call :expect_not "%OUT%\41c_filmstrip.log" "Filmstrip: slate + 11" "41c slate off by default"
+if not exist "%OUT%\41c_strip_movie.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 41c filmstrip - 41c_strip_movie.jpg missing
+  set /a FAILED+=1
+)
+if not exist "%OUT%\41c_strip_inter.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 41c filmstrip - 41c_strip_inter.jpg missing
+  set /a FAILED+=1
+)
+if exist "%OUT%\41c_strip_movie.jpg" (>> "%SUMMARY%" echo [INFO] 41c filmstrip - check 41c_strip_movie.jpg: slate first, burn-ins on the frames; 41c_strip_inter.jpg: same colours as 41b, no slate)
+
+echo.
 echo ==== 42  preview: one frame as the movie shows it, plus slate and JSON; the tuner uses this ====
 "%PY%" vfx-transcode.py ^
   -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^

@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 from vfx_transcode import metadata as md
 from vfx_transcode.burnin import (BURN_PLACES, DEFAULT_MARGINS, DEFAULT_STYLE, MARGIN_SIDES,
                                   WATERMARK, WATERMARK_STYLE)
+from vfx_transcode.filmstrip import SOURCES as FILMSTRIP_SOURCES, FilmstripPreset
 from vfx_transcode.slate import SlateSpec
 from vfx_transcode.tools import split_args
 from vfx_transcode.transforms import select as select_sub
@@ -306,6 +307,71 @@ def slate_json(state):
     return data
 
 
+# filmstrip
+
+VIEW_MODES = ("image", "slate", "filmstrip")
+
+
+@dataclass
+class FilmstripState:
+    enabled: bool = False             # add -of to the full command
+    preset: str = ""                  # the loaded preset, "" = none
+    tiles: int = 24
+    tile_width: int = 480
+    tile_height: int = 270
+    columns: int = 0                  # 0 = follow the tiles (both 0: one row)
+    rows: int = 0                     # 0 = as many as needed
+    quality: int = 90
+    source: str = "source"            # source | intermediates | movie
+    slate: bool = False
+
+    def preset_object(self):
+        return FilmstripPreset(name=self.preset or "tuned", tiles=self.tiles,
+                               tile_width=self.tile_width, tile_height=self.tile_height,
+                               columns=self.columns, rows=self.rows, quality=self.quality,
+                               source=self.source, slate=self.slate)
+
+    def needs_movie(self):
+        """The tiles come from the movie run: the movie or its intermediates, or the slate."""
+        return self.source != "source" or self.slate
+
+
+def filmstrip_from_preset(preset, name="", enabled=False):
+    preset = preset or FilmstripPreset(name="")
+    return FilmstripState(enabled=enabled, preset=name, tiles=preset.layout()[0],
+                          tile_width=preset.tile_width, tile_height=preset.tile_height,
+                          columns=preset.columns, rows=preset.rows, quality=preset.quality,
+                          source=preset.source, slate=preset.slate)
+
+
+def filmstrip_args(state, presets=None):
+    """-filmstrip_* options giving exactly this state (the preset name alone when unchanged).
+    Without -of in front; the caller adds it."""
+    if presets is not None and state.preset in presets.filmstrips:
+        loaded = filmstrip_from_preset(presets.filmstrips[state.preset], state.preset, state.enabled)
+        if loaded == state:
+            return ["-filmstrip_preset", state.preset]
+    columns, rows = state.columns, state.rows
+    if not columns and not rows:
+        columns, rows = state.tiles, 1                # explicit, whatever the file's default is
+    grid = "{}x{}".format(columns or "", rows or "")
+    return ["-filmstrip_tiles", str(state.tiles), "-filmstrip_grid", grid,
+            "-filmstrip_tile", "{}x{}".format(state.tile_width, state.tile_height),
+            "-filmstrip_quality", str(state.quality), "-filmstrip_source", state.source,
+            "-filmstrip_slate", "1" if state.slate else "0"]
+
+
+def filmstrip_json(state):
+    data = OrderedDict([("notes", "tuned"), ("tiles", state.tiles)])
+    if state.columns:
+        data["columns"] = state.columns
+    if state.rows:
+        data["rows"] = state.rows
+    data.update([("tile_width", state.tile_width), ("tile_height", state.tile_height),
+                 ("quality", state.quality), ("source", state.source), ("slate", state.slate)])
+    return data
+
+
 # letterbox
 
 @dataclass
@@ -372,6 +438,7 @@ class TunerState:
     slate: SlateState = field(default_factory=SlateState)
     letterbox: LetterboxState = field(default_factory=LetterboxState)
     metadata: MetadataState = field(default_factory=MetadataState)
+    filmstrip: FilmstripState = field(default_factory=FilmstripState)
 
 
 def preview_command(state, preview_path, tool=None):
@@ -382,6 +449,19 @@ def preview_command(state, preview_path, tool=None):
             + s.transform.preview_args() + burn_args(s.burn) + slate_args(s.slate)
             + letterbox_args(s.letterbox) + metadata_args(s.metadata)
             + ["-preview", str(preview_path)])
+
+
+def filmstrip_command(state, filmstrip_path, movie_path, tool=None):
+    """The command for the filmstrip view. Tiles from the source frames: only the filmstrip.
+    From the movie, its intermediates or with the slate: the movie is made too (movie_path),
+    with the burn-ins, slate and letterbox, so the filmstrip shows what the delivery will."""
+    s = state
+    cmd = ((tool or vfx_transcode_command()) + s.input.args() + s.transform.preview_args()
+           + filmstrip_args(s.filmstrip) + ["-of", str(filmstrip_path)])
+    if s.filmstrip.needs_movie():
+        cmd += (burn_args(s.burn) + slate_args(s.slate) + letterbox_args(s.letterbox)
+                + metadata_args(s.metadata) + ["-o", str(movie_path)])
+    return cmd
 
 
 def output_sections(state, presets, active_sub=None):
@@ -398,9 +478,12 @@ def output_sections(state, presets, active_sub=None):
                          json.dumps(slate_json(s.slate), indent=2) if s.slate.enabled else "")
     sections["letterbox"] = (quote(letterbox_args(s.letterbox)), "")
     sections["metadata"] = (quote(metadata_args(s.metadata)), "")
+    film = ["-of"] + filmstrip_args(s.filmstrip, presets)
+    sections["filmstrip"] = (quote(film), json.dumps(filmstrip_json(s.filmstrip), indent=2))
     full = (["vfx-transcode"] + s.input.args() + s.transform.cli_args(active_sub)
             + burn_args(s.burn, presets) + slate_args(s.slate, presets)
-            + letterbox_args(s.letterbox) + metadata_args(s.metadata) + ["-o", "./"])
+            + letterbox_args(s.letterbox) + metadata_args(s.metadata) + ["-o", "./"]
+            + (film if s.filmstrip.enabled else []))
     return quote(full), sections
 
 

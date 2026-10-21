@@ -26,6 +26,8 @@ class Config:
     # tools (already resolved to absolute paths by the CLI)
     oiiotool: str = "oiiotool"
     ffmpeg: str = "ffmpeg"
+    ffprobe: str = "ffprobe"
+    tool_sources: dict = field(default_factory=dict)   # tool -> where its path came from
     ocio: str = ""
 
     # oiiotool / mezzanine
@@ -88,9 +90,11 @@ class Config:
     alpha_active: bool = False         # set at run time: the movie really gets an alpha channel
 
     # thumbnail / what to make
-    movie: bool = True                 # False: -ot without -o, thumbnail only
+    movie: bool = True                 # False: -ot / -of without -o, stills only
     thumbnail: Any = None              # thumbnails.ThumbnailPreset, None = no thumbnail
     thumbnail_output: Optional[str] = None   # -ot template; "" = default place and name
+    filmstrip: Any = None              # filmstrip.FilmstripPreset, None = no filmstrip
+    filmstrip_output: Optional[str] = None   # -of template; "" = default place and name
 
     # letterbox
     letterbox: Any = None              # letterbox.LetterboxSpec, None = off

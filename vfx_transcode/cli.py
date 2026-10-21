@@ -45,6 +45,7 @@ from .smart_tokens import evaluate_preset as evaluate_smart_tokens
 from .names import (NAME_KEYWORDS, DEFAULT_VERSION_REGEX, compile_version_regex, custom_tokens,
                     merge_rules, name_tokens)
 from .transforms import INPUT_KEYWORDS, input_tokens, select as select_transform, transform_args
+from . import filmstrip as fs
 from .thumbnails import (choose_frame as choose_thumbnail_frame, ffmpeg_command as thumbnail_ffmpeg,
                          oiiotool_command as thumbnail_oiiotool, parse_frame as parse_thumbnail_frame)
 from .oiio import process_args
@@ -55,7 +56,7 @@ from .slate import (PLAIN_SLATE, SLATE_STYLE_FIELDS, SlateSpec, apply_field_opti
                     slate_timecode, style_values)
 from .timecode import (fps_display, fps_from_attribs, fps_to_str, frame_to_tc, nominal_fps,
                        offset_timecode, parse_fps, timecode_from_attribs, validate_timecode)
-from .tools import app_dir, ffmpeg_filters, resolve_path, resolve_tool, run_tool, split_args
+from .tools import TOOLS, app_dir, ffmpeg_filters, resolve_path, resolve_tool, run_tool, split_args
 
 log = logging.getLogger("vfx_transcode")
 
@@ -109,6 +110,32 @@ def build_parser(presets=None, presets_error=None):
     p.add_argument("-thumbnail_frame", default=None, metavar="middle|first|last|largest|FRAME",
                    help="Which frame: overrides the preset. largest = the frame whose converted "
                         "image is the biggest file (needs the movie; else middle)")
+    p.add_argument("-of", default=None, nargs="?", const="", metavar="PATH",
+                   help="Write a filmstrip: one jpg of evenly spaced frames in a grid of equal "
+                        "tiles, same look as the thumbnail (no burn-ins). PATH works like -ot; -of "
+                        "alone puts <name>_filmstrip.jpg next to the movie, or in the input folder. "
+                        "Without -o only the stills are made. See -filmstrip_preset")
+    p.add_argument("-filmstrip_preset", default=None, metavar="NAME",
+                   help="Filmstrip preset from the presets file (tiles, tile size, grid, quality). "
+                        "Default: the file's default_filmstrip")
+    p.add_argument("-filmstrip_tiles", default=None, metavar="N",
+                   help="Number of tiles (frames), evenly spaced from the first to the last frame: "
+                        "overrides the preset. Default 24")
+    p.add_argument("-filmstrip_tile", default=None, metavar="WxH",
+                   help="Size of one tile; each frame is fitted in and padded with black. "
+                        "Overrides the preset. Default 480x270")
+    p.add_argument("-filmstrip_grid", default=None, metavar="COLSxROWS",
+                   help="Layout, e.g. 24x1 (one row), 6x4, or 6x (rows as needed). Without "
+                        "-filmstrip_tiles the tile count becomes COLS x ROWS. Default: one row")
+    p.add_argument("-filmstrip_quality", default=None, metavar="1-100",
+                   help="jpg quality of the filmstrip: overrides the preset. Default 90")
+    p.add_argument("-filmstrip_source", default=None, choices=fs.SOURCES,
+                   help="Where the tiles come from. source (default): the source frames with the "
+                        "movie's look, also without a movie. intermediates: the frames oiiotool "
+                        "converted for the movie (EXR, with the movie or -skipffmpeg). movie: "
+                        "frames of the encoded movie via ffmpeg, burn-ins and letterbox included")
+    flag(p, "-filmstrip_slate", None,
+         "1: the slate (when the movie has one) is the first tile. Default 0: no slate")
     p.add_argument("-preview", default="", metavar="FILE.png",
                    help="Instead of the movie: one frame exactly as the movie shows it (burn-ins, "
                         "letterbox, pixel format), as FILE.png; the slate as FILE_slate.png; and "
@@ -157,10 +184,16 @@ def build_parser(presets=None, presets_error=None):
     p.add_argument("--version", action="version", version=__version__)
 
     g = p.add_argument_group("tools")
-    g.add_argument("-ffmpeg", default="./ffmpeg/ffmpeg.exe",
-                   help="ffmpeg executable. ./ paths are relative to the application; falls back to PATH")
-    g.add_argument("-oiio", default="./oiio/oiiotool.exe",
-                   help="oiiotool executable. ./ paths are relative to the application; falls back to PATH")
+    g.add_argument("-ffmpeg", default=None, metavar="PATH",
+                   help="ffmpeg executable. Default: the presets file's tools.ffmpeg, else "
+                        "./ffmpeg/ffmpeg.exe. ./ paths are relative to the application, "
+                        "%%VAR%% / $VAR are expanded; falls back to PATH")
+    g.add_argument("-ffprobe", default=None, metavar="PATH",
+                   help="ffprobe executable. Default: the presets file's tools.ffprobe, else "
+                        "./ffmpeg/ffprobe.exe")
+    g.add_argument("-oiio", default=None, metavar="PATH",
+                   help="oiiotool executable. Default: the presets file's tools.oiiotool, else "
+                        "./oiio/oiiotool.exe")
     g.add_argument("-ocio", default="./ocio/aces_1.2cg/config.ocio",
                    help="OCIO config file, or an ocio:// built-in config URI")
 
@@ -548,13 +581,14 @@ def config_from_args(ns, presets):
             check_output_template(ns.ot, "-ot", tuple(THUMBNAIL_KEYWORDS) + token_names)
     elif (ns.thumbnail_preset is not None or ns.thumbnail_frame is not None) and not ns.preview:
         log.warning("-thumbnail_preset / -thumbnail_frame ignored: no -ot.")
-    # what to make: -o and/or -ot; neither = the movie at its default place
-    movie = bool(ns.o.strip()) or ns.ot is None
+    filmstrip = filmstrip_from_args(ns, presets, token_names)
+    # what to make: -o, -ot and/or -of; none of them = the movie at its default place
+    movie = bool(ns.o.strip()) or (ns.ot is None and ns.of is None)
     preview_frame = "middle"
     if ns.preview:
-        if ns.o.strip() or ns.ot is not None:
-            log.warning("-preview: -o / -ot are ignored, only the preview is written.")
-        movie, thumbnail = True, None
+        if ns.o.strip() or ns.ot is not None or ns.of is not None:
+            log.warning("-preview: -o / -ot / -of are ignored, only the preview is written.")
+        movie, thumbnail, filmstrip = True, None, None
         preview_frame = parse_thumbnail_frame(ns.thumbnail_frame or "middle")
     if ns.clf.strip() and (ns.display is not None or ns.view is not None or ns.looks):
         log.warning("-clf is used for the colour; -display / -view / -looks are ignored.")
@@ -562,6 +596,7 @@ def config_from_args(ns, presets):
         ns.oiio_transform if ns.oiio_transform is not None else presets.default_transform)
     base = app_dir()
     skip_ffmpeg = ns.skipffmpeg
+    tools = tool_paths(ns, presets)
     return Config(
         input=ns.i,
         output=ns.o,
@@ -572,8 +607,10 @@ def config_from_args(ns, presets):
         par_source=ns.par_source,
         par_out=ns.par_out,
         verbose=ns.verbose or 0,
-        oiiotool=ns.oiio,
-        ffmpeg=ns.ffmpeg,
+        oiiotool=tools["oiiotool"][0],
+        ffmpeg=tools["ffmpeg"][0],
+        ffprobe=tools["ffprobe"][0],
+        tool_sources={name: where for name, (_path, where) in tools.items()},
         ocio=ns.ocio if ns.ocio.startswith("ocio://") else resolve_path(ns.ocio, base),
         colorin=ns.colorin,
         colorout=ns.colorout,
@@ -623,6 +660,8 @@ def config_from_args(ns, presets):
         preview=os.path.abspath(ns.preview) if ns.preview else "",
         preview_frame=preview_frame,
         thumbnail_output=ns.ot,
+        filmstrip=filmstrip,
+        filmstrip_output=ns.of,
         alpha=ns.alpha,
         alpha_premult=bool(ns.alpha_premult),
         version_regex=ns.version_regex,
@@ -635,6 +674,43 @@ def config_from_args(ns, presets):
         # the container: -ff_out_ext, else the -o file's extension, else the preset's
         ff_out_ext=(ns.ff_out_ext or container_from_output(ns.o) or preset.ext).lstrip("."),
     )
+
+
+TOOL_OPTIONS = {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "oiiotool": "oiio"}
+
+
+def tool_paths(ns, presets=None):
+    """{tool: (path, where it came from)}: the command line, else the presets file's "tools",
+    else the built-in default. resolve_tool falls back to the PATH when the file is missing."""
+    result = OrderedDict()
+    for name, default in TOOLS.items():
+        value = getattr(ns, TOOL_OPTIONS[name], None)
+        if value:
+            result[name] = (value, "-" + TOOL_OPTIONS[name])
+        elif presets is not None and presets.tools.get(name):
+            result[name] = (presets.tools[name], '{} "tools"'.format(Path(presets.path).name))
+        else:
+            result[name] = (default, "default")
+    return result
+
+
+FILMSTRIP_OPTIONS = ("filmstrip_preset", "filmstrip_tiles", "filmstrip_tile", "filmstrip_grid",
+                     "filmstrip_quality", "filmstrip_source", "filmstrip_slate")
+
+
+def filmstrip_from_args(ns, presets, token_names=()):
+    """The filmstrip preset with the -filmstrip_* options over it; None without -of."""
+    given = [o for o in FILMSTRIP_OPTIONS if getattr(ns, o) is not None]
+    if ns.of is None:
+        if given and not ns.preview:
+            log.warning("%s ignored: no -of.", " / ".join("-" + o for o in given))
+        return None
+    preset = presets.get_filmstrip(ns.filmstrip_preset or presets.default_filmstrip)
+    preset = fs.apply_options(preset, ns.filmstrip_tiles, ns.filmstrip_tile, ns.filmstrip_grid,
+                              ns.filmstrip_quality, ns.filmstrip_source, ns.filmstrip_slate)
+    if ns.of.strip():
+        check_output_template(ns.of, "-of", token_names)
+    return preset
 
 
 TEMP_ROOT_NAME = "vfx-transcode"
@@ -696,11 +772,12 @@ def describe_colour(cfg):
     return "{} -> {}".format(cfg.colorin, cfg.colorout)
 
 
-def show_ocio_info(ns):
+def show_ocio_info(ns, presets=None):
     """-ocio_info: print what the OCIO config offers."""
     base = app_dir()
     ocio = ns.ocio if ns.ocio.startswith("ocio://") else resolve_path(ns.ocio, base)
-    cfg = Config(input="", ocio=ocio, oiiotool=resolve_tool(ns.oiio, base, "oiiotool"))
+    path, where = tool_paths(ns, presets)["oiiotool"]
+    cfg = Config(input="", ocio=ocio, oiiotool=resolve_tool(path, base, "oiiotool", where))
     setup_ocio(cfg)
     result = run_tool([cfg.oiiotool, "--colorconfiginfo"], "oiiotool --colorconfiginfo", ns.verbose or 0)
     print("OCIO config: {}".format(os.environ.get("OCIO", ocio)))
@@ -936,8 +1013,9 @@ def run(cfg):
         log.warning("%s (holding the previous frame)", message)
 
     base = app_dir()
-    if not cfg.skip_ffmpeg or (cfg.thumbnail is not None and not seq.is_exr):
-        cfg.ffmpeg = resolve_tool(cfg.ffmpeg, base, "ffmpeg")
+    stills = cfg.thumbnail is not None or cfg.filmstrip is not None
+    if not cfg.skip_ffmpeg or (stills and not seq.is_exr):
+        cfg.ffmpeg = resolve_tool(cfg.ffmpeg, base, "ffmpeg", cfg.tool_sources.get("ffmpeg", ""))
         if cfg.movie and not cfg.skip_ffmpeg:
             check_ffmpeg_filters(cfg)
     work_dir, created_dir = prepare_work_dir(cfg, seq)
@@ -947,7 +1025,8 @@ def run(cfg):
     info = pick = depth = None
     try:
         if seq.is_exr:
-            cfg.oiiotool = resolve_tool(cfg.oiiotool, base, "oiiotool")
+            cfg.oiiotool = resolve_tool(cfg.oiiotool, base, "oiiotool",
+                                        cfg.tool_sources.get("oiiotool", ""))
             setup_ocio(cfg)
             # header of the first frame: channels, fps, timecode, reel and {meta:...} all
             # come from there
@@ -998,7 +1077,7 @@ def run(cfg):
             elif cfg.oiio_transform is not None:
                 cfg.oiio_transform_args = choose_transform(cfg, seq, info)
             if not cfg.movie:
-                return make_thumbnail_only(cfg, seq, info, pick, depth, exit_code)
+                return make_stills_only(cfg, seq, info, pick, depth, exit_code, work_dir)
             if cfg.preview:
                 preview_frame = choose_preview_frame(cfg, seq)
                 result = convert_preview_frame(cfg, seq, preview_frame, pick, work_dir, depth)
@@ -1027,7 +1106,7 @@ def run(cfg):
                 log.warning("-clf only applies to EXR input (oiiotool); %s frames are used as "
                             "they are.", seq.ext.lstrip("."))
             if not cfg.movie:
-                return make_thumbnail_only(cfg, seq, info, pick, depth, exit_code)
+                return make_stills_only(cfg, seq, info, pick, depth, exit_code, work_dir)
             if cfg.alpha == "keep" and not cfg.skip_ffmpeg:
                 source_fmt = probe_frame(cfg.ffmpeg, available[seq.start], cfg.verbose)
                 cfg.alpha_active = has_alpha(source_fmt.pix_fmt)
@@ -1038,9 +1117,10 @@ def run(cfg):
         if cfg.skip_ffmpeg:
             log.info("Skipping ffmpeg; intermediate files are in %s%s", work_dir,
                      " (no slate: ffmpeg draws it)" if cfg.slate else "")
-            if cfg.thumbnail is not None:
-                make_thumbnail_only(cfg, seq, info, pick, depth, exit_code,
-                                    sizes=frame_sizes(available) if seq.is_exr else None)
+            if stills:
+                make_stills_only(cfg, seq, info, pick, depth, exit_code, work_dir,
+                                 sizes=frame_sizes(available) if seq.is_exr else None,
+                                 available=available)
             return exit_code
 
         if cfg.alpha_active:
@@ -1088,6 +1168,7 @@ def run(cfg):
         created_files.append(list_file)
         frame_files = ([available[preview_frame]] if cfg.preview
                        else fill_holes(seq.full_range, available))
+        slate_file = None
         fmt = probe_frames(cfg.ffmpeg, available, cfg.verbose) if (cfg.slate or cfg.letterbox) else None
         if cfg.letterbox:
             width, height = movie_size(fmt, cfg.par_in, cfg.par_out_value, scale_width)
@@ -1135,6 +1216,10 @@ def run(cfg):
             make_thumbnail(cfg, seq, info, pick, depth,
                            frame_sizes(available) if seq.is_exr else None,
                            output_context(cfg, seq, info, timecode, reel_name), movie_output=output)
+        if cfg.filmstrip is not None:
+            make_filmstrip(cfg, seq, pick, depth, work_dir,
+                           output_context(cfg, seq, info, timecode, reel_name), movie_output=output,
+                           available=available, slate_file=slate_file)
         return exit_code
     finally:
         if cfg.temp_keep:
@@ -1231,7 +1316,8 @@ def resolve_path_template(template, seq, default_name, ext, ext_re, label, conte
             log.warning("%s ends in %s but the format is .%s; the file name decides, so the "
                         "settings for .%s may not fit.", label, suffix, ext, ext)
     if template != path:
-        log.info('%s: "%s" -> %s', "Output" if label == "-o" else "Thumbnail path", template, path)
+        log.info('%s: "%s" -> %s', {"-o": "Output", "-of": "Filmstrip path"}.get(label, "Thumbnail path"),
+                 template, path)
     return Path(path)
 
 
@@ -1338,17 +1424,23 @@ def frame_sizes(available):
     return sizes
 
 
-def make_thumbnail_only(cfg, seq, info, pick, depth, exit_code, sizes=None):
-    """Thumbnail without a movie (-ot without -o, or -skipffmpeg): the keywords of the movie's
-    context are resolved here, as the movie step did not run."""
+def make_stills_only(cfg, seq, info, pick, depth, exit_code, work_dir, sizes=None, available=None):
+    """Thumbnail and/or filmstrip without a movie (-ot / -of without -o, or -skipffmpeg): the
+    keywords of the movie's context are resolved here, as the movie step did not run."""
     cfg.par_in = resolve_par(cfg, quiet=True)[0]
     cfg.fps = resolve_fps(cfg, info)[0]
     timecode = resolve_timecode(cfg, seq, info, seq.start)[0]
     reel_name = resolve_reel_name(cfg, seq, info, timecode)[0] if cfg.reelid_source != "off" else ""
     if not cfg.movie:
-        log.info("No -o: only the thumbnail is made (add -o ./ for the movie as well).")
-    make_thumbnail(cfg, seq, info, pick, depth, sizes,
-                   output_context(cfg, seq, info, timecode, reel_name))
+        what = " and ".join(name for name, item in (("thumbnail", cfg.thumbnail),
+                                                    ("filmstrip", cfg.filmstrip)) if item is not None)
+        log.info("No -o: only the %s %s made (add -o ./ for the movie as well).", what,
+                 "are" if " and " in what else "is")
+    context = output_context(cfg, seq, info, timecode, reel_name)
+    if cfg.thumbnail is not None:
+        make_thumbnail(cfg, seq, info, pick, depth, sizes, context)
+    if cfg.filmstrip is not None:
+        make_filmstrip(cfg, seq, pick, depth, work_dir, context, available=available)
     return exit_code
 
 
@@ -1381,6 +1473,96 @@ def make_thumbnail(cfg, seq, info, pick, depth, sizes, context, movie_output=Non
         run_tool(cmd, "ffmpeg (thumbnail)", cfg.verbose)
     log.info("Thumbnail: frame %d (%s), %s -> %s", frame, how, preset.describe().split(", ", 1)[1],
              path)
+    return path
+
+
+_FILMSTRIP_EXT_RE = re.compile(r"^\.(?:jpg|jpeg)$", re.I)
+
+
+def filmstrip_plan(preset, seq, movie_output, available, slate_file, movie_has_slate):
+    """(source, slate wanted and possible, frames) after checking what this run has."""
+    source = preset.source
+    if source == "movie" and movie_output is None:
+        log.warning("Filmstrip: -filmstrip_source movie needs the movie (-o, without -skipffmpeg); "
+                    "using the source frames.")
+        source = "source"
+    if source == "intermediates":
+        if not seq.is_exr:
+            log.info("Filmstrip: %s input has no intermediates; the source frames are used.",
+                     seq.ext.lstrip("."))
+            source = "source"
+        elif not available:
+            log.warning("Filmstrip: -filmstrip_source intermediates needs the movie's converted "
+                        "frames (-o or -skipffmpeg); using the source frames.")
+            source = "source"
+    slate = False
+    if preset.slate:
+        slate = movie_has_slate if source == "movie" else slate_file is not None
+        if not slate:
+            log.warning("Filmstrip: no slate in this run%s; all tiles are frames.",
+                        " (-skipffmpeg makes none)" if available and movie_output is None else "")
+    count = preset.layout()[0]
+    pool = sorted(available) if source == "intermediates" else seq.frames
+    frames = fs.choose_frames(pool, count - 1 if slate else count)
+    return source, slate, frames
+
+
+def make_filmstrip(cfg, seq, pick, depth, work_dir, context, movie_output=None, available=None,
+                   slate_file=None):
+    """Write the filmstrip jpg; returns its path. available: {frame: file} the movie was made
+    from (EXR: the intermediates); slate_file: the movie's slate image, if any."""
+    preset = cfg.filmstrip
+    count = preset.layout()[0]
+    source, slate, frames = filmstrip_plan(preset, seq, movie_output, available, slate_file,
+                                           bool(cfg.slate))
+    name = seq.clean_name or seq.folder.name or "filmstrip"
+    context = dict(context, ext=preset.ext)
+    default_folder = movie_output.parent if movie_output is not None else seq.folder
+    path = resolve_path_template(cfg.filmstrip_output or "", seq, "{}_filmstrip.{}".format(
+        name, preset.ext), preset.ext, _FILMSTRIP_EXT_RE, "-of", context, default_folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    used = len(frames) + (1 if slate else 0)
+    if used < count:
+        log.info("Filmstrip: %d frames for %d tiles; the rest stay black.", len(frames),
+                 count - (1 if slate else 0))
+    failed = []
+    if source == "movie":
+        lead = 1 if cfg.slate else 0
+        indices = ([0] if slate else []) + [lead + f - seq.start for f in frames]
+        run_tool(fs.ffmpeg_movie_command(cfg.ffmpeg, movie_output, indices, path, preset,
+                                         cfg.par_out_value), "ffmpeg (filmstrip)", cfg.verbose)
+    elif seq.is_exr:
+        chans = fs.channel_args(alpha=bool(pick is not None and pick.alpha and depth is None),
+                                mono=bool(depth is None and pick is not None and not pick.alpha
+                                          and len(pick.without_alpha) == 1))
+        jobs = [("the slate", slate_file, chans)] if slate else []
+        if source == "intermediates":
+            jobs += [("frame {}".format(f), available[f], chans) for f in frames]
+        else:
+            # the tile size replaces the movie's -width resize (one resize, not two)
+            mid = fs.source_tile_args(process_args(replace(cfg, width=0), pick, depth)) + chans
+            jobs += [("frame {}".format(f), seq.path(f), mid) for f in frames]
+        failed = fs.render_oiiotool(cfg.oiiotool, jobs, path, preset, work_dir, cfg.par_in,
+                                    workers=cfg.workers, verbose=cfg.verbose, keep=cfg.temp_keep,
+                                    name=name)
+    else:
+        files = ([slate_file] if slate else []) + [seq.path(f) for f in frames]
+        list_file = Path(work_dir) / "{}.filmstrip.ffconcat.txt".format(name)
+        write_concat_list(files, Fraction(25), list_file)
+        try:
+            run_tool(fs.ffmpeg_files_command(cfg.ffmpeg, list_file, path, preset, cfg.par_in),
+                     "ffmpeg (filmstrip)", cfg.verbose)
+        finally:
+            if not cfg.temp_keep:
+                try:
+                    list_file.unlink()
+                except OSError:
+                    pass
+    log.info("Filmstrip: %s%d frames (%s) from the %s%s, %s -> %s", "slate + " if slate else "",
+             len(frames), format_frames(frames) if len(frames) <= 8 else "{}-{} evenly spaced".format(
+                 frames[0], frames[-1]) if frames else "none", source,
+             "; failed: {}".format(", ".join(failed)) if failed else "",
+             preset.describe().rsplit(", from the", 1)[0], path)
     return path
 
 
@@ -1499,7 +1681,7 @@ def main(argv=None):
     setup_logging(ns.verbose)
     try:
         if ns.ocio_info:
-            return show_ocio_info(ns)
+            return show_ocio_info(ns, presets)
         if not ns.i:
             raise TranscodeError("-i is required: any file of the input sequence.")
         if presets is None:

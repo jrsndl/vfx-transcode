@@ -26,6 +26,7 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - Frame rate and timecode from an argument or the EXR header, with a switch for which one wins; timecode is written as a real timecode track in mov/mp4/mxf.
 - Metadata: your own `KEY=VALUE` tags, optional copying from the EXR header, and metadata presets (`review`, `conform`, `client`, `delivery`, `archive`); `delivery` writes the tags delivery specs ask for (source frame rate, frame range, slate length, display colour, burn-ins present).
 - Keywords from the sequence name: version, name parts, your own regex tokens (`{shot}`, `{task}` …), and per-project smart token presets (conditions, regex replacement, case change) for burn-ins, slate, metadata, output paths and transform conditions.
+- Tool paths (ffmpeg, ffprobe, oiiotool) from the command line or the presets file's `tools` section, with environment variables expanded; falls back to the `PATH`.
 - Checks before converting that ffmpeg has the filters the movie needs (e.g. `drawtext` for burn-ins and the slate).
 - Reel name for conforming (explicit, or from the EXR `owner` or any other attribute), written into the mov timecode track and mxf source package.
 - Burn-ins in six places (corners plus top/bottom centre) and a centred watermark, with name, frame counter, frame range, running timecode, fps and date; colour, opacity, size and black box per preset or per place.
@@ -33,6 +34,7 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - Alpha: dropped by default, or kept into ProRes 4444 (or any alpha codec), straight or premultiplied.
 - A tuner app (PySide6) to tune presets by eye on a test frame, with compare image and copy-paste output: see [docs/TUNER.md](docs/TUNER.md).
 - Thumbnails (jpg/png) with the same look as the movie, from the middle, first, last or busiest frame; or thumbnails only.
+- Filmstrip: one jpg of evenly spaced frames in equal tiles (default 24 tiles of 480x270 in one row, black-padded), same look as the thumbnail; tiles from the source frames, oiiotool's intermediates or the encoded movie (with burn-ins), optional slate as the first tile; grid, tile count, tile size and jpg quality from presets or the command line; its own view in the tuner.
 - VFX slate: one frame before the pictures (frame and timecode start − 1), same size and pixel aspect as the pictures, with a shot thumbnail and rows from presets, header values or the command line.
 
 ## Layout
