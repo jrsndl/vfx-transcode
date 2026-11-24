@@ -41,7 +41,7 @@ from .presets import DEFAULT_PRESETS_FILE, load_presets
 from .letterbox import (DEFAULT_FILL as LB_FILL, DEFAULT_LINE_COLOR as LB_LINE_COLOR,
                         DEFAULT_RATIO as LB_DEFAULT_RATIO, LetterboxSpec, parse_ratio, parse_rgba,
                         plan as letterbox_plan)
-from .smart_tokens import evaluate_preset as evaluate_smart_tokens
+from .smart_tokens import evaluate_preset as evaluate_smart_tokens, parse_smart_token_presets
 from .names import (NAME_KEYWORDS, DEFAULT_VERSION_REGEX, compile_version_regex, custom_tokens,
                     merge_rules, name_tokens)
 from .transforms import INPUT_KEYWORDS, input_tokens, select as select_transform, transform_args
@@ -314,6 +314,10 @@ def build_parser(presets=None, presets_error=None):
                    help='Smart tokens preset from the presets file: per-project keyword rules '
                         '(conditions, regex, replacement, case), or "none". Default: the file\'s '
                         "default_smart_tokens")
+    g.add_argument("-smart_tokens_def", default=None, metavar="JSON",
+                   help="Smart token definitions given directly, as JSON: a list like the "
+                        "\"tokens\" of a smart tokens preset. Wins over -smart_tokens. Used by "
+                        "the tuner for definitions edited on its Tokens tab")
     g.add_argument("-metadata_preset", default=None, metavar="NAME",
                    help='Metadata preset from the presets file (tags, copy rules, reel name and '
                         'timecode settings), or "none". The options below override its values')
@@ -779,8 +783,11 @@ def config_from_args(ns, presets):
     letterbox = letterbox_from_args(ns)
     alpha_mode = check_alpha_args(ns, preset)
     name_rules = merge_rules(presets.name_rules, ns.name_token)
-    smart_tokens = presets.get_smart_tokens(
-        ns.smart_tokens if ns.smart_tokens is not None else presets.default_smart_tokens)
+    if ns.smart_tokens_def:
+        smart_tokens = smart_tokens_from_json(ns.smart_tokens_def)
+    else:
+        smart_tokens = presets.get_smart_tokens(
+            ns.smart_tokens if ns.smart_tokens is not None else presets.default_smart_tokens)
     token_names = tuple(name_rules) + tuple(smart_tokens.names() if smart_tokens else ())
     if ns.o.strip():
         check_output_template(ns.o, extra=token_names)
@@ -1178,6 +1185,21 @@ def add_custom_tokens(cfg, seq, info=None):
     if cfg.smart_tokens is not None:
         context = smart_token_context(cfg, seq, info)
         cfg.name_tokens.update(evaluate_smart_tokens(cfg.smart_tokens, context, md.expand))
+
+
+def smart_tokens_from_json(text):
+    """-smart_tokens_def: a JSON list of definitions (or {"tokens": [...]}) -> a preset named
+    "-smart_tokens_def"; None for an empty list."""
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise TranscodeError("-smart_tokens_def is not valid JSON: {}".format(exc))
+    if isinstance(data, dict):
+        data = data.get("tokens", [])
+    if not data:
+        return None
+    return parse_smart_token_presets({"-smart_tokens_def": {"tokens": data}}, "command line")[
+        "-smart_tokens_def"]
 
 
 def smart_token_context(cfg, seq, info):

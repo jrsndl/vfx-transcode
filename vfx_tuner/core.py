@@ -446,7 +446,8 @@ def filmstrip_json(state):
 
 # --- saving named presets (presets_store) ---
 
-PRESET_AREAS = OrderedDict([("colour", "Colour"), ("transform", "ffmpeg transform"),
+PRESET_AREAS = OrderedDict([("colour", "Colour"), ("smart_tokens", "Smart tokens"),
+                            ("transform", "ffmpeg transform"),
                             ("transform_sequence", "oiiotool transform"), ("burnin", "Burn-in"),
                             ("slate", "Slate"), ("filmstrip", "Filmstrip")])
 COLOUR_STATE_FIELDS = OrderedDict([("ci", "colorin"), ("co", "colorout"), ("display", "display"),
@@ -490,7 +491,8 @@ def preset_names(presets, area):
         return []
     return list({"colour": presets.colours, "transform": presets.ff_transforms,
                  "transform_sequence": presets.transforms, "burnin": presets.burnins,
-                 "slate": presets.slates, "filmstrip": presets.filmstrips}[area])
+                 "slate": presets.slates, "filmstrip": presets.filmstrips,
+                 "smart_tokens": presets.smart_tokens}[area])
 
 
 def preset_notes(presets, area, name, sub=None):
@@ -502,7 +504,8 @@ def preset_notes(presets, area, name, sub=None):
         found = next((s for s in t.subs if s.name == sub), None) if t else None
         return found.description if found else (t.description if t else "")
     table = {"colour": presets.colours, "transform": presets.ff_transforms,
-             "burnin": presets.burnins, "slate": presets.slates, "filmstrip": presets.filmstrips}[area]
+             "burnin": presets.burnins, "slate": presets.slates, "filmstrip": presets.filmstrips,
+             "smart_tokens": presets.smart_tokens}[area]
     found = table.get(name)
     return getattr(found, "notes", "") if found else ""
 
@@ -524,6 +527,8 @@ def preset_entry(state, area, presets=None, notes="", sub=None):
         data = slate_json(state.slate)
     elif area == "filmstrip":
         data = filmstrip_json(state.filmstrip)
+    elif area == "smart_tokens":
+        data = tokens_json(state.tokens)
     else:
         raise KeyError(area)
     data["notes"] = notes
@@ -548,6 +553,9 @@ def mark_saved(state, area, name, sub=None):
         state.slate.preset = name
     elif area == "filmstrip":
         state.filmstrip.preset = name
+    elif area == "smart_tokens":
+        t = state.tokens
+        t.preset, t.loaded = name, [OrderedDict(r) for r in t.rows]
 
 
 # letterbox
@@ -756,6 +764,92 @@ class TunerState:
     filmstrip: FilmstripState = field(default_factory=FilmstripState)
     ff_transform: FFTransformState = field(default_factory=FFTransformState)
     oiio_letterbox: LetterboxState = field(default_factory=LetterboxState)     # oiiotool
+    tokens: "TokensState" = field(default_factory=lambda: TokensState())
+
+
+# --- smart tokens (Tokens tab) ---
+
+TOKEN_COLUMNS = ("name", "conditions", "source", "regex", "repl", "mode", "case", "notes")
+TOKEN_MODES = ("extract", "replace")
+TOKEN_CASES = ("as_is", "lower", "upper", "title")
+
+
+@dataclass
+class TokensState:
+    """The Tokens tab: a smart tokens preset ("none" = off, "" = the file's default) and its
+    definitions, as JSON-like dicts, editable. Unchanged from the loaded preset, the preset
+    is named (-smart_tokens NAME); edited, the definitions go as -smart_tokens_def JSON."""
+    preset: str = ""
+    rows: List[dict] = field(default_factory=list)
+    loaded: List[dict] = field(default_factory=list)
+
+
+def token_row(token):
+    """A smart_tokens.SmartToken as the dict presets.json holds (default fields left out)."""
+    row = OrderedDict([("name", token.name)])
+    if token.conditions:
+        row["conditions"] = [OrderedDict([("left", c.left), ("op", c.op), ("right", c.right)])
+                             for c in token.conditions]
+    if token.source != "{clean_name}":
+        row["source"] = token.source
+    for key, default in (("regex", ""), ("repl", ""), ("mode", "extract"), ("case", "as_is"),
+                         ("notes", "")):
+        value = getattr(token, key)
+        if value != default:
+            row[key] = value
+    return row
+
+
+def tokens_from_preset(presets, name):
+    """TokensState for a preset name ("none", "" = the file's default)."""
+    if presets is None:
+        return TokensState(preset=name)
+    real = name or presets.default_smart_tokens
+    preset = presets.smart_tokens.get(real) if real and real != "none" else None
+    rows = [token_row(t) for t in preset.tokens] if preset else []
+    return TokensState(preset=name, rows=[OrderedDict(r) for r in rows],
+                       loaded=[OrderedDict(r) for r in rows])
+
+
+def conditions_text(conditions):
+    """[{left, op, right}] -> "{namesplit-2} == plate; {x} != y" for one table cell."""
+    return "; ".join("{} {} {}".format(c["left"], c["op"], c["right"]).strip() for c in conditions or [])
+
+
+def parse_conditions(text):
+    """The cell text back to [{left, op, right}]; "==" or "!=" in each part, ; between."""
+    out = []
+    for part in (text or "").split(";"):
+        if not part.strip():
+            continue
+        found = [(part.find(op), op) for op in ("==", "!=") if op in part]
+        if not found:
+            raise ValueError('condition "{}" needs == or !='.format(part.strip()))
+        index, op = min(found)
+        out.append(OrderedDict([("left", part[:index].strip()), ("op", op),
+                                ("right", part[index + len(op):].strip())]))
+    return out
+
+
+def tokens_args(t):
+    """-smart_tokens NAME while the definitions are the loaded preset's; else the edited
+    definitions as -smart_tokens_def JSON ("none" when there are none)."""
+    if [dict(r) for r in t.rows] == [dict(r) for r in t.loaded]:
+        return ["-smart_tokens", t.preset] if t.preset else []
+    if not t.rows:
+        return ["-smart_tokens", "none"]
+    return ["-smart_tokens_def", json.dumps(t.rows, separators=(",", ":"), ensure_ascii=False)]
+
+
+def tokens_json(t, notes=""):
+    return OrderedDict([("notes", notes), ("tokens", [OrderedDict(r) for r in t.rows])])
+
+
+def token_values(report, t):
+    """[(name, value or None)] for the token names of the table, from the last preview."""
+    words = (report or {}).get("keywords") or {}
+    names = list(OrderedDict.fromkeys(r.get("name", "") for r in t.rows if r.get("name")))
+    return [(n, words.get(n)) for n in names]
 
 
 # which tools run, by input and output (see vfx_transcode.outseq)
@@ -833,7 +927,7 @@ def pipeline_args(state, presets=None, active_sub=None, cli=False):
     two transform tabs."""
     s = state
     p = pipeline(s.input.input1, s.input.output_type)
-    out = ["-width", "0"]
+    out = ["-width", "0"] + tokens_args(s.tokens)
     if colour_use(s)[0]:
         out += s.input.colour_args()
     if p.oiio:

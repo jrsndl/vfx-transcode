@@ -17,7 +17,8 @@ from .errors import TranscodeError
 # tuner area -> presets file section
 SECTIONS = OrderedDict([("colour", "colour_presets"), ("transform", "ff_transforms"),
                         ("transform_sequence", "oiio_transforms"), ("burnin", "burnin_presets"),
-                        ("slate", "slate_presets"), ("filmstrip", "filmstrip_presets")])
+                        ("slate", "slate_presets"), ("filmstrip", "filmstrip_presets"),
+                        ("smart_tokens", "smart_tokens")])
 RESERVED = {"none", "plain", ""}
 INLINE_WIDTH = 100
 UPDATE_ATTEMPTS = 5
@@ -110,7 +111,8 @@ def exists(presets, area, name, sub=None):
         return False
     table = {"colour": presets.colours, "transform": presets.ff_transforms,
              "transform_sequence": presets.transforms, "burnin": presets.burnins,
-             "slate": presets.slates, "filmstrip": presets.filmstrips}[area]
+             "slate": presets.slates, "filmstrip": presets.filmstrips,
+             "smart_tokens": presets.smart_tokens}[area]
     if name not in table:
         return False
     if area == "transform_sequence":

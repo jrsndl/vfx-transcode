@@ -103,6 +103,11 @@ The **Super-presets** tab under the timeline saves the current settings of sever
   - **When they're used** (the line at the top of the tab says which applies):
     - EXR input to a movie or a display format (JPG, PNG …): always.
     - EXR to EXR, and PNG / JPG / movie frames going through oiiotool (e.g. a movie to EXRs): only with **Convert colour** ticked. Otherwise the tuner leaves out the colour options, and vfx-transcode doesn't convert those.
+- **Tokens**: the smart tokens (see [OPTIONS.md](OPTIONS.md#smart-tokens)), per-project keywords such as `{shot}`, `{task}` or `{client}`, made from the name or other keywords.
+  - **Smart tokens**: *(file default)*, `none` or a preset from the presets file (e.g. `example_project`); picking one loads its definitions. **Save as preset...** saves the table as a smart tokens preset.
+  - **The table**: one row per definition, processed top to bottom (a later row that applies wins; rows can use the tokens above them). Columns: `name` (the keyword it sets), `conditions` (e.g. `{namesplit-2} == plate; {version_string} !=`, all must hold, `;` between), `source` (empty = `{clean_name}`), `regex`, `repl`, `mode` (extract / replace), `case` (as_is / lower / upper / title), `notes`. Hover a column heading for help. **Add**, **Duplicate**, **Remove**, **Up**, **Down**.
+  - Unchanged, the preset is sent by name (`-smart_tokens NAME`); edited, the rows are sent as `-smart_tokens_def JSON`.
+  - **Values in the last preview**: what each token came out as for this input, or *(not set)* when no row applied.
 - **Output**:
   - **Output type** (first): a movie, or an EXR, PNG, JPG, TIF or DPX sequence. It decides which tools run (shown under it) and which tabs are greyed out; see the table above. Choosing another type resets the sequence preset to that format's default.
   - **Encode preset** (movie output): `-preset`; empty = the presets file's default, with its notes. It sets the codec, container and pixel format, so the preview shows e.g. h264's 4:2:0.

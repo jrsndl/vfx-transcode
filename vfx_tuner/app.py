@@ -12,6 +12,7 @@ vfx-transcode prints.
 """
 
 import argparse
+from collections import OrderedDict
 import itertools
 import json
 import os
@@ -215,6 +216,136 @@ class SavePresetDialog(QDialog):
         return (self.name.currentText().strip(),
                 self.sub.currentText().strip() if self.sub is not None else None,
                 self.notes.text().strip())
+
+
+class TokenTable(QWidget):
+    """Smart token definitions: one row each (name, conditions, source, regex, repl, mode,
+    case, notes), processed top to bottom; Add, Duplicate, Remove, Up, Down."""
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.table = QTableWidget(0, len(core.TOKEN_COLUMNS))
+        self.table.setHorizontalHeaderLabels(list(core.TOKEN_COLUMNS))
+        header = self.table.horizontalHeader()
+        for column, width in enumerate((90, 150, 110, 150, 80, 80, 70)):
+            self.table.setColumnWidth(column, width)
+        header.setStretchLastSection(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.itemChanged.connect(lambda _item: self.changed.emit())
+        tips = {"name": "the keyword it sets: shot -> {shot}",
+                "conditions": "all must hold, e.g. {namesplit-2} == plate; {version_string} != "
+                              "(empty right side = empty text); separate with ;",
+                "source": "text to work on, keywords allowed; empty = {clean_name}",
+                "regex": "optional; without one the whole source is the value",
+                "repl": "extract: what the match becomes (empty = group 1); replace: the "
+                        "replacement for every match",
+                "mode": "extract: the first match; replace: replace all matches",
+                "case": "as_is, lower, upper, title", "notes": "free text"}
+        for column, key in enumerate(core.TOKEN_COLUMNS):
+            self.table.horizontalHeaderItem(column).setToolTip(tips[key])
+        buttons = QVBoxLayout()
+        for text, slot in (("Add", self._add), ("Duplicate", self._duplicate),
+                           ("Remove", self._remove), ("Up", lambda: self._move(-1)),
+                           ("Down", lambda: self._move(1))):
+            button = QPushButton(text)
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.table, 1)
+        layout.addLayout(buttons)
+
+    # rows <-> table
+
+    def rows(self):
+        """The definitions as dicts (default fields left out, like presets.json). Raises
+        ValueError for a conditions cell that can't be read."""
+        out = []
+        for row in range(self.table.rowCount()):
+            cell = {key: self._text(row, column) for column, key in enumerate(core.TOKEN_COLUMNS)}
+            item = OrderedDict([("name", cell["name"].strip())])
+            conditions = core.parse_conditions(cell["conditions"])
+            if conditions:
+                item["conditions"] = conditions
+            if cell["source"].strip() and cell["source"].strip() != "{clean_name}":
+                item["source"] = cell["source"]
+            for key, default in (("regex", ""), ("repl", ""), ("mode", "extract"),
+                                 ("case", "as_is"), ("notes", "")):
+                if cell[key] and cell[key] != default:
+                    item[key] = cell[key]
+            out.append(item)
+        return out
+
+    def set_rows(self, rows):
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        for row in rows:
+            self._append(row)
+        self.table.blockSignals(False)
+
+    def _text(self, row, column):
+        widget = self.table.cellWidget(row, column)
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        item = self.table.item(row, column)
+        return item.text() if item else ""
+
+    def _append(self, data, at=None):
+        row = self.table.rowCount() if at is None else at
+        self.table.insertRow(row)
+        for column, key in enumerate(core.TOKEN_COLUMNS):
+            if key in ("mode", "case"):
+                box = combo(core.TOKEN_MODES if key == "mode" else core.TOKEN_CASES)
+                set_combo(box, data.get(key) or ("extract" if key == "mode" else "as_is"))
+                box.currentTextChanged.connect(lambda _t: self.changed.emit())
+                self.table.setCellWidget(row, column, box)
+                continue
+            if key == "conditions":
+                text = core.conditions_text(data.get("conditions"))
+            elif key == "source":
+                text = data.get("source", "")
+            else:
+                text = str(data.get(key, ""))
+            self.table.setItem(row, column, QTableWidgetItem(text))
+
+    def _safe_rows(self):
+        try:
+            return self.rows()
+        except ValueError:
+            return None
+
+    def _add(self):
+        row = self.table.currentRow()
+        self.table.blockSignals(True)
+        self._append({"name": "token"}, row + 1 if row >= 0 else None)
+        self.table.blockSignals(False)
+        self.changed.emit()
+
+    def _duplicate(self):
+        rows, row = self._safe_rows(), self.table.currentRow()
+        if rows is None or row < 0:
+            return
+        rows.insert(row + 1, OrderedDict(rows[row]))
+        self.set_rows(rows)
+        self.table.selectRow(row + 1)
+        self.changed.emit()
+
+    def _remove(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+            self.changed.emit()
+
+    def _move(self, step):
+        rows, row = self._safe_rows(), self.table.currentRow()
+        if rows is None or row < 0 or not 0 <= row + step < len(rows):
+            return
+        rows[row], rows[row + step] = rows[row + step], rows[row]
+        self.set_rows(rows)
+        self.table.selectRow(row + step)
+        self.changed.emit()
 
 
 class PairTable(QWidget):
@@ -766,6 +897,7 @@ class TunerWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         for title, builder in (("Input", self._build_input), ("Color", self._build_colour),
+                               ("Tokens", self._build_tokens),
                                ("Output", self._build_encode),
                                ("Transform Sequence", self._build_transform),
                                ("Transform", self._build_ff_transform),
@@ -1141,6 +1273,89 @@ class TunerWindow(QMainWindow):
         self.in_fps.currentTextChanged.connect(lambda _t: self.timeline.refresh_labels())
         self.in_input2.editingFinished.connect(self._compare_file_changed)
         self.in_compare_source.toggled.connect(lambda _on: self._compare_changed())
+
+    # tokens tab
+
+    def _build_tokens(self, page):
+        layout = QVBoxLayout(page)
+        top = QHBoxLayout()
+        self.tk_preset = compact_combo(QComboBox(), 14)
+        self.tk_preset.setToolTip("Pick a smart tokens preset to load its definitions")
+        self.tk_preset.activated.connect(lambda _i: self._load_tokens())
+        top.addWidget(QLabel("Smart tokens"))
+        top.addWidget(self.tk_preset, 1)
+        top.addWidget(self._save_button("smart_tokens"))
+        layout.addLayout(top)
+        self.tk_notes = QLabel("")
+        self.tk_notes.setWordWrap(True)
+        self.tk_notes.setStyleSheet("color: #8a8a8a;")
+        layout.addWidget(self.tk_notes)
+        help_text = QLabel("Per-project keywords made from the name (or any other keyword): each "
+                           "row sets {name}, top to bottom; a later row that applies wins, and "
+                           "rows can use the tokens above them. A row is skipped when a condition "
+                           "is false, or its regex does not match (extract). Use them anywhere "
+                           "keywords work: output path, burn-ins, slate, metadata.")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        self.tk_table = TokenTable()
+        self.tk_table.changed.connect(self._changed)
+        layout.addWidget(self.tk_table, 1)
+        self.tk_values = QLabel("")
+        self.tk_values.setWordWrap(True)
+        self.tk_values.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        values_box = QGroupBox("Values in the last preview")
+        QVBoxLayout(values_box).addWidget(self.tk_values)
+        layout.addWidget(values_box)
+
+    def _load_tokens(self):
+        name = self.tk_preset.currentData()
+        if name is None:
+            return
+        self.state.tokens = core.tokens_from_preset(self.presets, name)
+        self._fill_tokens()
+        self.status.setText("Smart tokens: {}".format(self.tk_preset.currentText()))
+        self._changed()
+
+    def _fill_token_presets(self):
+        box = self.tk_preset
+        box.blockSignals(True)
+        box.clear()
+        default = (self.presets.default_smart_tokens if self.presets else "") or "none"
+        box.addItem("(file default: {})".format(default), "")
+        box.addItem("none", "none")
+        for name in (self.presets.smart_tokens if self.presets else {}):
+            box.addItem(name, name)
+        index = box.findData(self.state.tokens.preset)
+        box.setCurrentIndex(index if index >= 0 else 0)
+        fit_popup(box)
+        box.blockSignals(False)
+
+    def _fill_tokens(self):
+        t = self.state.tokens
+        self.loading = True
+        index = self.tk_preset.findData(t.preset)
+        self.tk_preset.setCurrentIndex(index if index >= 0 else 0)
+        self.tk_table.set_rows(t.rows)
+        name = t.preset or (self.presets.default_smart_tokens if self.presets else "")
+        preset = self.presets.smart_tokens.get(name) if self.presets and name else None
+        self.tk_notes.setText(preset.notes if preset else "")
+        self.loading = False
+        self._show_token_values()
+
+    def _read_tokens(self):
+        try:
+            self.state.tokens.rows = self.tk_table.rows()
+        except ValueError as exc:
+            self.status.setText("Tokens: {}; that row's conditions are not used yet".format(exc))
+
+    def _show_token_values(self):
+        values = core.token_values(self.report, self.state.tokens)
+        if not self.report:
+            self.tk_values.setText("(after the first preview)")
+            return
+        self.tk_values.setText("   ".join(
+            "{{{}}} = {}".format(name, repr(value) if value is not None else "(not set)")
+            for name, value in values) or "(no smart tokens)")
 
     # color tab
 
@@ -1769,6 +1984,7 @@ class TunerWindow(QMainWindow):
     def _current_preset_name(self, area):
         s = self.state
         return {"colour": s.input.colour_preset, "transform": s.ff_transform.preset,
+                "smart_tokens": s.tokens.preset if s.tokens.preset not in ("", "none") else "",
                 "transform_sequence": s.transform.preset, "burnin": s.burn.preset,
                 "slate": s.slate.preset, "filmstrip": s.filmstrip.preset}[area]
 
@@ -1778,6 +1994,9 @@ class TunerWindow(QMainWindow):
         self._read_all()
         if area == "transform_sequence" and not self.state.transform.args:
             QMessageBox.information(self, "Save preset", "There are no oiiotool steps to save.")
+            return
+        if area == "smart_tokens" and not self.state.tokens.rows:
+            QMessageBox.information(self, "Save preset", "There are no smart token definitions to save.")
             return
         path = self._presets_path()
         presets = self.presets
@@ -1822,7 +2041,7 @@ class TunerWindow(QMainWindow):
             self.state.burn = core.burn_from_preset(self.presets.burnins[name])
             self.state.burn.enabled = enabled
             self._fill_burn()
-        box = {"colour": self.co_preset, "transform": self.ff_preset,
+        box = {"colour": self.co_preset, "transform": self.ff_preset, "smart_tokens": self.tk_preset,
                "transform_sequence": self.tr_preset, "burnin": self.bu_preset,
                "slate": self.sl_preset, "filmstrip": self.fs_preset}[area]
         set_combo(box, name)
@@ -2299,6 +2518,9 @@ class TunerWindow(QMainWindow):
             fit_popup(box)
             box.blockSignals(False)
         self._fill_encode_presets()
+        if not self.state.tokens.rows and not self.state.tokens.preset:
+            self.state.tokens = core.tokens_from_preset(self.presets, "")   # the file's default
+        self._fill_token_presets()
         self.loading = False
         self._transform_preset_selected(self.tr_preset.currentText())
         self._show_encode_notes()
@@ -2337,6 +2559,7 @@ class TunerWindow(QMainWindow):
         self._fill_filmstrip()
         self._fill_letterbox()
         self._fill_metadata()
+        self._fill_tokens()
 
     def _fill_transform(self):
         self.loading = True
@@ -2422,6 +2645,7 @@ class TunerWindow(QMainWindow):
         self.loading = False
 
     def _read_all(self):
+        self._read_tokens()
         i = self.state.input
         i.input1 = self.in_input1.text().strip()
         i.frame = i.frame or "middle"             # set by the timeline; "middle" for a new input
@@ -2598,6 +2822,7 @@ class TunerWindow(QMainWindow):
         self.show_images()
         self._update_compare()
         self._fill_info()
+        self._show_token_values()
         self._update_active_sub()
         self.update_outputs()
         self.status.setText("")

@@ -802,3 +802,36 @@ class CompareTests(unittest.TestCase):
         self.assertTrue(core.compare_is_plain_image("ref.png", "still"))
         self.assertFalse(core.compare_is_plain_image("plate.1001.png", "sequence"))
         self.assertFalse(core.compare_is_plain_image("still.exr", "still"))
+
+
+class TokensTests(unittest.TestCase):
+    def test_load_args_edit(self):
+        t = core.tokens_from_preset(PRESETS, "example_project")
+        self.assertEqual(t.rows[0], {"name": "project", "source": "{namesplit1}", "case": "upper",
+                                     "notes": "first part of the name: ICOI2"})
+        self.assertEqual(core.tokens_args(t), ["-smart_tokens", "example_project"])
+        t.rows[0]["case"] = "lower"
+        args = core.tokens_args(t)
+        self.assertEqual(args[0], "-smart_tokens_def")
+        cfg = parse(args)
+        self.assertEqual(cfg.smart_tokens.tokens[0].case, "lower")
+        self.assertEqual(len(cfg.smart_tokens.tokens), len(t.rows))
+        t.rows = []
+        self.assertEqual(core.tokens_args(t), ["-smart_tokens", "none"])
+        self.assertEqual(core.tokens_args(core.tokens_from_preset(PRESETS, "")), [])   # file default
+        self.assertEqual(core.tokens_from_preset(PRESETS, "none").rows, [])
+
+    def test_conditions_cell(self):
+        conds = [{"left": "{namesplit-2}", "op": "==", "right": "plate"},
+                 {"left": "{version_string}", "op": "!=", "right": ""}]
+        text = core.conditions_text(conds)
+        self.assertEqual(text, "{namesplit-2} == plate; {version_string} !=")
+        self.assertEqual(core.parse_conditions(text), conds)
+        with self.assertRaises(ValueError):
+            core.parse_conditions("{a} is b")
+
+    def test_values_from_report(self):
+        t = core.tokens_from_preset(PRESETS, "example_project")
+        values = dict(core.token_values({"keywords": {"shot": "ICOI2_005_033"}}, t))
+        self.assertEqual(values["shot"], "ICOI2_005_033")
+        self.assertIsNone(values["task"])

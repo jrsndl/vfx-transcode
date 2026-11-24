@@ -54,6 +54,7 @@
 | `-o PATH` | `<input folder>/<name>.<ext>` | Output movie: a file or a folder, with keywords. See [Output path](#output-path) below. `<name>` is the sequence name without its frame number and separator (`shot_010.1001.exr` → `shot_010`). |
 | `-version_regex REGEX` | `_v(\d\d\d)` | How the version is found in the sequence name for the [name keywords](#name-keywords). |
 | `-smart_tokens NAME` | the presets file's `default_smart_tokens` (`none`) | A [smart tokens](#smart-tokens) preset: per-project keyword rules with conditions, regex replacement and case change. `none` means none. |
+| `-smart_tokens_def JSON` | *(none)* | Smart token definitions given directly: a JSON list like a preset's `tokens`, e.g. `-smart_tokens_def "[{\"name\":\"client\",\"source\":\"acme\",\"case\":\"upper\"}]"`. Wins over `-smart_tokens`. The tuner sends this when its Tokens tab is edited. |
 | `-name_token NAME=REGEX` | the presets file's `name_tokens` | A [custom keyword](#custom-name-tokens) `{NAME}` cut out of the sequence name by a regex. Repeatable; `NAME=` removes one from the presets file. |
 
 **How the sequence is found.** The frame number is the run of digits at the end of the file name, just before the extension:

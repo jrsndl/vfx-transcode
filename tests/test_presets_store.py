@@ -133,3 +133,15 @@ class PresetsStoreTests(unittest.TestCase):
         self.assertTrue(ps.exists(presets, "transform_sequence", "someotherproject", "1080p"))
         self.assertFalse(ps.exists(presets, "transform_sequence", "someotherproject", "x"))
         self.assertTrue(ps.exists(presets, "colour", "rec709_to_acescg"))
+
+
+class SmartTokensStoreTests(PresetsStoreTests):
+    def test_smart_tokens_round_trip(self):
+        presets = load_presets(str(self.path))
+        state = core.TunerState()
+        state.tokens = core.tokens_from_preset(presets, "example_project")
+        state.tokens.rows.append({"name": "client", "source": "acme", "case": "upper"})
+        presets, _ = self.save(state, "smart_tokens", "acme", "for ACME")
+        loaded = core.tokens_from_preset(presets, "acme")
+        self.assertEqual(loaded.rows, state.tokens.rows)
+        self.assertEqual(presets.smart_tokens["acme"].notes, "for ACME")
