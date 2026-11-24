@@ -513,7 +513,11 @@ colorspaces:
         import tempfile
         folder = Path(tempfile.mkdtemp())
         (folder / "config.ocio").write_text("roles:\n  default: raw\ncolorspaces:\n  - !<ColorSpace>\n    name: raw\n")
-        info = core.scan_ocio(str(folder / "config.ocio"))     # no oiiotool here: read the file
+        from unittest import mock
+        # the file reader, as when oiiotool is not installed (an installed oiiotool would
+        # list its own built-in colour spaces for this tiny config)
+        with mock.patch.object(core, "tool_path", return_value=None):
+            info = core.scan_ocio(str(folder / "config.ocio"))
         self.assertEqual(info.colorspaces, ["raw"])
 
 
