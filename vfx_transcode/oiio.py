@@ -47,23 +47,39 @@ def process_args(cfg, pick, depth=None):
         if cfg.oiio_transform_args is not None:
             # transform preset: on the scene-linear (and still premultiplied) image
             args += cfg.oiio_transform_args
-        if pick.alpha:
+        if pick.alpha and not cfg.skip_colour:
             # EXR colour is premultiplied: resize as it is, then divide by alpha so the colour
             # transform sees straight colour. The intermediates stay straight (as PNG expects);
             # ffmpeg premultiplies again with -alpha_premult 1.
             if cfg.width > 0 and cfg.oiio_transform_args is None:
                 args += ["--resize", "{}x0".format(cfg.width)]
             args += ["--unpremult"]
-        args += colour_args(cfg)
+        if not cfg.skip_colour:
+            args += colour_args(cfg)
     if depth is not None and cfg.oiio_transform_args is not None:
         args += cfg.oiio_transform_args
-    elif cfg.width > 0 and cfg.oiio_transform_args is None and not (depth is None and pick.alpha):
+    elif (cfg.width > 0 and cfg.oiio_transform_args is None
+          and not (depth is None and pick.alpha and not cfg.skip_colour)):
         args += ["--resize", "{}x0".format(cfg.width)]
     args += cfg.oiio_command
     if cfg.mezzanine_ext != ".exr":
         # 8-bit is fast and enough for an 8-bit h264; 16-bit is opt-in for 10-bit codecs
         args += ["-d", "uint16" if cfg.mezzanine_16bit else "uint8"]
     return args
+
+
+def plain_args(cfg):
+    """oiiotool steps for input that is not EXR (PNG, JPG, a movie's frames): the OIIO
+    transform (or the -width resize), colour only when -ci / -co / -display / -view was given
+    (the frames are display-referred already), -oiio_command."""
+    args = ["--ch", cfg.alpha_strip] if cfg.alpha_strip else []
+    if cfg.oiio_transform_args is not None:
+        args += cfg.oiio_transform_args
+    elif cfg.width > 0:
+        args += ["--resize", "{}x0".format(cfg.width)]
+    if cfg.colour_given and not cfg.skip_colour and not cfg.clf:
+        args += colour_args(cfg)
+    return args + list(cfg.oiio_command)
 
 
 def colour_args(cfg):
@@ -85,37 +101,68 @@ def per_file_command(cfg, src, dst, mid):
     return [cfg.oiiotool, "-i", _posix(src)] + mid + ["-o", _posix(dst)]
 
 
-def batch_patterns(seq, work_dir, ext):
-    wildcard = "%0{}d".format(seq.zfill)
-    return (_posix(seq.folder / (seq.base + wildcard + seq.ext)),
-            _posix(Path(work_dir) / (seq.base + wildcard + ext)))
+class _Target:
+    """Where converted frames go: the intermediates (work_dir, the input's name and padding, the
+    mezzanine format) or an output sequence (outseq.OutputSeq)."""
+
+    def __init__(self, folder, base, zfill, ext):
+        self.folder, self.base, self.zfill, self.ext = Path(folder), base, zfill, ext
+
+    def name(self, frame):
+        return "{}{:0{}d}{}".format(self.base, frame, self.zfill, self.ext)
+
+    def path(self, frame):
+        return self.folder / self.name(frame)
 
 
-def batch_command(cfg, seq, work_dir, first, last, mid):
-    src, dst = batch_patterns(seq, work_dir, cfg.mezzanine_ext)
+def _target(cfg, seq, work_dir, target=None):
+    if target is not None:
+        return _Target(target.folder, target.base, target.zfill, target.ext)
+    return _Target(work_dir, seq.base, seq.zfill, cfg.mezzanine_ext)
+
+
+def batch_patterns(seq, target, ext=None):
+    """(source pattern, target pattern). target: a _Target, or a folder (with ext) for the
+    intermediates."""
+    if not isinstance(target, _Target):
+        target = _Target(target, seq.base, seq.zfill, ext)
+    return (_posix((seq.frames_folder or seq.folder) / (seq.base + "%0{}d".format(seq.zfill) + seq.ext)),
+            _posix(target.folder / (target.base + "%0{}d".format(target.zfill) + target.ext)))
+
+
+def batch_command(cfg, seq, work_dir, first, last, mid, target=None):
+    src, dst = batch_patterns(seq, _target(cfg, seq, work_dir, target))
     cmd = [cfg.oiiotool, "--frames", "{}-{}".format(first, last), "--parallel-frames"]
     if cfg.oiio_threads > 0:
         cmd += ["--threads", str(cfg.oiio_threads)]
     return cmd + ["-i", src] + mid + ["-o", dst]
 
 
-def can_batch(cfg, seq, work_dir):
+def can_batch(cfg, seq, work_dir, target=None):
     if cfg.oiio_per_file or not seq.numbered:
         return False
-    plain_src = _posix(seq.folder / (seq.base + seq.ext))
-    plain_dst = _posix(Path(work_dir) / seq.base)
+    out = _target(cfg, seq, work_dir, target)
+    plain_src = _posix((seq.frames_folder or seq.folder) / (seq.base + seq.ext))
+    plain_dst = _posix(out.folder / out.base)
     # a literal %, # or @ in the path would be read as a frame wildcard
     return not any(ch in plain_src + plain_dst for ch in _WILDCARD_CHARS)
 
 
-def convert_sequence(cfg, seq, pick, work_dir, depth=None):
+def convert_sequence(cfg, seq, pick, work_dir, depth=None, target=None, mid=None, per_frame=None):
     """Convert all present frames. Never raises for individual frame failures;
-    those are returned in ConversionResult.failed."""
+    those are returned in ConversionResult.failed.
+    target: an output sequence (outseq.OutputSeq) instead of the intermediates in work_dir;
+    mid: the oiiotool steps, instead of process_args;
+    per_frame: frame -> extra oiiotool arguments for that frame (e.g. its timecode). oiiotool's
+    --frames batch can't vary them, so the frames are then converted one file at a time."""
     work_dir = Path(work_dir)
-    ext = cfg.mezzanine_ext
-    mid = process_args(cfg, pick, depth)
+    out = _target(cfg, seq, work_dir, target)
+    ext = out.ext
+    if mid is None:
+        mid = process_args(cfg, pick, depth)
     result = ConversionResult()
-    target = {f: work_dir / seq.name(f, ext) for f in seq.frames}
+    out_target = target
+    target = {f: out.path(f) for f in seq.frames}
 
     # stale files from an earlier kept run must not be mistaken for fresh output
     for path in target.values():
@@ -124,13 +171,13 @@ def convert_sequence(cfg, seq, pick, work_dir, depth=None):
 
     start = perf_counter()
     pending = []
-    if can_batch(cfg, seq, work_dir):
+    if per_frame is None and can_batch(cfg, seq, work_dir, out_target):
         for first, last in seq.runs():
             frames = range(first, last + 1)
             if first == last:
                 pending.append(first)
                 continue
-            cmd = batch_command(cfg, seq, work_dir, first, last, mid)
+            cmd = batch_command(cfg, seq, work_dir, first, last, mid, out_target)
             log.info("Converting frames %d-%d with oiiotool --parallel-frames", first, last)
             try:
                 run_tool(cmd, "oiiotool", cfg.verbose)
@@ -146,19 +193,21 @@ def convert_sequence(cfg, seq, pick, work_dir, depth=None):
         pending = list(seq.frames)
 
     if pending:
-        _convert_per_file(cfg, seq, pending, target, mid, result)
+        _convert_per_file(cfg, seq, pending, target, mid, result, per_frame)
 
     log.info("Conversion to %s took %.2f seconds", ext[1:], perf_counter() - start)
     return result
 
 
-def _convert_per_file(cfg, seq, frames, target, mid, result):
+def _convert_per_file(cfg, seq, frames, target, mid, result, per_frame=None):
     total = len(frames)
-    log.info("Converting %d file(s) one by one with %d threads", total, cfg.workers)
+    log.info("Converting %d file(s) one by one with %d threads%s", total, cfg.workers,
+             " (each frame gets its own attributes)" if per_frame else "")
 
     def convert(frame):
         t0 = perf_counter()
-        run_tool(per_file_command(cfg, seq.path(frame), target[frame], mid), "oiiotool", cfg.verbose)
+        steps = list(mid) + (per_frame(frame) if per_frame else [])
+        run_tool(per_file_command(cfg, seq.path(frame), target[frame], steps), "oiiotool", cfg.verbose)
         return perf_counter() - t0
 
     done = 0

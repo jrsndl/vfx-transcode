@@ -764,6 +764,87 @@ if not exist "%OUT%\44_ICOI2_comp_v000.mov" (
 )
 
 echo.
+echo ==== 45  movie input: the mov of test 44 as input - slate, burn-ins, preview of one frame, a super-preset ====
+> "%OUT%\45_super_presets.json" echo {"super_presets": {"t45": {"notes": "test", "areas": {"letterbox": {"state": {}, "args": ["-letterbox", "1", "-letterbox_ratio", "2.39"]}}}}}
+"%PY%" vfx-transcode.py -i "%OUT%\44_ICOI2_comp_v000.mov" -o "%OUT%\45_from_movie.mp4" ^
+  -slate generic -burn_preset none -burn_tl "{clean_name} {current_frame} {tc}" ^
+  -super_presets_file "%OUT%\45_super_presets.json" -super_preset t45 ^
+  -of "%OUT%\45_from_movie_strip" -filmstrip_tiles 6 > "%OUT%\45_movie_input.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py -i "%OUT%\44_ICOI2_comp_v000.mov" -preview "%OUT%\45_preview.png" ^
+  -thumbnail_frame 1003 -burn_preset none -burn_tl "{current_frame} {tc}" >> "%OUT%\45_movie_input.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+type "%OUT%\45_movie_input.log"
+call :check %RC% "45 movie input"
+call :expect "%OUT%\45_movie_input.log" "Input: movie" "45 movie probed"
+call :expect "%OUT%\45_movie_input.log" "frames numbered 1001-" "45 movie frame numbers"
+call :expect "%OUT%\45_movie_input.log" " (movie)" "45 movie frame rate and timecode from the movie"
+call :expect "%OUT%\45_movie_input.log" "Movie: unpacking frame 1003" "45 preview unpacks one frame"
+call :expect "%OUT%\45_movie_input.log" "Letterbox" "45 super-preset letterbox"
+if not exist "%OUT%\45_from_movie.mp4" (
+  >> "%SUMMARY%" echo [FAIL] 45 movie input - 45_from_movie.mp4 missing
+  set /a FAILED+=1
+)
+if exist "%OUT%\45_from_movie.mp4" (>> "%SUMMARY%" echo [INFO] 45 movie input - check 45_from_movie.mp4: slate, burn-in frame numbers from 1001, 2.39 letterbox; 45_preview.png shows frame 1003)
+
+echo.
+echo ==== 46  image sequence output: EXR to JPG and EXR to EXR with oiiotool only, trimmed, oiiotool letterbox ====
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\46_jpg\{clean_name}.####.jpg" -in 1002 -out 1004 -width 0 ^
+  -oiio_letterbox 1 -oiio_letterbox_ratio 2.39 -oiio_transform_args "--resize 1280x0" > "%OUT%\46_sequences.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py ^
+  -i "%MEDIA%\ICOI2_005_033_renderCompSecondary_v000\ICOI2_005_033_renderCompSecondary_v000.1001.exr" ^
+  -o "%OUT%\46_exr\plate.%%05d.exr" -in 1001 -out 1002 -seq_args "-d half --compression dwab:45" ^
+  >> "%OUT%\46_sequences.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+type "%OUT%\46_sequences.log"
+call :check %RC% "46 image sequence output"
+call :expect "%OUT%\46_sequences.log" "made by oiiotool (no ffmpeg)" "46 oiiotool only"
+call :expect "%OUT%\46_sequences.log" "Trim: frames 1002-1004" "46 trim"
+call :expect "%OUT%\46_sequences.log" "oiiotool letterbox 2.39" "46 oiiotool letterbox"
+call :expect_not "%OUT%\46_sequences.log" "Encoding" "46 no ffmpeg encode"
+if not exist "%OUT%\46_jpg\ICOI2_005_033_renderCompSecondary_v000.1003.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 46 image sequence output - 46_jpg frame 1003 missing
+  set /a FAILED+=1
+)
+if not exist "%OUT%\46_exr\plate.01002.exr" (
+  >> "%SUMMARY%" echo [FAIL] 46 image sequence output - 46_exr\plate.01002.exr missing
+  set /a FAILED+=1
+)
+if exist "%OUT%\46_jpg\ICOI2_005_033_renderCompSecondary_v000.1003.jpg" (>> "%SUMMARY%" echo [INFO] 46 image sequence output - check 46_jpg: 1280 wide, 2.39 bars, same colours as the movies; 46_exr: linear like the source)
+
+echo.
+echo ==== 47  movie to JPG sequence with ffmpeg only: trim, ffmpeg transform, burn-in ====
+"%PY%" vfx-transcode.py -i "%OUT%\44_ICOI2_comp_v000.mov" -o "%OUT%\47_jpg\frame.####.jpg" ^
+  -in 1002 -out 1003 -ff_transform "scale=w=960:h=-2:flags=lanczos" -burn_preset none -burn_tl "{current_frame}" ^
+  > "%OUT%\47_movie_to_jpg.log" 2>&1
+set RC=%ERRORLEVEL%
+type "%OUT%\47_movie_to_jpg.log"
+call :check %RC% "47 movie to jpg"
+call :expect "%OUT%\47_movie_to_jpg.log" "made by ffmpeg (no oiiotool)" "47 ffmpeg only"
+if not exist "%OUT%\47_jpg\frame.1003.jpg" (
+  >> "%SUMMARY%" echo [FAIL] 47 movie to jpg - frame.1003.jpg missing
+  set /a FAILED+=1
+)
+
+echo.
+echo ==== 48  -alpha auto: the ProRes 4444 of test 37 to a PNG sequence with alpha, to h264 without ====
+"%PY%" vfx-transcode.py -i "%OUT%\37_alpha_straight.mov" -o "%OUT%\48_png\frame.####.png" ^
+  -in 1001 -out 1003 -alpha auto > "%OUT%\48_alpha_auto.log" 2>&1
+set RC=%ERRORLEVEL%
+"%PY%" vfx-transcode.py -i "%OUT%\37_alpha_straight.mov" -o "%OUT%\48_alpha_auto_h264.mp4" ^
+  -alpha auto >> "%OUT%\48_alpha_auto.log" 2>&1
+if not "%ERRORLEVEL%"=="0" set RC=%ERRORLEVEL%
+"%~dp0ffmpeg\ffmpeg.exe" -hide_banner -i "%OUT%\48_png\frame.1001.png" > "%OUT%\48_alpha_probe.txt" 2>&1
+type "%OUT%\48_alpha_auto.log"
+call :check %RC% "48 alpha auto"
+call :expect "%OUT%\48_alpha_auto.log" "Alpha: kept" "48 alpha auto png"
+call :expect "%OUT%\48_alpha_auto.log" "Alpha: not kept (-alpha auto)" "48 alpha auto h264"
+call :expect "%OUT%\48_alpha_probe.txt" "rgba" "48 alpha png"
+
+echo.
 echo ===========================================================================
 type "%SUMMARY%"
 echo.

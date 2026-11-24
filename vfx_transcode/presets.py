@@ -4,7 +4,7 @@ JSON file (presets.json)."""
 import json
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .burnin import (BURN_PLACES, MARGIN_FIELDS, PLACE_NAMES, STYLE_FIELDS, BurnStyle,
                      margins_from_values, parse_size, style_from_values)
@@ -43,8 +43,8 @@ class Preset:
 # Fields of a metadata preset; the command-line options with the same meaning override them.
 METADATA_PRESET_FIELDS = ("notes", "tags", "copy", "reelid_source", "reelid", "reelid_attr",
                           "reelid_pattern", "timecode_source")
-METADATA_CHOICES = {"reelid_source": ("auto", "arg", "exr", "off"),
-                    "timecode_source": ("counter", "arg", "exr")}
+METADATA_CHOICES = {"reelid_source": ("auto", "arg", "metadata", "exr", "off"),
+                    "timecode_source": ("counter", "arg", "metadata", "exr")}
 
 
 @dataclass(frozen=True)
@@ -98,9 +98,13 @@ class PresetFile:
     name_rules: "OrderedDict[str, NameRule]" = field(default_factory=OrderedDict)
     smart_tokens: "OrderedDict[str, SmartTokenPreset]" = field(default_factory=OrderedDict)
     default_smart_tokens: str = ""
+    sequences: "OrderedDict[str, Any]" = field(default_factory=OrderedDict)   # outseq.SequencePreset
+    default_sequences: "OrderedDict[str, str]" = field(default_factory=OrderedDict)  # ext -> name
     filmstrips: "OrderedDict[str, FilmstripPreset]" = field(default_factory=OrderedDict)
     default_filmstrip: str = ""
     tools: "OrderedDict[str, str]" = field(default_factory=OrderedDict)   # name -> path
+    colours: "OrderedDict[str, ColourPreset]" = field(default_factory=OrderedDict)
+    ff_transforms: "OrderedDict[str, FFTransformPreset]" = field(default_factory=OrderedDict)
 
     def get_filmstrip(self, name):
         """Filmstrip preset by name; the built-in defaults (24 tiles of 480x270 in one row)
@@ -183,7 +187,8 @@ class PresetFile:
     def describe(self):
         width = max(len(n) for n in list(self.presets) + list(self.burnins)
                     + list(self.metadata_presets) + list(self.slates) + list(self.transforms)
-                    + list(self.thumbnails) + list(self.filmstrips) + list(self.smart_tokens))
+                    + list(self.thumbnails) + list(self.filmstrips) + list(self.smart_tokens)
+                    + list(self.sequences) + list(self.colours) + list(self.ff_transforms))
         lines = []
         if self.tools:
             lines += ["Tools (presets file \"tools\"; -ffmpeg / -ffprobe / -oiio override them):"]
@@ -234,12 +239,28 @@ class PresetFile:
             for t in self.thumbnails.values():
                 lines.append("  {:<{}}  {}".format(t.name, width, t.notes))
                 lines.append("  {:<{}}    {}".format("", width, t.describe()))
+        if self.sequences:
+            lines += ["", "Sequence presets (-seq_preset, for an image sequence -o), defaults: {}:".format(
+                ", ".join("{} {}".format(e, n) for e, n in self.default_sequences.items()) or "none")]
+            for q in self.sequences.values():
+                lines.append("  {:<{}}  {}".format(q.name, width, q.notes))
+                lines.append("  {:<{}}    {}".format("", width, q.describe()))
         if self.filmstrips:
             lines += ["", "Filmstrip presets (-filmstrip_preset, with -of), default {}:".format(
                 self.default_filmstrip or "(built-in: 24 tiles of 480x270, one row, jpg 90)")]
             for f in self.filmstrips.values():
                 lines.append("  {:<{}}  {}".format(f.name, width, f.notes))
                 lines.append("  {:<{}}    {}".format("", width, f.describe()))
+        if self.colours:
+            lines += ["", "Colour presets (-colour_preset; -ci, -co ... given on the command line win):"]
+            for c in self.colours.values():
+                lines.append("  {:<{}}  {}".format(c.name, width, c.notes))
+                lines.append("  {:<{}}    {}".format("", width, c.describe()))
+        if self.ff_transforms:
+            lines += ["", "ffmpeg transform presets (-ff_transform_preset; -ff_transform wins):"]
+            for t in self.ff_transforms.values():
+                lines.append("  {:<{}}  {}".format(t.name, width, t.notes))
+                lines.append("  {:<{}}    {}".format("", width, t.chain()))
         if self.transforms:
             lines += ["", "OIIO transforms (-oiio_transform), default {}; first matching sub wins:"
                       .format(self.default_transform or NO_TRANSFORM)]
@@ -333,6 +354,8 @@ def _metadata_preset_from_json(name, data, path):
             if key in METADATA_CHOICES and value not in METADATA_CHOICES[key]:
                 raise TranscodeError('{}: {}: "{}" must be one of {}.'.format(
                     path, where, key, ", ".join(METADATA_CHOICES[key])))
+            if key in METADATA_CHOICES and value == "metadata":
+                value = "exr"                 # "metadata" is the new name of "exr"
             values[key] = value
     if "reelid_pattern" in values and values["reelid_pattern"]:
         import re
@@ -389,6 +412,21 @@ def _burnin_from_json(name, data, path):
                       margins=margins, font=data.get("font") or None, notes=str(notes))
 
 
+def preset_relative_path(value, presets_path):
+    """A file named in the presets file: environment variables expanded; ./ and ../ are the
+    presets file's folder (so a studio presets file on a share can keep its logo beside it),
+    falling back to the application folder."""
+    import os
+    from .tools import app_dir, expand_path, resolve_path
+    text = expand_path(value.strip())
+    if text == "." or text.startswith(("./", ".\\", "../", "..\\")):
+        beside = resolve_path(text, os.path.dirname(os.path.abspath(str(presets_path))))
+        if os.path.exists(beside):
+            return beside
+        return resolve_path(text, app_dir())
+    return text
+
+
 def _slate_from_json(name, data, path):
     where = '{}: slate preset "{}"'.format(path, name)
     if name == NO_SLATE:
@@ -412,6 +450,8 @@ def _slate_from_json(name, data, path):
     values.update(style_values(data, where))
     if data.get("font"):
         values["font"] = str(data["font"])
+    if data.get("logo"):
+        values["logo"] = preset_relative_path(str(data["logo"]), path)
     notes = data.get("notes", "")
     if isinstance(notes, list):
         notes = " ".join(str(n) for n in notes)
@@ -508,6 +548,9 @@ def load_presets(path):
     if default_thumbnail and default_thumbnail not in thumbnails:
         raise TranscodeError('{}: default thumbnail preset "{}" is not defined.'.format(
             path, default_thumbnail))
+    from .outseq import sequence_presets_from_json
+    sequences, default_sequences = sequence_presets_from_json(
+        data.get("sequence_presets"), data.get("default_sequence_presets"), path)
     filmstrips = filmstrips_from_json(data.get("filmstrip_presets") or {}, path)
     default_filmstrip = data.get("default_filmstrip") or ""
     if default_filmstrip and default_filmstrip not in filmstrips:
@@ -533,7 +576,107 @@ def load_presets(path):
                       thumbnails, default_thumbnail, name_rules, smart,
                       "" if default_smart == NO_SMART_TOKENS else default_smart,
                       filmstrips=filmstrips, default_filmstrip=default_filmstrip,
-                      tools=parse_tools(data.get("tools"), path))
+                      tools=parse_tools(data.get("tools"), path),
+                      sequences=sequences, default_sequences=default_sequences,
+                      colours=colour_presets_from_json(data.get("colour_presets"), path),
+                      ff_transforms=ff_transforms_from_json(data.get("ff_transforms"), path))
+
+
+# --- colour presets ---
+
+COLOUR_FIELDS = ("ci", "co", "display", "view", "looks", "clf", "ocio")
+COLOUR_OPTION = {"ci": "-ci", "co": "-co", "display": "-display", "view": "-view",
+                 "looks": "-looks", "clf": "-clf", "ocio": "-ocio"}
+
+
+@dataclass(frozen=True)
+class ColourPreset:
+    """Named colour settings: the -ci / -co / -display / -view / -looks / -clf / -ocio
+    values, e.g. "rec709_to_acescg". Empty fields are not set."""
+    name: str
+    notes: str = ""
+    ci: str = ""
+    co: str = ""
+    display: str = ""
+    view: str = ""
+    looks: str = ""
+    clf: str = ""
+    ocio: str = ""
+
+    def values(self):
+        return OrderedDict((f, getattr(self, f)) for f in COLOUR_FIELDS if getattr(self, f))
+
+    def describe(self):
+        return " ".join("{} {}".format(COLOUR_OPTION[f], json.dumps(v) if " " in v else v)
+                        for f, v in self.values().items()) or "(nothing set)"
+
+
+def colour_presets_from_json(data, path):
+    out = OrderedDict()
+    if data is None:
+        return out
+    if not isinstance(data, dict):
+        raise TranscodeError('{}: "colour_presets" must be an object.'.format(path))
+    for name, entry in data.items():
+        where = '{}: colour preset "{}"'.format(path, name)
+        if not isinstance(entry, dict):
+            raise TranscodeError("{} must be an object.".format(where))
+        unknown = sorted(set(entry) - set(COLOUR_FIELDS) - {"notes"})
+        if unknown:
+            raise TranscodeError("{}: unknown field(s) {}; use notes, {}.".format(
+                where, ", ".join(unknown), ", ".join(COLOUR_FIELDS)))
+        values = {}
+        for key in COLOUR_FIELDS:
+            value = entry.get(key)
+            if value is not None and not isinstance(value, str):
+                raise TranscodeError('{}: "{}" must be text.'.format(where, key))
+            values[key] = (value or "").strip()
+        if values["clf"] and (values["display"] or values["view"] or values["looks"]):
+            raise TranscodeError("{}: clf can't be combined with display, view or looks.".format(where))
+        out[name] = ColourPreset(name=name, notes=_notes_text(entry.get("notes", "")), **values)
+    return out
+
+
+# --- ffmpeg transform presets ---
+
+@dataclass(frozen=True)
+class FFTransformPreset:
+    """Named -ff_transform: ffmpeg scale / zscale filters, one per list entry."""
+    name: str
+    notes: str = ""
+    filters: tuple = ()
+
+    def chain(self):
+        lines = [l.strip().rstrip(",") for l in self.filters]
+        return ",".join(l for l in lines if l and not l.startswith("#"))
+
+
+def ff_transforms_from_json(data, path):
+    out = OrderedDict()
+    if data is None:
+        return out
+    if not isinstance(data, dict):
+        raise TranscodeError('{}: "ff_transforms" must be an object.'.format(path))
+    for name, entry in data.items():
+        where = '{}: ffmpeg transform preset "{}"'.format(path, name)
+        if not isinstance(entry, dict):
+            raise TranscodeError("{} must be an object.".format(where))
+        unknown = sorted(set(entry) - {"notes", "filters"})
+        if unknown:
+            raise TranscodeError('{}: unknown field(s) {}; use notes, filters.'.format(
+                where, ", ".join(unknown)))
+        filters = entry.get("filters", [])
+        if isinstance(filters, str):
+            filters = [filters]
+        if not (isinstance(filters, list) and all(isinstance(f, str) for f in filters)):
+            raise TranscodeError('{}: "filters" must be text or a list of text.'.format(where))
+        out[name] = FFTransformPreset(name=name, notes=_notes_text(entry.get("notes", "")),
+                                      filters=tuple(filters))
+    return out
+
+
+def _notes_text(notes):
+    return " ".join(str(n) for n in notes) if isinstance(notes, list) else str(notes)
 
 
 def transfer_for(colorout):

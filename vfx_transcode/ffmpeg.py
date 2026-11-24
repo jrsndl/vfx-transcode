@@ -203,9 +203,12 @@ def build_video_filter(cfg, ctx, scale_width):
 
     scale_width: target width, or 0 to keep the size (EXRs are already resized by oiiotool).
     """
-    scale = [("in_range", "full"), ("in_color_matrix", "bt709"),
-             ("out_range", "tv"), ("out_color_matrix", "bt709")]
-    if scale_width > 0:
+    if cfg.image_output:
+        scale = [("in_range", "full"), ("out_range", "full")]   # RGB stays RGB
+    else:
+        scale = [("in_range", "full"), ("in_color_matrix", "bt709"),
+                 ("out_range", "tv"), ("out_color_matrix", "bt709")]
+    if scale_width > 0 and not cfg.ff_transform:
         scale = [("w", str(scale_width)), ("h", "-2")] + scale
     from .aspect import reformat_filters, sar_filter
     filters = []
@@ -214,10 +217,12 @@ def build_video_filter(cfg, ctx, scale_width):
         filters += [make_filter("format", [("pix_fmts", "gbrap16le")]),
                     make_filter("premultiply", [("inplace", "1")])]
     filters += reformat_filters(cfg.par_in, cfg.par_out_value)
+    if cfg.ff_transform:
+        filters.append(cfg.ff_transform)        # the user's scale / zscale chain, as given
     filters += [make_filter("scale", scale),
                 make_filter("pad", [("width", "ceil(iw/2)*2"), ("height", "ceil(ih/2)*2")]),
                 sar_filter(cfg.par_out_value)]         # also tags 1:1, so nothing is inherited
-    if cfg.preset.colour_tags and not cfg.ff_encode.strip():
+    if cfg.preset.colour_tags and not cfg.ff_encode.strip() and not cfg.image_output:
         # Tag the frames too, not only the encoder: newer ffmpeg (seen with 7.1) takes the
         # colour tags from the frames, i.e. from the intermediate PNGs' gamma chunks
         # ("unknown/linear"), and ignores -color_trc / -color_primaries.
@@ -299,6 +304,8 @@ def build_command(cfg, list_file, output_file, video_filter, timecode, metadata=
     cmd = [cfg.ffmpeg, "-hide_banner", "-y",
            "-f", "concat", "-safe", "0", "-r", fps_to_str(cfg.fps), "-i", Path(list_file).as_posix()]
     metadata = metadata or {}
+    if not cfg.output_reelid:
+        reel_name = ""                 # found for the slate / {reel}, not written
     encode = encode_args(cfg, video_filter)
     preset_metadata = any(a.startswith("-metadata") for a in encode)   # e.g. ProRes vendor_id
     encode = md.merge_movflags(encode, cfg.ff_out_ext,
@@ -308,6 +315,18 @@ def build_command(cfg, list_file, output_file, video_filter, timecode, metadata=
     cmd += md.ffmpeg_args(metadata, timecode, cfg.ff_out_ext, cfg.output_timecode, reel_name)
     cmd.append(Path(output_file).as_posix())
     return cmd
+
+
+def build_image_command(cfg, list_file, out, video_filter, start_number):
+    """An image sequence (outseq.OutputSeq) from the concat list: the video filter, then the
+    format's image codec. No timecode or container metadata."""
+    from .outseq import ffmpeg_output_args
+    pattern = out.folder / "{}%0{}d{}".format(out.base, out.zfill, out.ext)
+    return ([cfg.ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0", "-r", fps_to_str(cfg.fps),
+             "-i", Path(list_file).as_posix(), "-vf", video_filter]
+            + ffmpeg_output_args(out.ext, cfg.mezzanine_16bit, cfg.alpha_active)
+            + ["-map_metadata", "-1", "-f", "image2", "-start_number", str(start_number),
+               Path(pattern).as_posix()])
 
 
 def encode(cfg, cmd):

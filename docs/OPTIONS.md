@@ -3,6 +3,10 @@
 - [How a run works](#how-a-run-works)
 - [Conventions](#conventions)
 - [Input and output](#input-and-output)
+- [Movie input](#movie-input)
+- [Trim](#trim)
+- [Image sequence output](#image-sequence-output)
+- [Super-presets](#super-presets)
 - [Frame rate](#frame-rate)
 - [Pixel aspect ratio](#pixel-aspect-ratio)
 - [Colour](#colour)
@@ -46,7 +50,7 @@
 
 | Option | Default | Description |
 |---|---|---|
-| `-i PATH` | *(required)* | Any file of the input sequence. See the sequence rules below. |
+| `-i PATH` | *(required)* | Any file of the input sequence, or a movie file (see [Movie input](#movie-input)). See the sequence rules below. |
 | `-o PATH` | `<input folder>/<name>.<ext>` | Output movie: a file or a folder, with keywords. See [Output path](#output-path) below. `<name>` is the sequence name without its frame number and separator (`shot_010.1001.exr` → `shot_010`). |
 | `-version_regex REGEX` | `_v(\d\d\d)` | How the version is found in the sequence name for the [name keywords](#name-keywords). |
 | `-smart_tokens NAME` | the presets file's `default_smart_tokens` (`none`) | A [smart tokens](#smart-tokens) preset: per-project keyword rules with conditions, regex replacement and case change. `none` means none. |
@@ -85,6 +89,140 @@ Examples, for frames in `D:/shows/abc/sh010/comp/v003/sh010_comp_v003.1001.exr`:
 | `./../../review/` | `D:/shows/abc/sh010/review/sh010_comp_v003.mp4` |
 | `./../review/{namesplit1}_v{version_number}` | `D:/shows/abc/sh010/comp/review/sh010_v3.mp4` |
 | `D:/dailies/{date}/{clean_name}.mov` | `D:/dailies/2026-09-30/sh010_comp_v003.mov` (a mov) |
+
+## Movie input
+
+`-i` can be a movie file instead of a frame of a sequence: `.mov .mp4 .m4v .mxf .mkv .avi .webm .mts .m2ts .mpg .mpeg .ts .wmv .flv .y4m .gif`, recognised by the extension.
+
+```
+vfx-transcode -i D:/edit/sh020_comp_v002.mov -o ./review/ -slate generic -burn_preset review
+```
+
+- **Probing:** ffprobe reads the movie's size, frame rate, frame count, pixel aspect (SAR), timecode and tags (the [`tools.ffprobe`](#tools) path, else `ffprobe` on the PATH). The log shows it, e.g. `Input: movie D:/edit/sh020_comp_v002.mov  1920x1080 prores yuv422p10le, 23.976 fps, 48 frames, timecode 01:00:10:00, frames numbered 1001-1048`.
+- **Frames:** ffmpeg unpacks the frames into the intermediate folder as a numbered sequence named after the movie (`sh020_comp_v002.1001.png` …), in the `-mezzanine` format (`png`, `tif`, `jpg` or `bmp`; anything else falls back to `png`). `-mezzanine_16bit 1` keeps 10-bit sources at 16 bits. From there the movie goes the same way as PNG / JPG input, so slate, burn-ins, letterbox, alpha, thumbnail, filmstrip and preview all work as usual.
+  - Outputs and `./` paths are relative to the movie's folder, as for a sequence.
+  - YUV is read as the movie is tagged. Untagged movies are read as Rec.709 (HD and larger) or Rec.601 (SD).
+- **Only what's needed:**
+  - A [preview](#preview) unpacks only its one frame (a frame-exact seek), so scrubbing in the tuner is quick even on long movies.
+  - A thumbnail or filmstrip without `-o` unpacks only the frames it uses, when that's under an eighth of the movie.
+  - The movie itself unpacks every frame, which needs disk space: about 3–6 MB a frame for 1080p PNG. `-mezzanine jpg` is much smaller, at a small quality cost.
+- **Colour:** the frames are used as they are, as display-referred pictures, the same as PNG input. OCIO and CLF settings are not applied (the log says so).
+- **Audio:** not carried over.
+
+| Option | Default | Description |
+|---|---|---|
+| `-movie_first_frame N` | `1001` | The frame number of the movie's first frame, for burn-ins (`{current_frame}`, `{frame_start}`), `-thumbnail_frame`, the slate (frame N−1) and the frame counter timecode. |
+
+Header values come from the movie, so the same rules as for an EXR header apply:
+- **Frame rate:** the movie's own rate takes the place of the EXR header rate, so [`-fps_source`](#frame-rate) works as usual (by default `-r` wins, else the movie's rate).
+- **Timecode:** when no timecode source is chosen (no `-timecode_source`, `-timecode` or metadata preset), the movie's own timecode is used if it has one; otherwise the frame counter, as for sequences.
+- **Pixel aspect:** from the movie's sample aspect ratio, following [`-par_source`](#pixel-aspect-ratio).
+- **Keywords:** `{meta:movie:codec}`, `{meta:movie:pix_fmt}`, `{meta:movie:frames}`, `{meta:movie:width}`, `{meta:movie:height}`, `{meta:movie:file}`, and the movie's tags as `{meta:movie:TAG}` (e.g. `{meta:movie:encoder}`), plus `{meta:timecode}` and `{meta:FramesPerSecond}`.
+
+## Trim
+
+| Option | Default | Description |
+|---|---|---|
+| `-in FRAME` | the first frame | The first frame to use, by frame number (inclusive). |
+| `-out FRAME` | the last frame | The last frame to use, by frame number (inclusive). |
+
+- **Works for sequences and movies.** A movie's frames are numbered from [`-movie_first_frame`](#movie-input), and only the trimmed range is unpacked. Either option alone trims one end.
+- **Everything follows the trim:** the frame range in burn-ins (`{frame_start}`, `{frame_end}`), the slate (frame `-in` − 1), the frame-counter timecode, and the thumbnail and filmstrip frames.
+- **Timecode:** a timecode from a header (EXR or movie) is offset to the trimmed first frame. A movie that starts at `01:00:10:00`, trimmed with `-in 1011`, starts at `01:00:10:10`.
+- **Errors:** a range with no frames, or `-in` after `-out`, stops the run.
+- **Preview:** a [preview](#preview) can show a frame outside the trim, so the tuner can scrub there to find a new In or Out. The burn-ins still show the trimmed range.
+
+## Image sequence output
+
+`-o` naming an image file writes an image sequence instead of a movie: `.exr`, `.png`, `.jpg`, `.tif`, `.dpx` or `.bmp`.
+
+```
+vfx-transcode -i D:/shots/sh010/sh010_comp_v003.1001.exr -o "./../jpg/{clean_name}.####.jpg" -in 1001 -out 1050
+vfx-transcode -i D:/edit/sh020.mov -o "D:/plates/sh020/sh020.%04d.exr" -ci "Output - Rec.709" -co ACEScg
+```
+
+- **Naming:** the frame-number pattern sets the padding: `####` (4 digits), `%05d` (5), `@@@@` (4). Without one, `.####` is added before the extension, with the input's padding. A folder (`./out/`) gets `<name>.####.<ext>`. Keywords work as for a movie `-o`.
+- **Frame numbers** are the input's (trimmed): `sh010.1001.exr` becomes `sh010.1001.jpg`. Holes in the input stay holes.
+- **Safety:** an output that would overwrite the input frames stops the run.
+
+**Which tool runs:**
+
+| Input | Output | Tools |
+|---|---|---|
+| EXR sequence | image sequence (EXR or not) | oiiotool only |
+| PNG / JPG / TIF … sequence | image sequence | oiiotool only |
+| movie | EXR sequence | ffmpeg unpacks the frames, oiiotool writes the EXRs |
+| movie | PNG / JPG / TIF / DPX sequence | ffmpeg only |
+
+Without ffmpeg there is no ffmpeg step at all: burn-ins, `-letterbox`, `-ff_transform` and `-ff_filter` aren't applied (the log says so). Use [`-oiio_letterbox`](#letterbox) and an [OIIO transform](#oiio-transforms) instead. Image sequences get no slate and no container metadata. When ffmpeg writes the sequence (a movie to JPG …), burn-ins, the ffmpeg letterbox and `-ff_transform` work as for a movie.
+
+**Colour:**
+- EXR input to a non-EXR sequence: the usual conversion (`-ci` → `-co`, or display/view, or `-clf`), as for a movie.
+- EXR to EXR: no colour conversion unless `-ci`, `-co`, `-display`, `-view` or `-clf` is given. Alpha stays premultiplied.
+- PNG / JPG / movie frames through oiiotool: no colour conversion unless `-ci` / `-co` (or `-display` / `-view`) is given, e.g. `-ci "Output - Rec.709" -co ACEScg` for a movie to linear EXRs. `-clf` only applies to EXR input.
+
+| Option | Default | Description |
+|---|---|---|
+| `-seq_preset NAME` | the presets file's `default_sequence_presets` entry for the format | A [sequence preset](#sequence-presets): the oiiotool output settings (bit depth, compression, quality). A preset for another format prints a warning. `--help` lists them. |
+| `-seq_args ARGS` | *(the preset)* | oiiotool output arguments for one run, replacing the sequence preset, e.g. `-seq_args "-d half --compression dwab:45"`. Without a preset or `-seq_args`, the built-in settings apply: exr `-d half --compression zip`; jpg `-d uint8 --compression jpeg:95`; png / tif `-d uint8` (`uint16` with `-mezzanine_16bit 1`); dpx `-d uint10`. |
+
+The log names what was used, e.g. `Writing D:/out/sh010.####.exr (exr_dwab30_half: -d half --compression dwab:30)`.
+
+### Sequence presets
+
+The shipped `sequence_presets`, with `default_sequence_presets` setting exr → `exr_zip16_half`, jpg → `jpg_high` and png → `png_8bit`. TIF and DPX have no default preset, so they use the built-in settings.
+
+| Preset | Format | oiiotool arguments | Use |
+|---|---|---|---|
+| `jpg_high` | jpg | `-d uint8 --compression jpeg:95 --attrib jpeg:subsampling 4:4:4` | High quality, no chroma subsampling |
+| `jpg_medium` | jpg | `-d uint8 --compression jpeg:80 --attrib jpeg:subsampling 4:2:0` | Small files for review and web |
+| `png_8bit` | png | `-d uint8` | |
+| `png_16bit` | png | `-d uint16` | 10-bit sources, grading |
+| `exr_piz_half` | exr | `-d half --compression piz` | Lossless; good for grainy plates |
+| `exr_zip1_half` | exr | `-d half --compression zips` | Lossless ZIP, 1 scanline (ZIPS): fast to read in compositing |
+| `exr_zip16_half` | exr | `-d half --compression zip` | Lossless ZIP, 16 scanlines: smaller than ZIPS |
+| `exr_dwab30_half` | exr | `-d half --compression dwab:30` | Lossy DWAB, high quality, small |
+| `exr_dwab60_half` | exr | `-d half --compression dwab:60` | Lossy DWAB, smaller files |
+
+Fields: `notes`; `ext` (exr, jpg, png, tif, dpx or bmp; jpeg and tiff are read as jpg and tif); `args` (one string or a list).
+- EXR compressions: `zips`, `zip`, `piz`, `dwaa:Q` / `dwab:Q` (Q = quality; 45 is OpenEXR's default), `pxr24`, `b44`, `none`.
+- JPEG: `--compression jpeg:QUALITY` and `--attrib jpeg:subsampling 4:4:4|4:2:2|4:2:0`.
+- A `default_sequence_presets` entry must name a preset of that format.
+
+The presets are oiiotool settings, so they apply wherever oiiotool writes the sequence. When ffmpeg writes it (a movie to JPG / PNG …), its fixed formats apply (see above).
+
+When ffmpeg writes the sequence, the formats are fixed: JPG `mjpeg -q:v 2` (4:4:4), PNG / TIF 8-bit RGB (16-bit with `-mezzanine_16bit 1`), DPX 10-bit.
+
+A [preview](#preview) follows the same tools. An oiiotool-only preview writes the frame in the output format, then shows it as 8-bit PNG. An EXR's values are shown clipped, with no view transform.
+
+## Super-presets
+
+A super-preset stores the settings of several areas together under one name: encode, transform, burn-in, slate, filmstrip, metadata and letterbox. The [tuner](TUNER.md) saves them in `super_presets.json`, next to the presets file. Each area holds the tuner's values and the matching vfx-transcode options, so a super-preset made in the tuner also works on the command line:
+
+```
+vfx-transcode -i D:/shots/sh010/sh010_comp_v003.1001.exr -super_preset dailies -o ./review/
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `-super_preset NAME[,NAME]` | *(none)* | The options of the super-preset's areas are put in front of the command line's. An option on the command line wins over the super-preset's; options that add up (`-metadata`, `-slate_field`, `-burn_style`) add to it. Several names, comma separated or with `-super_preset` repeated, are applied in order, so later ones win. |
+| `-super_presets_file PATH` | `super_presets.json` next to the presets file (plus the local one, see below) | Another super-presets file. |
+
+- The areas' options are written out in full, so a super-preset doesn't depend on which presets file is loaded. The exceptions are the encode preset, which is stored by name (`-preset h264`), and a transform preset loaded in the tuner and left unchanged, which is stored by name (`-oiio_transform NAME`) so vfx-transcode still picks the sub-preset for each input by its conditions.
+- The input, colour settings, frame rate and output path are not part of a super-preset.
+- An unknown name stops the run before anything is done, and lists the names in the file.
+- The file is plain JSON. vfx-transcode reads only each area's `args`; the tuner reads its `state`. Hand edits to `args` work on the command line but the tuner won't see them: save the super-preset again from the tuner instead.
+
+**Where they are saved.** With [studio preferences](#which-presets-file-is-used) in use, `super_presets.json` is the one beside the studio `presets.json`, so everyone shares it. If the tuner can't write there (no write access, share offline), it offers the local `super_presets.json` next to the application instead. The local file is also read, but only on that computer. Its entries are listed in italic, and one with the same name as a studio entry wins there; `-super_preset NAME` on the command line sees it too.
+
+**Saving is multi-user safe**, so several people can save to the shared file at the same time:
+
+1. The new file is written to a temporary file in the same folder, named after the user and the time (`super_presets_jdoe_261124-1649.json`), and read back to check it.
+2. For the moment of the swap, a lock file (`super_presets.json.lock`, with the user and time in it) keeps others waiting; a lock older than a minute is from a crash and is removed.
+3. If someone else saved since the file was read, the tuner reads it again and redoes its change, so their super-presets are kept.
+4. The current file is copied to `super_presets_safecopyNNN.json` (the next free number), then the temporary file takes its name in one rename. The old file is copied rather than renamed away first, so others never find the file missing.
+
+A failed save leaves the file as it was. Safe copies are never deleted by the tools; clear out old ones by hand when you like.
 
 ## Frame rate
 
@@ -152,6 +290,7 @@ EXRs are converted in one of three ways: colourspace to colourspace, display / v
 
 | Option | Default | Description |
 |---|---|---|
+| `-colour_preset NAME` | *(none)* | A [colour preset](#colour-and-ffmpeg-transform-presets): named `-ci` / `-co` / `-display` / `-view` / `-looks` / `-clf` / `-ocio` values from the presets file, e.g. `-colour_preset rec709_to_acescg`. The options given on the command line win over the preset's. Counts as a colour given (so non-EXR input through oiiotool is converted). `-color_preset` works too. |
 | `-ci`, `--colorin NAME` | `ACEScg` | Colourspace of the EXRs, as named in the OCIO config, e.g. `ACEScg` or `"Utility - Linear - sRGB"`. Used in both modes. |
 | `-co`, `--colorout NAME` | `out_rec709` | Output colourspace, e.g. `out_rec709` or `out_srgb` (ACES 1.2 config names). It also decides the colour tags written to the movie; see [Presets file](#presets-file). |
 
@@ -333,16 +472,16 @@ The log prints the range it used.
 
 | Option | Default | Description |
 |---|---|---|
-| `-timecode_source counter\|arg\|exr` | the metadata preset's, else `counter` | Where the start timecode comes from. See below. |
+| `-timecode_source counter\|arg\|metadata` | the metadata preset's, else `counter` | Where the start timecode comes from. See below. `exr` is the old name of `metadata` and still works. |
 | `-timecode HH:MM:SS:FF` | `01:00:00:00` | Start timecode for `arg`. Giving `-timecode` selects `arg` automatically. Use `;` before the frames for drop-frame (`00:59:59;29`). |
-| `-output_timecode 0\|1` | `1` | Write the timecode into the movie: a real timecode track in mov, mp4 and mxf, which editing apps read, or a `timecode` tag in other containers. |
+| `-output_timecode 0\|1` | `1` | Write the timecode into the movie: a real timecode track in mov, mp4 and mxf, which editing apps read, or a `timecode` tag in other containers. In an EXR or DPX [image sequence](#image-sequence-output) written by oiiotool, each frame gets its own timecode (`smpte:TimeCode`, counting up from the start timecode). oiiotool's `--frames` batch can't give each frame a different value, so these frames are converted one file at a time, `-workers` in parallel. EXR input whose header has a timecode, with `-timecode_source metadata`, keeps each frame's own. `0` removes any timecode carried over from the input header. |
 | `-timecode_from_counter 0\|1` | — | Old switch, kept for existing scripts: `1` = `counter`, `0` = `arg`. |
 
 The three sources:
 
 - **`counter`**: the first frame number at the [frame rate](#frame-rate). Frame 1001 at 24 fps is `00:00:41:17`; at 25 fps it is `00:00:40:01`.
 - **`arg`**: the value of `-timecode`.
-- **`exr`**: read from the first frame's EXR header: `smpte:TimeCode` (OpenEXR `timeCode`), or any attribute whose name ends in "timecode". If the header has no timecode, a warning is printed and `counter` is used. EXR input only.
+- **`metadata`** (old name `exr`): read from the first frame's EXR header: `smpte:TimeCode` (OpenEXR `timeCode`), or any attribute whose name ends in "timecode"; for movie input, the movie's timecode. If there is none, a warning is printed and `counter` is used. EXR or movie input.
 
 The log shows the timecode and its source, e.g. `Timecode: 00:00:41:17 (frame counter)`. The same value starts the `{tc}` burn-in.
 
@@ -355,6 +494,7 @@ With a [slate](#slate) the movie starts one frame earlier, so its timecode track
 | `-metadata_preset NAME` | the presets file's `default_metadata` (`none`) | A [metadata preset](#metadata-presets): tags, copy rules, reel name and timecode settings in one name. `none` means no preset. |
 | `-metadata KEY=VALUE` | *(none)* | Write a tag. Repeatable. The value may use `{clean_name}`, `{frame_start}`, `{frame_end}`, `{frames}`, `{timecode}`, `{fps}`, `{preset}`, `{date}`, [`{meta:ATTR}`](#header-values-metaattr), the [name keywords](#name-keywords) and the [delivery keywords](#delivery-keywords). `KEY=` with no value removes a tag that a preset would write. |
 | `-metadata_copy SPEC` | the metadata preset's `copy`, else none | Copy attributes from the first frame's EXR header. See below. `-metadata_copy ""` switches off a preset's copying. |
+| `-seq_metadata 0\|1` | `1` | [Image sequence](#image-sequence-output) written by oiiotool: write the tags into each image. See below. |
 
 Examples:
 
@@ -382,6 +522,15 @@ Examples:
 
 An empty value at any level removes the key. mov and mp4 need `-movflags +use_metadata_tags` to keep custom keys; the tool adds it, merged with any `-movflags` the preset already has. mkv keeps any key as it is. The log lists the keys that were written.
 
+**Image sequences.** When oiiotool writes an image sequence (EXR input, PNG / JPG … input, or a movie to EXR), the metadata preset's `tags` and `-metadata` are written into every image as string attributes (`--attrib:type=string KEY VALUE`). Keywords are filled in first, the same as for a movie (`{timecode}` is the start timecode); braces left in a value are written as they are. `-seq_metadata 0` writes none.
+
+- **EXR** keeps every key, e.g. `-metadata "vfx:shot={namesplit1}" -metadata "vfx:version={version_number}"`.
+- **PNG, TIF, JPG** keep what their format can store: OIIO maps the standard names (`ImageDescription`, `Artist`, `Copyright`, `DateTime` …); other keys may be dropped by the format.
+- The encode preset's `metadata` is not used (it is codec settings for the movie), and nothing is copied with `-metadata_copy`: oiiotool already keeps the input header's attributes as far as the output format can.
+- A movie to a PNG / JPG / TIF sequence is written by ffmpeg, whose image files carry no tags; the log says so.
+
+The log lists them, e.g. `Metadata: title, vfx:shot written into each exr`.
+
 ### Delivery keywords
 
 Some delivery specs (streaming services in particular) want the movie to say how it was made. These keywords work in `-metadata` values and metadata preset `tags`:
@@ -408,7 +557,7 @@ The log names the preset in its metadata line, e.g. `Metadata: title, comment (p
 | Preset | Tags | Other settings | Use |
 |---|---|---|---|
 | `review` | `title={clean_name}`, `comment={clean_name} {frame_start}-{frame_end} @ {fps} fps, start TC {timecode}` | reel name `auto` | Internal review. |
-| `conform` | `title={clean_name}` | `timecode_source exr`, `reelid_source exr`, `reelid_attr owner` | Editorial / conform: timecode and reel name from the renders. |
+| `conform` | `title={clean_name}` | `timecode_source metadata`, `reelid_source metadata`, `reelid_attr owner` | Editorial / conform: timecode and reel name from the renders. |
 | `client` | `title={clean_name}` | nothing copied, `reelid_source off` | Client delivery with nothing from the render headers. |
 | `delivery` | `title`, `source_frame_rate={fps}`, `first_frame`, `last_frame`, `frame_count`, `slate_length`, `display_type={colour}`, `watermarking={burnins}` | nothing copied, reel name `auto` | Delivery tags, see [delivery keywords](#delivery-keywords). |
 | `archive` | `title={clean_name}`, `comment=transcoded {date}, preset {preset}` | `copy all,-husk:*,-nuke/*,-MEDIA_PATH`, reel name `auto` | Keep header information, minus command lines and internal paths. |
@@ -419,7 +568,8 @@ The reel name (reel ID) ties a clip back to its source in an EDL or AAF when con
 
 | Option | Default | Description |
 |---|---|---|
-| `-reelid_source auto\|arg\|exr\|off` | the metadata preset's, else `auto` | Where the reel name comes from; see below. |
+| `-reelid_source auto\|arg\|metadata\|off` | the metadata preset's, else `auto` | Where the reel name comes from; see below. |
+| `-output_reelid 0\|1` | `1` | Write the reel name into the movie, or into each image of an EXR sequence written by oiiotool (`reelName`, the OpenEXR standard attribute). Other image formats have no reel name field. `0`: it is still found (log, slate, `{reel}` keyword) but not written; for EXR, a `reelName` carried over from the input is removed. |
 | `-reelid TEXT` | the metadata preset's, else none | Explicit reel name. It may use the `-metadata` keywords, e.g. `-reelid "{clean_name}"`. |
 | `-reelid_attr NAME` | the metadata preset's, else `owner` | EXR header attribute holding the reel name. Any attribute works, e.g. `-reelid_attr pipe/reel`. The standard OpenEXR names are also found under oiiotool's names, so `owner` also finds `Copyright`. Matching ignores case. |
 
@@ -427,7 +577,7 @@ The reel name (reel ID) ties a clip back to its source in an EDL or AAF when con
 |---|---|---|
 | `auto` (default) | `-reelid` → EXR attribute → none | Written when either exists; otherwise no reel name, silently. |
 | `arg` | `-reelid` → none | Only the explicit value. Warns if `-reelid` is missing. |
-| `exr` | EXR attribute → `-reelid` → none | The header wins. Warns if neither exists. |
+| `metadata` (old name `exr`) | EXR attribute → `-reelid` → none | The header wins. Warns if neither exists. |
 | `off` | — | No reel name is written. |
 
 The first frame's header is used, EXR input only. The log shows the value and its source, e.g. `Reel name: A001C003 (EXR header owner)`.
@@ -663,8 +813,14 @@ A slate is one information frame placed before the first picture: shot name, fra
 | `-slate_value_color COLOR` | the preset's, else `white` | Colour of the row values. |
 | `-slate_rule 0\|1` | the preset's, else `0` | A line under the title, in `line_color`. |
 | `-slate_label_color COLOR` | the preset's, else `#7a7a7a` | Colour of the row labels (the field names), usually a darker grey. |
-| `-slate_style "KEY=VALUE,..."` | *(none)* | Any style setting, e.g. `-slate_style "title_color=yellow,background=#000000"`. Keys: `background`, `title_color`, `subtitle_color`, `value_color`, `label_color`, `line_color`, `title_size`, `subtitle_size`, `size`, `scale`, `valign`, `rule` (1/0), `hide_empty` (1/0), and `color` (title and values). Repeatable; wins over the options above. |
+| `-slate_style "KEY=VALUE,..."` | *(none)* | Any style setting, e.g. `-slate_style "title_color=yellow,background=#000000"`. Keys: `background`, `title_color`, `subtitle_color`, `value_color`, `label_color`, `line_color`, `title_size`, `subtitle_size`, `size`, `scale`, `valign`, `rule` (1/0), `hide_empty` (1/0), `logo_position`, `logo_size`, `logo_x`, `logo_y`, and `color` (title and values). Repeatable; wins over the options above. |
 | `-slate_burnin 0\|1` | `0` | Draw the burn-ins on the slate as well. |
+| `-slate_logo PATH` | the preset's, else none | Vendor logo drawn on the slate: an image, best a PNG with alpha (its transparent parts show the slate background). `./` is the application folder; environment variables work. `-slate_logo ""` removes a preset's logo. A missing file gives a warning and a slate without the logo. |
+| `-slate_logo_position POS` | the preset's, else `tr` | `tl` `tc` `tr` / `ml` `mc` `mr` / `bl` `bc` `br`: top / middle / bottom, then left / centre / right. Words work too: `top-right`, `bottom-left`, `center`, `bottom`. |
+| `-slate_logo_size SIZE` | the preset's, else `10%` | Logo height: percent of the picture height, or pixels. The width follows the logo's proportions. |
+| `-slate_logo_x SIZE`, `-slate_logo_y SIZE` | the preset's, else `4%` and `5%` | Distance from the left or right edge (percent of the width, or pixels) and from the top or bottom edge (percent of the height, or pixels). `0` is allowed. Not used along a centred axis. |
+
+The logo is placed on the whole slate, not inside the `-slate_scale` box, and is drawn over the thumbnail and under the text. Anamorphic slates are laid out at display proportions, so the logo keeps its shape after un-squeezing.
 
 The `-slate_*` options without `-slate` make a plain slate: title `{clean_name}`, only the rows you give, and a thumbnail. With `-slate none` they are ignored, with a warning. `-skipffmpeg` makes no slate, because ffmpeg draws it.
 
@@ -706,7 +862,14 @@ The letterbox covers part of the picture with bars, to show how it looks at a ta
 - target ratio **narrower** (4:3 on a 16:9 movie, or 2.39 on an anamorphic 2:1 movie that displays at about 4.8:1): bars left and right, a **pillarbox**.
 - the same ratio (within a pixel): no bars, and the log says so.
 
-The bars are drawn on the encoded size, after scaling, pixel aspect reformat and padding. They are drawn before `-ff_filter` and before the burn-ins, so burn-ins are drawn on top of them. The [slate](#slate) never gets bars.
+The bars are drawn on the encoded size, after scaling (`-width` or `-ff_transform`), pixel aspect reformat and padding. They are drawn before `-ff_filter` and before the burn-ins, so burn-ins are drawn on top of them. The [slate](#slate) never gets bars.
+
+There are two letterboxes, which can be used separately or together:
+- **`-letterbox`** is drawn by ffmpeg, on the movie (or a movie → JPG … sequence).
+- **`-oiio_letterbox`** is drawn by oiiotool, on the converted frames, so it needs no ffmpeg. It works for EXR input, and for every oiiotool-only [image sequence output](#image-sequence-output).
+  - It measures the frames' size after the OIIO transform (one frame, with `--echo`), then draws exact `--box` bars.
+  - Colours are in the output's values: black is black, but other colours in a linear EXR are linear values.
+  - Its options mirror the ffmpeg ones: `-oiio_letterbox 0|1`, `-oiio_letterbox_ratio`, `-oiio_letterbox_color`, `-oiio_letterbox_line`, `-oiio_letterbox_line_color`.
 
 | Option | Default | Description |
 |---|---|---|
@@ -720,17 +883,18 @@ The log shows the result, e.g. `Letterbox 2.39: letterbox, bars of 138 px top an
 
 ## Alpha
 
-By default the movie has no alpha channel, whatever the input has. `-alpha keep` carries the input's alpha into the movie, e.g. for comp elements in ProRes 4444.
+By default the output has no alpha channel, whatever the input has. `-alpha keep` carries the input's alpha into the output, e.g. for comp elements in ProRes 4444. `-alpha auto` does the same when it can, and quietly does without when it can't.
 
 | Option | Default | Description |
 |---|---|---|
-| `-alpha drop\|keep` | `drop` | `keep` writes the input alpha to the movie. The encode preset must be able to store alpha: presets with `alpha_pix_fmt` (shipped: `prores4444`, marked `[alpha]` in `--help`), or `-ff_encode` with an alpha pixel format (e.g. `-pix_fmt yuva420p … -c:v libvpx-vp9` for WebM). Otherwise the tool stops with an error before converting anything. The intermediates must be `png` or `tif`. |
+| `-alpha drop\|keep\|auto` | `drop` | `drop`: no alpha in the output. `keep` writes the input alpha to the output. A movie's encode preset must be able to store alpha: presets with `alpha_pix_fmt` (shipped: `prores4444`, marked `[alpha]` in `--help`), or `-ff_encode` with an alpha pixel format (e.g. `-pix_fmt yuva420p … -c:v libvpx-vp9` for WebM). An [image sequence](#image-sequence-output) must be `exr`, `png` or `tif`. Otherwise the tool stops with an error before converting anything. The intermediates must be `png` or `tif`. `auto`: as `keep` when the output can store alpha, else as `drop`, with an info line saying why (no error); an input without alpha is an info line too, where `keep` warns. |
 | `-alpha_premult 0\|1` | `0` | Only with `-alpha keep`. `0`: the colour is written **straight** (unpremultiplied), which is what most players and editors expect in a mov. `1`: the colour is **premultiplied** by alpha. |
 
 How it works:
 
 - **EXR input.** The alpha channel next to the chosen colour channels is used (`rgba.A` for `rgba.R,G,B`, `A` for `R,G,B`, `beauty.A` …). EXR colour is premultiplied, so oiiotool resizes first, then divides by alpha (`--unpremult`), then applies the colour transform to the straight colour. The intermediate PNGs are straight, as PNG expects. If there is no alpha channel, or the picture is a deep depth view, a warning is printed and the movie gets no alpha.
 - **Other input** (PNG, TIFF …) is used as it is and taken to be straight, as PNG defines. Whether it has alpha is read from the first frame.
+- **Image sequence output.** oiiotool writes the alpha into EXR (premultiplied, as EXR expects), PNG and TIF (straight). For PNG / TIFF input with `drop`, oiiotool removes the alpha channel (`--ch R,G,B`). A movie to PNG / TIF sequence is written by ffmpeg as `rgba` (`rgba64` with `-mezzanine_16bit 1`).
 - **Premultiplied output** is done by ffmpeg (`premultiply`, in 16-bit RGB) at the start of the filter chain.
 - **Burn-ins** are drawn opaque where their text is, also over transparent parts. **Letterbox bars** are composited over the picture with their own opacity, so they also show over transparent parts. The **slate** is fully opaque.
 - Colour in fully transparent pixels (alpha 0) can't survive straight output: additive glows with no alpha disappear. That is a property of straight alpha, not of the tool.
@@ -837,6 +1001,8 @@ Shipped filmstrip presets:
 | `-presets_file PATH` | `./presets.json` | JSON file holding the encode, burn-in, metadata and slate presets and the channel preferences. See [Presets file](#presets-file). |
 | `-ff_out_ext EXT` | the preset's `ext` | Output extension/container, e.g. `mov`, `mp4`, `mkv`, `mxf`. |
 | `-ff_encode ARGS` | *(none)* | Replaces the preset's codec arguments for one run. It must contain `{videofilter}` as a separate word where the `-vf` filter goes. No colour tags are added. Example: `-ff_encode "-pix_fmt yuv420p {videofilter} -c:v libx264 -crf 23"`. |
+| `-ff_transform_preset NAME` | *(none)* | An [ffmpeg transform preset](#colour-and-ffmpeg-transform-presets) from the presets file, e.g. `hd_fit_pad`. `-ff_transform` wins. |
+| `-ff_transform FILTERS` | *(none)* | The ffmpeg transform: filters that replace the `-width` scale, e.g. `-ff_transform "scale=w=2048:h=-2:flags=lanczos"` or a `zscale` chain. Separate filters with commas or new lines; a line starting with `#` is skipped. They run after the pixel aspect reformat and before the colour-matrix conversion, letterbox and burn-ins. `-width` still sets oiiotool's resize of EXRs (`-width 0` leaves it all to `-ff_transform`). |
 | `-ff_filter FILTERS` | *(none)* | Extra ffmpeg video filters, inserted after scale/pad and before the burn-ins, e.g. `-ff_filter "eq=gamma=1.1"`. Used as given, so escape ffmpeg special characters yourself. |
 | `-skipffmpeg 0\|1` | `0` | Only convert the EXRs. The movie isn't made and the intermediates are kept (implies `-temp_keep 1`); the log prints their folder. Add `-temp_location source` to get them next to the source files. |
 
@@ -846,7 +1012,74 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
 
 ## Presets file
 
-`presets.json` holds the encode, burn-in and metadata presets and the channel preferences. It sits next to the application; for a built .exe, copy it next to the .exe. Edit, add or remove presets freely. If the file has a mistake, the tool reports the file and line, or the preset and field.
+`presets.json` holds the encode, burn-in and metadata presets and the channel preferences. Edit, add or remove presets freely. If the file has a mistake, the tool reports the file and line, or the preset and field.
+
+### Colour and ffmpeg transform presets
+
+`colour_presets` name colour settings for the OCIO config; `ff_transforms` name `-ff_transform` filter chains. The shipped file has some of each (the colour names are the ACES 1.2 config's):
+
+| Colour preset | Settings |
+|---|---|
+| `acescg_to_rec709` | `-ci "ACES - ACEScg" -co "Output - Rec.709"` (the usual review look) |
+| `acescg_to_srgb` | `-ci "ACES - ACEScg" -co "Output - sRGB"` |
+| `aces2065_to_rec709` | `-ci "ACES - ACES2065-1" -co "Output - Rec.709"` |
+| `rec709_to_acescg` | `-ci "Output - Rec.709" -co "ACES - ACEScg"` (inverse output transform; bright values can go well above 1.0) |
+| `srgb_to_acescg` | `-ci "Output - sRGB" -co "ACES - ACEScg"` |
+| `srgb_texture_to_acescg` | `-ci "Utility - sRGB - Texture" -co "ACES - ACEScg"` (plain sRGB curve, for textures and matte paintings) |
+| `logc3_to_rec709` | `-ci "Input - ARRI - V3 LogC (EI800) - Wide Gamut" -co "Output - Rec.709"` |
+| `acescg_display_rec709` | `-ci "ACES - ACEScg" -display ACES -view Rec.709` |
+
+```json
+"colour_presets": {
+  "rec709_to_acescg": {"notes": "Rec.709 video into ACEScg", "ci": "Output - Rec.709", "co": "ACES - ACEScg"}
+},
+"ff_transforms": {
+  "hd_fit_pad": {
+    "notes": "Fit inside 1920x1080 keeping the aspect, black bars to fill.",
+    "filters": ["scale=w=1920:h=1080:force_original_aspect_ratio=decrease", "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"]
+  }
+}
+```
+
+| Colour preset field | Description |
+|---|---|
+| `ci`, `co` | Colourspace in / out, as `-ci` / `-co`. |
+| `display`, `view`, `looks` | As `-display` / `-view` / `-looks`, instead of `co`. |
+| `clf` | A CLF file, as `-clf`; not with `display`, `view` or `looks`. |
+| `ocio` | The OCIO config, as `-ocio`. Left out: `-ocio` or the default config. |
+| `notes` | Shown in `--help` and the tuner. |
+
+An ffmpeg transform preset has `filters` (one filter per entry, or one string; entries starting with `#` are skipped) and `notes`. The shipped ones: `hd_lanczos` (1920 wide), `hd720_bicubic` (1280 wide), `2k_zscale` (2048 wide, zscale spline36) and `hd_fit_pad` (fit inside 1920x1080 with black bars).
+
+### Saving presets from the tuner
+
+The tuner's **Save as preset...** buttons (Color, Transform, Transform Sequence, Burn-in, Slate, Filmstrip) write a named preset into the presets file in use. With [studio preferences](#which-presets-file-is-used), that is the studio `presets.json`, so everyone gets it.
+
+- A new name adds a preset; an existing name replaces it (the tuner asks first). Transform Sequence saves a sub-preset: into an existing transform preset (replacing a sub-preset of the same name, which keeps its conditions) or as a new transform preset with that one sub-preset.
+- The save is [multi-user safe](#super-presets), like the super-presets: a temporary file first, a short lock, someone else's save merged in, the previous version kept as `presets_safecopyNNN.json`.
+- Before the new file replaces the old one, it is loaded as vfx-transcode would load it; if that fails, nothing changes.
+- The file is rewritten with its own layout (two-space indents, short lists of small objects such as conditions on one line), so the only lines that change are the saved preset's. Everything else, `_notes` and the `tools` paths included, stays as it is.
+- If the presets file can't be written (no write access to the share), the tuner says so and nothing is saved. Ask whoever looks after the studio preferences, or point the Presets file field at a file you can write.
+
+### Which presets file is used
+
+1. `-presets_file PATH`, when given (`./` = the application folder).
+2. The **studio preferences** named in `vfx-transcode.ini`, when that file exists next to `vfx-transcode.py` / `vfx-transcode.exe`, its path exists and its presets file loads.
+3. `presets.json` next to the application, as before. A built .exe needs it copied next to the .exe.
+
+`vfx-transcode.ini` (the shipped one has an empty path, so step 3 is used):
+
+```ini
+[vfx-transcode]
+studio_prefs = \\server\pipeline\vfx-transcode
+```
+
+- `studio_prefs` is a folder holding `presets.json`, or the path of the presets file itself. Environment variables work (`%PIPELINE_ROOT%\vfx-transcode`), and `./` is the application folder.
+- If the path is empty, the local `presets.json` is used without a message. If it doesn't exist, or the file fails to load (a JSON mistake, the share is offline), the local `presets.json` is used and a warning says why, e.g. `Warning: Studio preferences not used: "\\server\pipeline\vfx-transcode\presets.json" not found (studio_prefs in vfx-transcode.ini); using D:\apps\vfx-transcode\presets.json`.
+- When the studio preferences are used, the log says so: `Presets: \\server\...\presets.json (studio preferences from vfx-transcode.ini)`.
+- `super_presets.json` is read from the folder of the presets file used, so studio super-presets live on the share next to the studio `presets.json`.
+- `./` in the presets file's `tools` paths still means the application folder, not the share. Give studio tools as absolute or UNC paths.
+- The tuner uses the same order; its Presets file field shows the default it found.
 
 ```json
 {
@@ -870,8 +1103,8 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
     "my-conform": {
       "notes": "Shown in --help.",
       "tags": {"title": "{clean_name}", "comment": "vfx v{frame_start}"},
-      "timecode_source": "exr",
-      "reelid_source": "exr",
+      "timecode_source": "metadata",
+      "reelid_source": "metadata",
       "reelid_attr": "owner"
     }
   },
@@ -901,6 +1134,8 @@ Every encode also sets the colour matrix explicitly (`scale=in_range=full:in_col
 |---|---|
 | `tools` | Paths to `ffmpeg`, `ffprobe` and `oiiotool`, see [Tools](#tools). Optional; any other key is an error. |
 | `default_encode` | Encode preset used without `-preset`. Defaults to the first one. |
+| `sequence_presets` | oiiotool output settings for image sequence outputs, see [Sequence presets](#sequence-presets). |
+| `default_sequence_presets` | `{"exr": NAME, "jpg": NAME, …}`: the sequence preset each format uses without `-seq_preset`. |
 | `default_burnin` | Burn-in preset used without `-burn_preset`. `none` (or leaving it out) means no burn-ins. |
 | `encode_presets` | The encode presets. The older key name `presets` (with `default`) is still accepted. |
 | `burnin_presets` | The burn-in presets. Optional. The name `none` is reserved. |
@@ -937,7 +1172,7 @@ Metadata preset fields (all optional; any other field is an error; each has the 
 | `tags` | `{"key": "value"}` tags written to the movie; values may use the `-metadata` keywords, including `{meta:ATTR}`. |
 | `copy` | EXR attributes to copy, like `-metadata_copy`. |
 | `reelid_source`, `reelid`, `reelid_attr`, `reelid_pattern` | Reel name settings, like the options of the same name. |
-| `timecode_source` | `counter`, `arg` or `exr`, like `-timecode_source`. |
+| `timecode_source` | `counter`, `arg` or `metadata` (old name `exr`), like `-timecode_source`. |
 | `notes` | Description shown in `--help`. |
 
 Burn-in preset fields (all optional; any other field is an error):
@@ -972,6 +1207,8 @@ Slate preset fields (all optional; any other field is an error):
 | `line_color` | Colour of that line, default `#5a5a5a`. |
 | `color` | Shortcut: sets `title_color` and `value_color`. |
 | `font` | Font file; default the burn-in font. |
+| `logo` | Vendor logo image (PNG with alpha). `./` and `../` are relative to the presets file's folder (so a studio presets file on a share keeps its logo beside it), else the application folder. |
+| `logo_position`, `logo_size`, `logo_x`, `logo_y` | As `-slate_logo_position`, `-slate_logo_size`, `-slate_logo_x`, `-slate_logo_y`. |
 | `notes` | Description shown in `--help`. |
 
 Thumbnail preset fields (all optional; any other field is an error):
@@ -1054,14 +1291,14 @@ ProRes for editorial, 25 fps, timecode from the EXR header, 16-bit intermediates
 
 ```
 python vfx-transcode.py -i D:/shots/sh010/comp/sh010_comp.1001.exr ^
-  -preset prores422hq -r 25 -timecode_source exr -mezzanine_16bit 1 -burn_preset editorial
+  -preset prores422hq -r 25 -timecode_source metadata -mezzanine_16bit 1 -burn_preset editorial
 ```
 
 Frame rate and timecode both taken from the renders, with 25 fps for files without a rate:
 
 ```
 python vfx-transcode.py -i D:/shots/sh010/comp/sh010_comp.1001.exr ^
-  -fps_source exr -r 25 -timecode_source exr
+  -fps_source exr -r 25 -timecode_source metadata
 ```
 
 Your own burn-ins without a preset:
@@ -1082,7 +1319,7 @@ ProRes for conforming, with the reel name from the EXR `owner` attribute and the
 
 ```
 python vfx-transcode.py -i D:/shots/sh010/comp/sh010_comp.1001.exr ^
-  -preset prores422hq -timecode_source exr -reelid_source exr
+  -preset prores422hq -timecode_source metadata -reelid_source metadata
 ```
 
 The same with an explicit reel name built from the shot name:

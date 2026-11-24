@@ -141,6 +141,17 @@ def build(copied, explicit, context, preset_layers=()):
     return merged
 
 
+def oiio_args(metadata):
+    """--attrib arguments for oiiotool: each tag as a string attribute of the written image.
+    Expression evaluation is off around them, so braces in a value stay as they are."""
+    if not metadata:
+        return []
+    args = ["--evaloff"]
+    for key, value in metadata.items():
+        args += ["--attrib:type=string", key, str(value)]
+    return args + ["--evalon"]
+
+
 def ffmpeg_args(metadata, timecode, ext, write_timecode, reel_name=""):
     """-metadata / -timecode arguments for the output file.
 

@@ -38,9 +38,12 @@ VALIGN_CHOICES = ("center", "top")
 SLATE_COLOR_FIELDS = ("background", "title_color", "subtitle_color", "value_color", "label_color",
                       "line_color")
 SLATE_SIZE_FIELDS = ("title_size", "subtitle_size", "size")
+LOGO_POSITIONS = ("tl", "tc", "tr", "ml", "mc", "mr", "bl", "bc", "br")
+LOGO_STYLE_FIELDS = ("logo_position", "logo_size", "logo_x", "logo_y")
 SLATE_STYLE_FIELDS = SLATE_COLOR_FIELDS + SLATE_SIZE_FIELDS + ("scale", "valign", "rule",
-                                                               "hide_empty", "font", "color")
-SLATE_PRESET_FIELDS = ("notes", "title", "subtitle", "fields", "thumbnail", "hide_empty") \
+                                                               "hide_empty", "font", "color") \
+    + LOGO_STYLE_FIELDS
+SLATE_PRESET_FIELDS = ("notes", "title", "subtitle", "fields", "thumbnail", "hide_empty", "logo") \
     + SLATE_STYLE_FIELDS
 SLATE_KEYWORDS = ("clean_name", "frame_start", "frame_end", "frames", "timecode", "timecode_end",
                   "duration", "fps", "width", "height", "par", "colour", "reel", "preset",
@@ -70,6 +73,11 @@ class SlateSpec:
     scale: float = 1.0                 # whole layout: 0.5 = half size, centred
     valign: str = "center"             # center | top
     font: Optional[str] = None
+    logo: str = ""                     # vendor logo image (PNG with alpha), "" = none
+    logo_position: str = "tr"          # tl tc tr / ml mc mr / bl bc br (top/middle/bottom)
+    logo_size: str = "10%"             # logo height: % of the picture height, or pixels
+    logo_x: str = "4%"                 # distance from the left / right edge: % of the width or px
+    logo_y: str = "5%"                 # distance from the top / bottom edge: % of the height or px
     burnin: bool = False               # draw the burn-ins on the slate as well
     notes: str = ""
 
@@ -113,7 +121,55 @@ def style_values(values, where):
         out["rule"] = parse_bool(values["rule"], where + ": rule")
     if values.get("hide_empty") is not None:
         out["hide_empty"] = parse_bool(values["hide_empty"], where + ": hide_empty")
+    if values.get("logo_position") is not None:
+        out["logo_position"] = parse_logo_position(values["logo_position"], where + ": logo_position")
+    if values.get("logo_size") is not None:
+        out["logo_size"] = parse_size(values["logo_size"], where + ": logo_size")
+    for key in ("logo_x", "logo_y"):
+        if values.get(key) is not None:
+            out[key] = parse_offset(values[key], "{}: {}".format(where, key))
     return out
+
+
+_POSITION_WORDS = {"top": "t", "middle": "m", "center": "m", "centre": "m", "bottom": "b",
+                   "left": "l", "right": "r"}
+
+
+def parse_logo_position(value, where="-slate_logo_position"):
+    """tl tc tr ml mc mr bl bc br, or words: top-right, bottom-left, center ..."""
+    text = str(value).strip().lower().replace("_", "-").replace(" ", "-")
+    if text in ("center", "centre", "middle"):
+        text = "mc"
+    elif "-" in text or text in _POSITION_WORDS:
+        parts = [_POSITION_WORDS.get(p, "?") for p in text.split("-")]
+        vertical = next((p for p in parts if p in "tmb"), "m")
+        horizontal = next((p for p in parts if p in "lr"), "c")
+        text = vertical + horizontal if "?" not in parts else text
+    if text not in LOGO_POSITIONS:
+        raise TranscodeError('{}: use one of {} (or top-right, bottom-left ...), got "{}".'.format(
+            where, " ".join(LOGO_POSITIONS), value))
+    return text
+
+
+def parse_offset(value, where):
+    """Logo distance from the edge: "4%" of the picture side, or pixels; 0 is allowed."""
+    text = str(value).strip()
+    if text in ("0", "0%", "0px"):
+        return "0"
+    return parse_size(text, where)
+
+
+def offset_pixels(value, side):
+    return 0.0 if value == "0" else size_pixels(value, side)
+
+
+def logo_overlay_xy(spec, cw, ch):
+    """overlay x / y expressions (w, h = the logo's size) for the logo's position."""
+    mx, my = offset_pixels(spec.logo_x, cw), offset_pixels(spec.logo_y, ch)
+    v, h = spec.logo_position[0], spec.logo_position[1]
+    x = {"l": "{:.0f}".format(mx), "c": "(W-w)/2", "r": "W-w-{:.0f}".format(mx)}[h]
+    y = {"t": "{:.0f}".format(my), "m": "(H-h)/2", "b": "H-h-{:.0f}".format(my)}[v]
+    return x, y
 
 
 def parse_bool(value, where):
@@ -374,7 +430,7 @@ def canvas_size(fmt, par):
     return max(2, width), fmt.height
 
 
-def build_slate_command(ffmpeg, spec, fmt, par, lay, thumb_path, out_path, font=""):
+def build_slate_command(ffmpeg, spec, fmt, par, lay, thumb_path, out_path, font="", logo_path=""):
     from .ffmpeg import escape_text_expansion, make_filter   # ffmpeg.py imports this module
     cw, ch = lay.width, lay.height
     cmd = [ffmpeg, "-hide_banner", "-y", "-f", "lavfi",
@@ -392,6 +448,19 @@ def build_slate_command(ffmpeg, spec, fmt, par, lay, thumb_path, out_path, font=
         graph.append("[0:v][thumb]" + make_filter("overlay", [("x", str(x)), ("y", str(y))])
                      + "[base]")
         current = "[base]"
+    if logo_path:
+        index = 2 if lay.thumb and thumb_path else 1
+        cmd += ["-i", Path(logo_path).as_posix()]
+        height = max(2, int(round(size_pixels(spec.logo_size, ch))))
+        x, y = logo_overlay_xy(spec, cw, ch)
+        # the logo keeps its own proportions; its alpha decides what shows through
+        graph.append("[{}:v]".format(index) + ",".join([
+            make_filter("scale", [("w", "-1"), ("h", str(height)), ("flags", "bicubic")]),
+            make_filter("format", [("pix_fmts", "rgba")]),
+            make_filter("setsar", [("sar", "1")])]) + "[logo]")
+        graph.append(current + "[logo]" + make_filter("overlay", [("x", x), ("y", y), ("format", "auto")])
+                     + "[withlogo]")
+        current = "[withlogo]"
     chain = []
     if spec.rule:
         rx, ry, rw, rh = lay.rule
@@ -461,7 +530,14 @@ def render_slate(cfg, spec, context, expand, fmt, thumb_path, out_path):
     if font and not Path(font).is_file():
         log.warning('Slate font "%s" not found, using ffmpeg default font.', font)
         font = ""
-    cmd = build_slate_command(cfg.ffmpeg, spec, fmt, cfg.par_in, lay, thumb_path, out_path, font)
+    logo = spec.logo
+    if logo and not Path(logo).is_file():
+        log.warning('Slate logo "%s" not found; the slate has no logo.', logo)
+        logo = ""
+    elif logo:
+        log.info("Slate logo: %s, %s high, %s", logo, spec.logo_size, spec.logo_position)
+    cmd = build_slate_command(cfg.ffmpeg, spec, fmt, cfg.par_in, lay, thumb_path, out_path, font,
+                              logo)
     run_tool(cmd, "ffmpeg (slate)", cfg.verbose)
     made = probe_frame(cfg.ffmpeg, out_path, cfg.verbose)
     if (made.width, made.height) != (fmt.width, fmt.height):

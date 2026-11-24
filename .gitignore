@@ -24,3 +24,7 @@ ocio/*
 !ocio/README.md
 oiio/*
 !oiio/README.md
+
+# presets / super-presets saved by the tuner: safe copies and save locks
+*_safecopy[0-9]*.json
+*.json.lock

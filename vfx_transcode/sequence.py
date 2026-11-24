@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from .errors import TranscodeError
 
@@ -23,6 +23,9 @@ class Sequence:
     ext: str           # extension as found on disk (".exr")
     zfill: int         # frame number padding, 0 for a single un-numbered file
     frames: Tuple[int, ...]  # frames present on disk, sorted
+    # where the files are when not in folder: a movie's unpacked frames live in the intermediate
+    # folder, while folder stays the movie's (outputs and ./ paths are relative to it)
+    frames_folder: Optional[Path] = None
 
     @property
     def numbered(self):
@@ -54,7 +57,7 @@ class Sequence:
         return "{}{:0{}d}{}".format(self.base, frame, self.zfill, ext)
 
     def path(self, frame):
-        return self.folder / self.name(frame)
+        return (self.frames_folder or self.folder) / self.name(frame)
 
     def frame_of(self, path):
         """Frame number of a file of this sequence, or None."""

@@ -7,7 +7,7 @@ rem
 rem Result:
 rem   dist\vfx-transcode\vfx-transcode.exe          one-file console exe
 rem   dist\vfx-transcode\vfx-transcode-tuner.exe    windowed tuner, uses the _internal folder
-rem   dist\vfx-transcode\presets.json, docs\, README.md, ffmpeg\, oiio\, ocio\, fonts\
+rem   dist\vfx-transcode\presets.json, vfx-transcode.ini, docs\, README.md, ffmpeg\, oiio\, ocio\, fonts\
 rem The tuner runs the vfx-transcode.exe that sits next to it; both read ./presets.json and the
 rem ./ffmpeg, ./oiio, ./ocio tool paths relative to the exe folder.
 
@@ -73,6 +73,8 @@ if errorlevel 1 goto :fail
 copy /y "build\cli\vfx-transcode.exe" "%OUT%\" >nul
 if errorlevel 1 goto :fail
 copy /y presets.json "%OUT%\" >nul
+rem the ini may already point to the studio preferences: keep an existing one
+if not exist "%OUT%\vfx-transcode.ini" copy /y vfx-transcode.ini "%OUT%\" >nul
 copy /y README.md "%OUT%\" >nul
 xcopy /e /i /q /y docs "%OUT%\docs" >nul
 

@@ -32,8 +32,8 @@ from .burnin import (BURN_PLACES, DEFAULT_MARGINS, PLACE_NAMES, BurnStyle, margi
 from .config import Config
 from .deep import parse_zrange, plan_depth_view
 from .errors import TranscodeError
-from .ffmpeg import (BurnContext, build_command, build_video_filter, encode, encode_args,
-                     write_concat_list)
+from .ffmpeg import (BurnContext, build_command, build_image_command, build_video_filter, encode,
+                     encode_args, write_concat_list)
 from .oiio import convert_sequence
 from .oiio_info import get_image_info, write_info_json
 from . import metadata as md
@@ -48,15 +48,21 @@ from .transforms import INPUT_KEYWORDS, input_tokens, select as select_transform
 from . import filmstrip as fs
 from .thumbnails import (choose_frame as choose_thumbnail_frame, ffmpeg_command as thumbnail_ffmpeg,
                          oiiotool_command as thumbnail_oiiotool, parse_frame as parse_thumbnail_frame)
-from .oiio import process_args
+from .oiio import plain_args, process_args
+from .thumbnails import _without_depth
 from .sequence import fill_holes, find_sequence, format_frames
+from . import movie as mv
+from .movie import DEFAULT_FIRST_FRAME
+from . import outseq
+from . import super_presets as sp
+from . import studio
 from .channels import find_alpha
 from .slate import (PLAIN_SLATE, SLATE_STYLE_FIELDS, SlateSpec, apply_field_options, has_alpha, movie_size,
                     parse_thumbnail, pick_thumbnail, probe_frame, probe_frames, render_slate,
                     slate_timecode, style_values)
 from .timecode import (fps_display, fps_from_attribs, fps_to_str, frame_to_tc, nominal_fps,
                        offset_timecode, parse_fps, timecode_from_attribs, validate_timecode)
-from .tools import TOOLS, app_dir, ffmpeg_filters, resolve_path, resolve_tool, run_tool, split_args
+from .tools import TOOLS, app_dir, expand_path, ffmpeg_filters, resolve_path, resolve_tool, run_tool, split_args
 
 log = logging.getLogger("vfx_transcode")
 
@@ -143,7 +149,24 @@ def build_parser(presets=None, presets_error=None):
                         "-thumbnail_frame (default middle). Used by vfx-transcode-tuner")
     p.add_argument("-r", "--fps", default=None, metavar="RATE",
                    help="Frame rate: 24, 25, 23.976, 24000/1001. See -fps_source for how it "
-                        "combines with the EXR header; 24 if neither gives one")
+                        "combines with the EXR header (or a movie's own rate); 24 if neither "
+                        "gives one")
+    p.add_argument("-in", dest="trim_in", type=int, default=None, metavar="FRAME",
+                   help="Trim: the first frame to use (frame number, inclusive)")
+    p.add_argument("-out", dest="trim_out", type=int, default=None, metavar="FRAME",
+                   help="Trim: the last frame to use (frame number, inclusive)")
+    p.add_argument("-seq_preset", default=None, metavar="NAME",
+                   help="Sequence preset from the presets file (oiiotool output settings for an "
+                        "image sequence -o: bit depth, compression, quality). Default: the file's "
+                        "default_sequence_presets entry for the output's format")
+    p.add_argument("-seq_args", default="", metavar="ARGS",
+                   help="oiiotool output arguments for an image sequence -o, replacing the "
+                        "sequence preset, e.g. \"-d half --compression dwab:45\". Without either: "
+                        "exr -d half --compression zip; jpg -d uint8 --compression jpeg:95; png/tif "
+                        "-d uint8 (uint16 with -mezzanine_16bit 1); dpx -d uint10")
+    p.add_argument("-movie_first_frame", type=int, default=None, metavar="N",
+                   help="Movie input (.mov .mp4 .mxf ...): the frame number of its first frame, "
+                        "for burn-ins, -thumbnail_frame and the frame counter. Default 1001")
     p.add_argument("-fps_source", choices=("arg", "exr", "arg_only"), default="arg",
                    help="arg (default): -r wins, else the EXR header, else 24. "
                         "exr: the EXR header wins, else -r, else 24. "
@@ -158,9 +181,11 @@ def build_parser(presets=None, presets_error=None):
                    help="same (default): keep the pixels and tag the movie with the input pixel "
                         "aspect. square: reformat for square pixels (height scaled, -width kept). "
                         "PAR: reformat for that pixel aspect, e.g. 2")
-    p.add_argument("-ci", "--colorin", default="ACEScg", metavar="",
-                   help='EXR (input) colourspace, e.g. ACEScg, "Utility - Linear - sRGB". Default ACEScg')
-    p.add_argument("-co", "--colorout", default="out_rec709", metavar="",
+    p.add_argument("-ci", "--colorin", default=None, metavar="",
+                   help='EXR (input) colourspace, e.g. ACEScg, "Utility - Linear - sRGB". Default '
+                        "ACEScg. Other input through oiiotool (a sequence or EXR output): only "
+                        "converted when -ci / -co is given")
+    p.add_argument("-co", "--colorout", default=None, metavar="",
                    help="Output colourspace, e.g. out_rec709, out_srgb. Default out_rec709")
     p.add_argument("-display", default=None, metavar="NAME",
                    help='OCIO display, e.g. "sRGB - Display" (ACES 1.3+ configs). With -display '
@@ -176,6 +201,10 @@ def build_parser(presets=None, presets_error=None):
                         '"D:/luts/{namesplit1}/{namesplit2}.clf" or {meta:ATTR}; ./ is relative '
                         "to the application. -co then only names the output for the movie's "
                         "colour tags (out_srgb for sRGB). EXR only")
+    p.add_argument("-colour_preset", "-color_preset", default=None, metavar="NAME",
+                   help="Colour preset from the presets file (\"colour_presets\"): named "
+                        "-ci / -co / -display / -view / -looks / -clf / -ocio values, e.g. "
+                        "rec709_to_acescg. Options given on the command line win")
     p.add_argument("-ocio_info", action="store_true",
                    help="Print the colourspaces, displays and views of the OCIO config (oiiotool "
                         "--colorconfiginfo) and exit. -i is not needed")
@@ -194,8 +223,9 @@ def build_parser(presets=None, presets_error=None):
     g.add_argument("-oiio", default=None, metavar="PATH",
                    help="oiiotool executable. Default: the presets file's tools.oiiotool, else "
                         "./oiio/oiiotool.exe")
-    g.add_argument("-ocio", default="./ocio/aces_1.2cg/config.ocio",
-                   help="OCIO config file, or an ocio:// built-in config URI")
+    g.add_argument("-ocio", default=None,
+                   help="OCIO config file, or an ocio:// built-in config URI. Default: the "
+                        "colour preset's, else " + DEFAULT_OCIO)
 
     g = p.add_argument_group("EXR conversion (oiiotool)")
     g.add_argument("-oiio_threads", type=int, default=0,
@@ -244,16 +274,26 @@ def build_parser(presets=None, presets_error=None):
                         "(default) or stop with an error")
 
     g = p.add_argument_group("timecode, metadata and burn-in")
-    g.add_argument("-timecode_source", choices=("counter", "arg", "exr"), default=None,
+    g.add_argument("-timecode_source", choices=("counter", "arg", "exr"), type=metadata_source,
+                   default=None, metavar="{counter,arg,metadata}",
                    help="counter: from the first frame number and fps (1001 at 24 fps = "
-                        "00:00:41:17), the default. arg: -timecode. exr: the EXR header "
-                        "timecode (falls back to counter if there is none)")
+                        "00:00:41:17), the default. arg: -timecode. metadata: the timecode in the "
+                        "EXR header or the movie (falls back to counter if there is none); "
+                        "exr is the old name of metadata")
     g.add_argument("-timecode", default=None,
                    help="Start timecode HH:MM:SS:FF. Giving it implies -timecode_source arg")
     flag(g, "-timecode_from_counter", None,
          "Old switch: 1 = -timecode_source counter, 0 = -timecode_source arg")
     flag(g, "-output_timecode", True,
-         "Write the timecode to the output (timecode track in mov/mp4/mxf, a tag otherwise)")
+         "Write the timecode to the output: a timecode track in mov/mp4/mxf, a tag in other "
+         "containers; in an EXR or DPX sequence each frame's own timecode (smpte:TimeCode)")
+    flag(g, "-seq_metadata", True,
+         "Image sequence written by oiiotool: write the -metadata tags and the metadata preset's "
+         "tags into each image as string attributes (EXR keeps them all; other formats what "
+         "they can store). 0: none")
+    flag(g, "-output_reelid", True,
+         "Write the reel name to the output: the movie, or each image of an EXR sequence "
+         "(reelName). 0: it is still found, for the slate and the {reel} keyword, but not written")
     g.add_argument("-metadata", action="append", default=[], metavar="KEY=VALUE",
                    help="Write a metadata tag; repeatable; KEY= removes a preset's tag. Values may use {clean_name} "
                         "{frame_start} {frame_end} {timecode} {fps} {preset} {date} {meta:ATTR} and the name "
@@ -277,10 +317,11 @@ def build_parser(presets=None, presets_error=None):
     g.add_argument("-metadata_preset", default=None, metavar="NAME",
                    help='Metadata preset from the presets file (tags, copy rules, reel name and '
                         'timecode settings), or "none". The options below override its values')
-    g.add_argument("-reelid_source", choices=("auto", "arg", "exr", "off"), default=None,
-                   help="Reel name for conforming. auto (default): -reelid, else the EXR "
-                        "attribute, else none. arg: -reelid only. exr: the EXR attribute, else "
-                        "-reelid. off: no reel name")
+    g.add_argument("-reelid_source", choices=("auto", "arg", "exr", "off"), type=metadata_source,
+                   default=None, metavar="{auto,arg,metadata,off}",
+                   help="Reel name for conforming. auto (default): -reelid, else the header "
+                        "attribute, else none. arg: -reelid only. metadata: the header attribute, "
+                        "else -reelid (exr is the old name). off: no reel name")
     g.add_argument("-reelid", default=None, metavar="TEXT",
                    help="Explicit reel name; may use {clean_name} and the other -metadata keywords")
     g.add_argument("-reelid_attr", default=None, metavar="NAME",
@@ -364,14 +405,31 @@ def build_parser(presets=None, presets_error=None):
                    help="Any slate style setting, e.g. \"title_color=yellow,background=#000000\". "
                         "Keys: " + ", ".join(k for k in SLATE_STYLE_FIELDS if k != "font") +
                         " (color = title and value colour). Repeatable; wins over the options above")
+    g.add_argument("-slate_logo", default=None, metavar="PATH",
+                   help="Vendor logo drawn on the slate: an image, best a PNG with alpha. "
+                        "./ = the application folder. \"\" removes a preset's logo")
+    g.add_argument("-slate_logo_position", default=None, metavar="tl|tc|tr|ml|mc|mr|bl|bc|br",
+                   help="Where the logo sits: top / middle / bottom + left / centre / right "
+                        "(top-right, bottom-left ... work too). Default tr")
+    g.add_argument("-slate_logo_size", default=None, metavar="SIZE",
+                   help="Logo height: percent of the picture height (10%% default) or pixels; "
+                        "the width follows the logo's proportions")
+    g.add_argument("-slate_logo_x", default=None, metavar="SIZE",
+                   help="Logo distance from the left / right edge: percent of the width (4%% "
+                        "default) or pixels. Not used for a centred position")
+    g.add_argument("-slate_logo_y", default=None, metavar="SIZE",
+                   help="Logo distance from the top / bottom edge: percent of the height (5%% "
+                        "default) or pixels. Not used for a middle position")
     flag(g, "-slate_rule", None, "Line under the slate title. Default: the preset's, else 0")
     flag(g, "-slate_burnin", False, "Draw the burn-ins on the slate frame too")
 
     g = p.add_argument_group("alpha")
-    g.add_argument("-alpha", choices=("drop", "keep"), default="drop",
-                   help="drop (default): the movie has no alpha. keep: carry the input alpha into "
-                        "the movie; needs an encode preset that can store it (marked [alpha] "
-                        "below, e.g. prores4444) or -ff_encode with an alpha pixel format")
+    g.add_argument("-alpha", choices=ALPHA_MODES, default="drop",
+                   help="drop (default): the output has no alpha. keep: carry the input alpha into "
+                        "the output; a movie needs an encode preset that can store it (marked "
+                        "[alpha] below, e.g. prores4444) or -ff_encode with an alpha pixel format, "
+                        "a sequence must be exr, png or tif (else an error). auto: as keep when "
+                        "the input has alpha and the output can store it, else as drop (no error)")
     flag(g, "-alpha_premult", False,
          "With -alpha keep: 1 = colour premultiplied by alpha, 0 (default) = straight "
          "(unpremultiplied) colour, what most players and editors expect in a mov")
@@ -391,15 +449,41 @@ def build_parser(presets=None, presets_error=None):
                         "0 (default) = no line")
     g.add_argument("-letterbox_line_color", default=None, metavar="R,G,B,A",
                    help="Line colour, 0-255 per channel. Default 255,255,255,255")
+    flag(g, "-oiio_letterbox", False,
+         "Letterbox drawn by oiiotool on the converted frames (EXR input, or any oiiotool-only "
+         "sequence output), so no ffmpeg is needed for it. Size from the frames after the OIIO "
+         "transform; on the slate too, as the slate is made from them")
+    g.add_argument("-oiio_letterbox_ratio", default=None, metavar="RATIO",
+                   help="As -letterbox_ratio, for the oiiotool letterbox")
+    g.add_argument("-oiio_letterbox_color", default=None, metavar="R,G,B,A",
+                   help="As -letterbox_color (0-255; alpha below 255 = see-through)")
+    g.add_argument("-oiio_letterbox_line", type=int, default=None, metavar="PIXELS",
+                   help="As -letterbox_line")
+    g.add_argument("-oiio_letterbox_line_color", default=None, metavar="R,G,B,A",
+                   help="As -letterbox_line_color")
 
     g = p.add_argument_group("encoding (ffmpeg)")
     flag(g, "-skipffmpeg", False, "Only convert the EXRs; implies -temp_keep 1")
+    g.add_argument("-super_preset", default=None, metavar="NAME[,NAME]",
+                   help="Super-preset from super_presets.json (written by vfx-transcode-tuner): "
+                        "the options of its areas (encode, transform, burn-in, slate, filmstrip, "
+                        "metadata, letterbox) go in front of the command line's, which win")
+    g.add_argument("-super_presets_file", default=None, metavar="PATH",
+                   help="super_presets.json to read. Default: next to the presets file")
     g.add_argument("-preset", default=None,
                    help="Encode preset from the presets file, see the list below. "
                         "Default: the file's \"default\"")
-    g.add_argument("-presets_file", default=DEFAULT_PRESETS_FILE,
+    g.add_argument("-presets_file", default=None,
                    help="JSON file with the encode, burn-in, metadata and slate presets and channel "
-                        "preferences. Default ./presets.json (relative to the application)")
+                        "preferences. Default: the studio preferences named in vfx-transcode.ini "
+                        "next to the application, else ./presets.json (relative to the application)")
+    g.add_argument("-ff_transform_preset", default=None, metavar="NAME",
+                   help="ffmpeg transform preset from the presets file (\"ff_transforms\"); "
+                        "-ff_transform wins")
+    g.add_argument("-ff_transform", default="", metavar="FILTERS",
+                   help="ffmpeg filters that replace the -width scale, e.g. "
+                        "\"scale=w=2048:h=-2:flags=lanczos\" or a zscale chain. Filters are "
+                        "separated by commas or new lines; a line starting with # is skipped")
     g.add_argument("-ff_filter", default="",
                    help="Extra ffmpeg video filters, inserted before the burn-ins")
     g.add_argument("-ff_encode", default="",
@@ -407,6 +491,12 @@ def build_parser(presets=None, presets_error=None):
                         "Use {videofilter} where the -vf filter goes")
     g.add_argument("-ff_out_ext", default=None, help="Output extension. Default: from the preset")
     return p
+
+
+def metadata_source(value):
+    """-timecode_source / -reelid_source value: "metadata" is the new name of "exr"."""
+    value = value.strip().lower()
+    return "exr" if value == "metadata" else value
 
 
 def timecode_source_from_args(ns, metadata_preset=None):
@@ -417,6 +507,12 @@ def timecode_source_from_args(ns, metadata_preset=None):
     if metadata_preset is not None and metadata_preset.timecode_source:
         return metadata_preset.timecode_source
     return "counter"
+
+
+def timecode_source_given(ns, metadata_preset=None):
+    """False when the timecode source is only the default (the frame counter)."""
+    return bool(ns.timecode_source or ns.timecode is not None or ns.timecode_from_counter is not None
+                or (metadata_preset is not None and metadata_preset.timecode_source))
 
 
 def _pick(cli_value, preset, attr, default):
@@ -430,7 +526,8 @@ def _pick(cli_value, preset, attr, default):
 
 SLATE_OPTIONS = ("slate_title", "slate_subtitle", "slate_thumbnail", "slate_size", "slate_scale",
                  "slate_valign", "slate_title_size", "slate_subtitle_size", "slate_value_color",
-                 "slate_label_color")
+                 "slate_label_color", "slate_logo", "slate_logo_position", "slate_logo_size",
+                 "slate_logo_x", "slate_logo_y")
 
 
 def parse_slate_style(items):
@@ -474,7 +571,11 @@ def slate_from_args(ns, presets):
     options = {"size": ns.slate_size, "title_size": ns.slate_title_size,
                "subtitle_size": ns.slate_subtitle_size, "value_color": ns.slate_value_color,
                "label_color": ns.slate_label_color, "scale": ns.slate_scale,
-               "valign": ns.slate_valign, "rule": ns.slate_rule}
+               "valign": ns.slate_valign, "rule": ns.slate_rule,
+               "logo_position": ns.slate_logo_position, "logo_size": ns.slate_logo_size,
+               "logo_x": ns.slate_logo_x, "logo_y": ns.slate_logo_y}
+    if ns.slate_logo is not None:
+        changes["logo"] = resolve_path(expand_path(ns.slate_logo.strip()), app_dir())
     changes.update(style_values(options, "command line"))
     changes.update(style_values(parse_slate_style(ns.slate_style), "-slate_style"))
     if spec.font:
@@ -482,21 +583,101 @@ def slate_from_args(ns, presets):
     return replace(spec, **changes)
 
 
+ALPHA_MODES = ("drop", "keep", "auto")
 ALPHA_MEZZANINES = ("png", "tif", "tiff", "exr")
+ALPHA_SEQUENCES = (".exr", ".png", ".tif", ".tiff")
+
+
+def alpha_blocker(ns, preset):
+    """Why the output cannot store alpha, or None when it can."""
+    seq_ext = outseq.sequence_ext(ns.o)
+    if seq_ext and seq_ext not in ALPHA_SEQUENCES:
+        return "{} files cannot store alpha; use exr, png or tif.".format(seq_ext.lstrip("."))
+    if not seq_ext and not ns.ff_encode and not preset.alpha_pix_fmt:
+        return ('the encode preset "{}" cannot store alpha. Use a preset with "alpha_pix_fmt" '
+                '(e.g. prores4444), or -ff_encode with an alpha pixel format such as '
+                'yuva444p10le.'.format(preset.name))
+    if seq_ext != ".exr" and ns.mezzanine.strip().lower().lstrip(".") not in ALPHA_MEZZANINES:
+        return "-mezzanine {} cannot store alpha; use png or tif.".format(ns.mezzanine)
+    return None
 
 
 def check_alpha_args(ns, preset):
-    if ns.alpha != "keep":
-        if ns.alpha_premult:
-            log.warning("-alpha_premult ignored: -alpha is drop.")
-        return
-    if not ns.ff_encode and not preset.alpha_pix_fmt:
-        raise TranscodeError('-alpha keep: the encode preset "{}" cannot store alpha. Use a '
-                             'preset with "alpha_pix_fmt" (e.g. prores4444), or -ff_encode with an '
-                             'alpha pixel format such as yuva444p10le.'.format(preset.name))
-    if ns.mezzanine.strip().lower().lstrip(".") not in ALPHA_MEZZANINES:
-        raise TranscodeError("-alpha keep: -mezzanine {} cannot store alpha; use png or tif."
-                             .format(ns.mezzanine))
+    """-alpha as run: keep or drop. auto becomes keep when the output can store alpha (whether
+    the input has one is only known later), else drop; keep with such an output is an error."""
+    mode = ns.alpha
+    if mode != "drop":
+        blocker = alpha_blocker(ns, preset)
+        if blocker and mode == "keep":
+            raise TranscodeError("-alpha keep: " + blocker)
+        if blocker:
+            log.info("Alpha: not kept (-alpha auto): %s", blocker)
+            mode = "drop"
+        else:
+            mode = "keep"
+    if mode == "drop" and ns.alpha_premult:
+        log.warning("-alpha_premult ignored: no alpha in the output.")
+    return mode
+
+
+def alpha_missing(cfg, text, *args):
+    """No alpha in the input: a warning for -alpha keep, information for -alpha auto."""
+    (log.info if cfg.alpha_auto else log.warning)(text, *args)
+
+
+DEFAULT_COLORIN, DEFAULT_COLOROUT = "ACEScg", "out_rec709"
+OIIO_LETTERBOX_OPTIONS = ("oiio_letterbox_ratio", "oiio_letterbox_color", "oiio_letterbox_line",
+                          "oiio_letterbox_line_color")
+
+
+def sequence_args_from(ns, presets):
+    """(oiiotool output args, where from) for an image sequence -o: -seq_args, else
+    -seq_preset, else the presets file's default for the format, else ([], "") = built-in."""
+    ext = outseq.norm_ext(outseq.sequence_ext(ns.o))
+    if ns.seq_args.strip():
+        return split_args(ns.seq_args), "-seq_args"
+    sequences = presets.sequences if presets is not None else {}
+    if ns.seq_preset:
+        if ns.seq_preset not in sequences:
+            raise TranscodeError('Unknown sequence preset "{}". Available: {}'.format(
+                ns.seq_preset, ", ".join(sequences) or "none"))
+        preset = sequences[ns.seq_preset]
+        if ext and preset.ext != ext:
+            log.warning('-seq_preset %s is a %s preset, the output is %s: its settings may not fit.',
+                        preset.name, preset.ext, ext)
+        return list(preset.args), preset.name
+    defaults = presets.default_sequences if presets is not None else {}
+    if ext and ext in defaults:
+        preset = sequences[defaults[ext]]
+        return list(preset.args), preset.name
+    return [], ""
+
+
+def ff_transform_from_args(text):
+    """-ff_transform: one filter chain from lines and commas; # lines skipped."""
+    lines = [l.strip() for l in (text or "").replace("\r", "").split("\n")]
+    parts = [l.rstrip(",") for l in lines if l and not l.startswith("#")]
+    return ",".join(p for p in parts if p)
+
+
+def oiio_letterbox_from_args(ns):
+    given = [o for o in OIIO_LETTERBOX_OPTIONS if getattr(ns, o) is not None]
+    if not ns.oiio_letterbox:
+        if given:
+            log.warning("-%s ignored: the oiiotool letterbox is off (-oiio_letterbox 1 turns it on).",
+                        given[0])
+        return None
+    ratio_text = ns.oiio_letterbox_ratio or LB_DEFAULT_RATIO
+    line = ns.oiio_letterbox_line or 0
+    if line < 0:
+        raise TranscodeError("-oiio_letterbox_line must be 0 or more pixels.")
+    return LetterboxSpec(
+        ratio=parse_ratio(ratio_text, "-oiio_letterbox_ratio"), ratio_text=ratio_text.strip(),
+        fill=(parse_rgba(ns.oiio_letterbox_color, "-oiio_letterbox_color")
+              if ns.oiio_letterbox_color else LB_FILL),
+        line=line,
+        line_color=(parse_rgba(ns.oiio_letterbox_line_color, "-oiio_letterbox_line_color")
+                    if ns.oiio_letterbox_line_color else LB_LINE_COLOR))
 
 
 LETTERBOX_OPTIONS = ("letterbox_ratio", "letterbox_color", "letterbox_line", "letterbox_line_color")
@@ -520,7 +701,38 @@ def letterbox_from_args(ns):
                     if ns.letterbox_line_color else LB_LINE_COLOR))
 
 
+DEFAULT_OCIO = "./ocio/aces_1.2cg/config.ocio"
+
+
+def apply_named_presets(ns, presets):
+    """-colour_preset and -ff_transform_preset fill the options not given on the command
+    line. Safe to call twice."""
+    if getattr(ns, "_named_presets_applied", False):
+        return
+    ns._named_presets_applied = True
+    if ns.colour_preset:
+        if ns.colour_preset not in presets.colours:
+            raise TranscodeError('Unknown colour preset "{}". Available: {}'.format(
+                ns.colour_preset, ", ".join(presets.colours) or "none (add \"colour_presets\")"))
+        c = presets.colours[ns.colour_preset]
+        for attr, value, unset in (("colorin", c.ci, None), ("colorout", c.co, None),
+                                   ("display", c.display, None), ("view", c.view, None),
+                                   ("looks", c.looks, ""), ("clf", c.clf, ""), ("ocio", c.ocio, None)):
+            if value and getattr(ns, attr) in (unset, ""):
+                setattr(ns, attr, value)
+        log.info("Colour preset %s: %s", c.name, c.describe())
+    if ns.ocio is None:
+        ns.ocio = DEFAULT_OCIO
+    if ns.ff_transform_preset:
+        if ns.ff_transform_preset not in presets.ff_transforms:
+            raise TranscodeError('Unknown ffmpeg transform preset "{}". Available: {}'.format(
+                ns.ff_transform_preset, ", ".join(presets.ff_transforms) or "none (add \"ff_transforms\")"))
+        if not ns.ff_transform.strip():
+            ns.ff_transform = presets.ff_transforms[ns.ff_transform_preset].chain()
+
+
 def config_from_args(ns, presets):
+    apply_named_presets(ns, presets)
     try:
         fps_arg = parse_fps(ns.fps) if ns.fps else None
         timecode = validate_timecode(ns.timecode or "01:00:00:00")
@@ -565,7 +777,7 @@ def config_from_args(ns, presets):
         parse_zrange(ns.deep_zrange)   # validate early
     slate = slate_from_args(ns, presets)
     letterbox = letterbox_from_args(ns)
-    check_alpha_args(ns, preset)
+    alpha_mode = check_alpha_args(ns, preset)
     name_rules = merge_rules(presets.name_rules, ns.name_token)
     smart_tokens = presets.get_smart_tokens(
         ns.smart_tokens if ns.smart_tokens is not None else presets.default_smart_tokens)
@@ -582,12 +794,15 @@ def config_from_args(ns, presets):
     elif (ns.thumbnail_preset is not None or ns.thumbnail_frame is not None) and not ns.preview:
         log.warning("-thumbnail_preset / -thumbnail_frame ignored: no -ot.")
     filmstrip = filmstrip_from_args(ns, presets, token_names)
+    seq_args, seq_preset = sequence_args_from(ns, presets)
     # what to make: -o, -ot and/or -of; none of them = the movie at its default place
     movie = bool(ns.o.strip()) or (ns.ot is None and ns.of is None)
     preview_frame = "middle"
     if ns.preview:
-        if ns.o.strip() or ns.ot is not None or ns.of is not None:
-            log.warning("-preview: -o / -ot / -of are ignored, only the preview is written.")
+        if ns.ot is not None or ns.of is not None:
+            log.warning("-preview: -ot / -of are ignored, only the preview is written.")
+        if ns.o.strip() and not outseq.sequence_ext(ns.o):
+            log.debug("-preview: -o is only used to tell an image sequence output from a movie.")
         movie, thumbnail, filmstrip = True, None, None
         preview_frame = parse_thumbnail_frame(ns.thumbnail_frame or "middle")
     if ns.clf.strip() and (ns.display is not None or ns.view is not None or ns.looks):
@@ -612,8 +827,10 @@ def config_from_args(ns, presets):
         ffprobe=tools["ffprobe"][0],
         tool_sources={name: where for name, (_path, where) in tools.items()},
         ocio=ns.ocio if ns.ocio.startswith("ocio://") else resolve_path(ns.ocio, base),
-        colorin=ns.colorin,
-        colorout=ns.colorout,
+        colorin=ns.colorin or DEFAULT_COLORIN,
+        colorout=ns.colorout or DEFAULT_COLOROUT,
+        colour_given=bool(ns.colorin or ns.colorout or ns.display is not None
+                          or ns.view is not None or ns.clf.strip()),
         ocio_display=ns.display,
         ocio_view=ns.view,
         ocio_looks=ns.looks,
@@ -638,7 +855,12 @@ def config_from_args(ns, presets):
         deep_zrange=ns.deep_zrange,
         timecode=timecode,
         timecode_source=timecode_source_from_args(ns, metadata_preset),
+        timecode_source_given=timecode_source_given(ns, metadata_preset),
+        movie_first_frame=(ns.movie_first_frame if ns.movie_first_frame is not None
+                           else DEFAULT_FIRST_FRAME),
         output_timecode=ns.output_timecode,
+        output_reelid=ns.output_reelid,
+        seq_metadata=ns.seq_metadata,
         metadata_copy=_pick(ns.metadata_copy, metadata_preset, "copy", ""),
         metadata=md.parse_pairs(ns.metadata),
         metadata_preset=metadata_preset.name if metadata_preset else "",
@@ -655,6 +877,13 @@ def config_from_args(ns, presets):
         burn_margins=burn_margins,
         slate=slate,
         letterbox=letterbox,
+        oiio_letterbox=oiio_letterbox_from_args(ns),
+        trim_in=ns.trim_in,
+        trim_out=ns.trim_out,
+        ff_transform=ff_transform_from_args(ns.ff_transform),
+        seq_args=seq_args,
+        seq_preset=seq_preset,
+        seq_out_ext=outseq.sequence_ext(ns.o),
         movie=movie,
         thumbnail=thumbnail,
         preview=os.path.abspath(ns.preview) if ns.preview else "",
@@ -662,8 +891,9 @@ def config_from_args(ns, presets):
         thumbnail_output=ns.ot,
         filmstrip=filmstrip,
         filmstrip_output=ns.of,
-        alpha=ns.alpha,
-        alpha_premult=bool(ns.alpha_premult),
+        alpha=alpha_mode,
+        alpha_auto=ns.alpha == "auto",
+        alpha_premult=bool(ns.alpha_premult) and alpha_mode == "keep",
         version_regex=ns.version_regex,
         name_rules=name_rules,
         smart_tokens=smart_tokens,
@@ -774,6 +1004,9 @@ def describe_colour(cfg):
 
 def show_ocio_info(ns, presets=None):
     """-ocio_info: print what the OCIO config offers."""
+    if presets is not None:
+        apply_named_presets(ns, presets)
+    ns.ocio = ns.ocio or DEFAULT_OCIO
     base = app_dir()
     ocio = ns.ocio if ns.ocio.startswith("ocio://") else resolve_path(ns.ocio, base)
     path, where = tool_paths(ns, presets)["oiiotool"]
@@ -813,12 +1046,13 @@ def resolve_fps(cfg, info):
             chosen = (cfg.fps_arg, "-r")
             break
         if source == "exr" and header_fps is not None:
-            chosen = (header_fps, "EXR header " + header_key)
+            chosen = (header_fps, cfg.header_label if cfg.header_label != "EXR header"
+                      else "EXR header " + header_key)
             break
     if chosen is None:
         chosen = (DEFAULT_FPS, "default")
     if header_fps is not None and cfg.fps_arg is not None and header_fps != cfg.fps_arg:
-        unused = ("EXR header {}".format(fps_display(header_fps)) if chosen[1] == "-r"
+        unused = ("{} {}".format(cfg.header_label, fps_display(header_fps)) if chosen[1] == "-r"
                   else "-r {}".format(fps_display(cfg.fps_arg)))
         log.info("Frame rate: %s ignored (-fps_source %s)", unused, cfg.fps_source)
     if cfg.fps_source == "exr" and header_fps is None:
@@ -832,25 +1066,32 @@ def today():
 
 
 def resolve_timecode(cfg, seq, info, header_frame=None):
-    """Start timecode of the movie and where it came from."""
+    """Start timecode of the movie and where it came from (also kept in cfg.timecode_found,
+    for the preview report)."""
+    timecode, source = _resolve_timecode(cfg, seq, info, header_frame)
+    cfg.timecode_found = source
+    return timecode, source
+
+
+def _resolve_timecode(cfg, seq, info, header_frame=None):
     fps_int = nominal_fps(cfg.fps)
     if cfg.timecode_source == "arg":
         return cfg.timecode, "-timecode"
     if cfg.timecode_source == "exr":
         tc = None
         if info is None:
-            log.warning("-timecode_source exr needs EXR input; using the frame counter.")
+            log.warning("-timecode_source metadata needs EXR or movie input; using the frame counter.")
         else:
             tc = next((t for t in (timecode_from_attribs(sub.get("attribs", {})) for sub in info)
                        if t), None)
             if tc is None:
-                log.warning("No timecode in the EXR header; using the frame counter.")
+                log.warning("No timecode in the %s; using the frame counter.", cfg.header_label)
         if tc:
             frame = header_frame if header_frame is not None else seq.frame_of(cfg.input)
             if frame is not None and frame != seq.start:
                 # the header we read belongs to a later frame, not the first one
                 tc = offset_timecode(tc, seq.start - frame, fps_int)
-            return tc, "EXR header"
+            return tc, cfg.header_label
     return frame_to_tc(seq.start, fps_int), "frame counter"
 
 
@@ -951,7 +1192,14 @@ def smart_token_context(cfg, seq, info):
 
 
 def resolve_reel_name(cfg, seq, info, timecode):
-    """Reel name and where it came from, following -reelid_source; ("", reason) for none."""
+    """Reel name and where it came from, following -reelid_source; ("", reason) for none.
+    The source is also kept in cfg.reel_found, for the preview report."""
+    reel, source = _resolve_reel_name(cfg, seq, info, timecode)
+    cfg.reel_found = source
+    return reel, source
+
+
+def _resolve_reel_name(cfg, seq, info, timecode):
     if cfg.reelid_source == "off":
         return "", "off"
     explicit = md.expand(cfg.reelid, metadata_context(cfg, seq, timecode)).strip()
@@ -996,15 +1244,105 @@ def output_metadata(cfg, seq, info, timecode):
     return result
 
 
+SEQ_METADATA_FULL = (".exr",)
+SEQ_TIMECODE_EXTS = (".exr", ".dpx")     # oiiotool writes smpte:TimeCode into these
+SEQ_REEL_EXTS = (".exr",)                # reelName (OpenEXR standard attribute)
+EXR_REEL_ATTR = "reelName"
+
+
+def sequence_timecode(cfg, seq, timecode):
+    """(frame -> oiiotool arguments, or None; fixed arguments) for the timecode of an image
+    sequence written by oiiotool: each frame its own smpte:TimeCode. EXR input with its own
+    timecode keeps it (oiiotool carries the header), so the fast batch stays."""
+    ext = cfg.seq_out_ext
+    label = ext.lstrip(".")
+    if ext not in SEQ_TIMECODE_EXTS:
+        if cfg.output_timecode:
+            log.info("Timecode: not written, %s files have no timecode field.", label)
+        return None, []
+    if not cfg.output_timecode:
+        log.info("Timecode: not written (-output_timecode 0); any in the input header removed.")
+        return None, ["--eraseattrib", "smpte:TimeCode"]
+    if seq.is_exr and cfg.timecode_source == "exr" and cfg.timecode_found == cfg.header_label:
+        log.info("Timecode: each %s keeps the input frame's own timecode (EXR header).", label)
+        return None, []
+    fps_int = nominal_fps(cfg.fps)
+    start = seq.start
+
+    def per_frame(frame):
+        return ["--attrib:type=timecode", "smpte:TimeCode",
+                offset_timecode(timecode, frame - start, fps_int)]
+
+    log.info("Timecode: written into each %s (smpte:TimeCode), %s at frame %d", label, timecode, start)
+    return per_frame, []
+
+
+def sequence_reel(cfg, reel_name):
+    """oiiotool arguments for the reel name of an image sequence (EXR: reelName)."""
+    ext = cfg.seq_out_ext
+    if ext not in SEQ_REEL_EXTS:
+        if cfg.output_reelid and reel_name:
+            log.info("Reel name: not written, %s files have no reel name field.", ext.lstrip("."))
+        return []
+    if not cfg.output_reelid:
+        if reel_name:
+            log.info("Reel name: not written (-output_reelid 0)")
+        return ["--eraseattrib", EXR_REEL_ATTR]
+    if not reel_name:
+        return []
+    log.info("Reel name: written into each exr (%s)", EXR_REEL_ATTR)
+    return md.oiio_args({EXR_REEL_ATTR: reel_name})
+
+
+def sequence_metadata(cfg, seq, timecode):
+    """Tags for an image sequence written by oiiotool: the metadata preset's tags and
+    -metadata (not the encode preset's, those are codec settings). The input header is kept
+    by oiiotool already, so nothing is copied."""
+    if not cfg.seq_metadata:
+        return OrderedDict()
+    tags = md.build({}, cfg.metadata, metadata_context(cfg, seq, timecode), [cfg.preset_tags])
+    if tags:
+        log.info("Metadata: %s written into each %s%s", ", ".join(tags), cfg.seq_out_ext.lstrip("."),
+                 "" if cfg.seq_out_ext in SEQ_METADATA_FULL else
+                 " (as far as the format can store them; EXR keeps all)")
+    return tags
+
+
+def open_movie(cfg, base):
+    """Movie input: probe it, and the sequence its frames will be unpacked as."""
+    if not os.path.isfile(cfg.input):
+        raise TranscodeError('Input file "{}" does not exist.'.format(cfg.input))
+    cfg.ffprobe = resolve_tool(cfg.ffprobe, base, "ffprobe", cfg.tool_sources.get("ffprobe", ""))
+    info = mv.probe_movie(cfg.ffprobe, cfg.input, cfg.verbose)
+    seq = mv.movie_sequence(cfg.input, info, cfg.movie_first_frame, cfg.mezzanine_ext)
+    cfg.header_label = "movie"
+    if not cfg.timecode_source_given and info.timecode:
+        cfg.timecode_source = "exr"            # the movie's own timecode, unless told otherwise
+    log.info("Input: movie %s  %s, frames numbered %s", cfg.input, info.describe(),
+             format_frames(seq.frames))
+    if cfg.clf or cfg.display_mode:
+        log.info("Colour: a movie is used as it is (display-referred); no OCIO conversion.")
+    return info, seq
+
+
 def run(cfg):
-    seq = find_sequence(cfg.input)
+    base = app_dir()
+    movie = None
+    if mv.is_movie(cfg.input):
+        movie, seq = open_movie(cfg, base)
+    else:
+        seq = find_sequence(cfg.input)
+    full_seq = seq                         # the preview may show a frame outside the trim
+    seq = trim_sequence(cfg, seq)
+    cfg.header_frame = cfg.movie_first_frame if movie is not None else seq.start
     cfg.name_tokens = name_tokens(seq.clean_name, cfg.version_regex)
     if cfg.name_tokens["version_string"]:
         log.info("Version: %s (from %s)", cfg.name_tokens["version_string"], seq.clean_name)
     else:
         log.debug("No version in %s (-version_regex %s)", seq.clean_name, cfg.version_regex)
-    log.info("Input: %s  frames %s (%d)", seq.folder / seq.name(seq.start),
-             format_frames(seq.frames), len(seq.frames))
+    if movie is None:
+        log.info("Input: %s  frames %s (%d)", seq.folder / seq.name(seq.start),
+                 format_frames(seq.frames), len(seq.frames))
     missing = seq.missing
     if missing:
         message = "Missing frames: {}".format(format_frames(missing))
@@ -1012,18 +1350,31 @@ def run(cfg):
             raise TranscodeError(message)
         log.warning("%s (holding the previous frame)", message)
 
-    base = app_dir()
     stills = cfg.thumbnail is not None or cfg.filmstrip is not None
-    if not cfg.skip_ffmpeg or (stills and not seq.is_exr):
+    # which tools: image sequence out is oiiotool only, except a movie to a non-EXR sequence
+    # (ffmpeg only); a movie out is ffmpeg, after oiiotool for EXR input
+    seq_out = cfg.seq_out_ext
+    oiio_only = bool(seq_out) and cfg.movie and not (movie is not None and seq_out != ".exr")
+    cfg.image_output = bool(seq_out) and cfg.movie and not oiio_only
+    cfg.skip_colour = seq_out == ".exr" and not cfg.colour_given
+    if seq_out and cfg.movie:
+        log.info("Output: %s sequence, made by %s", seq_out.lstrip("."),
+                 "oiiotool (no ffmpeg)" if oiio_only else "ffmpeg (no oiiotool)")
+        warn_unused_for_sequences(cfg, oiio_only)
+    encode_ffmpeg = cfg.movie and not cfg.skip_ffmpeg and not oiio_only
+    if encode_ffmpeg or (stills and not seq.is_exr) or movie is not None:
         cfg.ffmpeg = resolve_tool(cfg.ffmpeg, base, "ffmpeg", cfg.tool_sources.get("ffmpeg", ""))
-        if cfg.movie and not cfg.skip_ffmpeg:
+        if encode_ffmpeg:
             check_ffmpeg_filters(cfg)
     work_dir, created_dir = prepare_work_dir(cfg, seq)
     log.info("Intermediate files: %s", work_dir)
     created_files = []
     exit_code = EXIT_OK
     info = pick = depth = None
+    preview_frame = choose_preview_frame(cfg, full_seq) if cfg.preview else None
     try:
+        if movie is not None:
+            seq, info = unpack_movie(cfg, movie, seq, work_dir, preview_frame, created_files)
         if seq.is_exr:
             cfg.oiiotool = resolve_tool(cfg.oiiotool, base, "oiiotool",
                                         cfg.tool_sources.get("oiiotool", ""))
@@ -1046,12 +1397,12 @@ def run(cfg):
             depth = plan_depth_view(cfg, info, pick)
             if cfg.alpha == "keep":
                 if depth is not None:
-                    log.warning("Alpha: a depth picture has no alpha; the movie gets none.")
+                    alpha_missing(cfg, "Alpha: a depth picture has no alpha; the output gets none.")
                 else:
                     pick.alpha = find_alpha(pick, info)
                     if not pick.alpha:
-                        log.warning("Alpha: no alpha channel next to %s; the movie gets none.",
-                                    ",".join(pick.without_alpha))
+                        alpha_missing(cfg, "Alpha: no alpha channel next to %s; the output gets none.",
+                                      ",".join(pick.without_alpha))
                 cfg.alpha_active = bool(pick.alpha) and depth is None
             if depth is None:
                 log.info("Channels: %s (%s%s)", pick, pick.reason,
@@ -1078,11 +1429,16 @@ def run(cfg):
                 cfg.oiio_transform_args = choose_transform(cfg, seq, info)
             if not cfg.movie:
                 return make_stills_only(cfg, seq, info, pick, depth, exit_code, work_dir)
+            if oiio_only:
+                return write_sequence_oiio(cfg, seq, info, pick, depth, work_dir, preview_frame,
+                                           exit_code)
+            source = seq.path(preview_frame) if cfg.preview else seq.path(seq.start)
+            mid = process_args(cfg, pick, depth) + oiio_letterbox_steps(cfg, source,
+                                                                         process_args(cfg, pick, depth))
             if cfg.preview:
-                preview_frame = choose_preview_frame(cfg, seq)
-                result = convert_preview_frame(cfg, seq, preview_frame, pick, work_dir, depth)
+                result = convert_preview_frame(cfg, seq, preview_frame, pick, work_dir, depth, mid)
             else:
-                result = convert_sequence(cfg, seq, pick, work_dir, depth)
+                result = convert_sequence(cfg, seq, pick, work_dir, depth, mid=mid)
             # every target, so partial files of failed frames are removed as well
             created_files += [work_dir / seq.name(f, cfg.mezzanine_ext) for f in seq.frames]
             if result.failed:
@@ -1096,10 +1452,17 @@ def run(cfg):
             # scales the transform's output (whatever size it is) to -width
             scale_width = cfg.width if cfg.oiio_transform_args is not None else 0
         else:
+            if oiio_only and cfg.movie:
+                info = setup_oiio_for_other_input(cfg, seq, info, base, preview_frame)
+                plan_plain_alpha(cfg, seq, info, movie)
+                return write_sequence_oiio(cfg, seq, info, None, None, work_dir, preview_frame,
+                                           exit_code)
+            if cfg.oiio_letterbox is not None and cfg.movie:
+                log.warning("-oiio_letterbox: %s input to a movie runs no oiiotool; use "
+                            "-letterbox (ffmpeg).", "movie" if movie is not None else seq.ext.lstrip("."))
             add_custom_tokens(cfg, seq, info)
             available = {f: seq.path(f) for f in seq.frames}
             if cfg.preview:
-                preview_frame = choose_preview_frame(cfg, seq)
                 available = {preview_frame: seq.path(preview_frame)}
             scale_width = cfg.width
             if cfg.clf:
@@ -1108,11 +1471,12 @@ def run(cfg):
             if not cfg.movie:
                 return make_stills_only(cfg, seq, info, pick, depth, exit_code, work_dir)
             if cfg.alpha == "keep" and not cfg.skip_ffmpeg:
-                source_fmt = probe_frame(cfg.ffmpeg, available[seq.start], cfg.verbose)
+                source_fmt = probe_frame(cfg.ffmpeg, available[min(available)], cfg.verbose)
                 cfg.alpha_active = has_alpha(source_fmt.pix_fmt)
                 if not cfg.alpha_active:
-                    log.warning("Alpha: the %s input has no alpha (%s); the movie gets none.",
-                                seq.ext.lstrip("."), source_fmt.pix_fmt)
+                    alpha_missing(cfg, "Alpha: the %s input has no alpha (%s); the output gets none.",
+                                  "movie" if movie is not None else seq.ext.lstrip("."),
+                                  source_fmt.pix_fmt)
 
         if cfg.skip_ffmpeg:
             log.info("Skipping ffmpeg; intermediate files are in %s%s", work_dir,
@@ -1126,7 +1490,8 @@ def run(cfg):
         if cfg.alpha_active:
             log.info("Alpha: kept%s, written %s, %s", " ({})".format(pick.alpha) if seq.is_exr else "",
                      "premultiplied" if cfg.alpha_premult else "straight (unpremultiplied)",
-                     cfg.preset.alpha_pix_fmt if not cfg.ff_encode else "-ff_encode")
+                     cfg.seq_out_ext.lstrip(".") + " sequence" if cfg.image_output
+                     else cfg.preset.alpha_pix_fmt if not cfg.ff_encode else "-ff_encode")
         cfg.fps, fps_source = resolve_fps(cfg, info)
         log.info("Frame rate: %s (%s)", fps_display(cfg.fps), fps_source)
         cfg.par_in, par_source = resolve_par(cfg)
@@ -1140,7 +1505,7 @@ def run(cfg):
                 log.warning("Burn-ins are drawn in stored pixels; with output pixel aspect %s they "
                             "look stretched on playback. -par_out square avoids that.",
                             par_display(cfg.par_out_value))
-        timecode, tc_source = resolve_timecode(cfg, seq, info, seq.start)
+        timecode, tc_source = resolve_timecode(cfg, seq, info, cfg.header_frame)
         movie_tc = timecode
         if cfg.slate:
             fps_int = nominal_fps(cfg.fps)
@@ -1153,7 +1518,9 @@ def run(cfg):
                  ", slate {}".format(movie_tc) if cfg.slate else "")
         metadata = output_metadata(cfg, seq, info, timecode)
         reel_name, reel_source = resolve_reel_name(cfg, seq, info, timecode)
-        if reel_name:
+        if reel_name and not cfg.output_reelid:
+            log.info("Reel name: %s (%s), not written (-output_reelid 0)", reel_name, reel_source)
+        elif reel_name:
             log.info("Reel name: %s (%s)", reel_name, reel_source)
             ext = cfg.ff_out_ext.lower()
             if ext == "mov" and not cfg.output_timecode:
@@ -1207,6 +1574,22 @@ def run(cfg):
             write_preview(cfg, seq, info, list_file, video_filter, work_dir, preview_frame,
                           timecode, movie_tc, reel_name, metadata)
             return exit_code
+        if cfg.image_output:
+            if metadata:
+                log.info("Metadata: not written: ffmpeg writes this %s sequence (a movie input), and "
+                         "its image files carry no tags; EXR output (oiiotool) can.",
+                         cfg.seq_out_ext.lstrip("."))
+            out = resolve_output_seq(cfg, seq, output_context(cfg, seq, info, timecode, reel_name))
+            out.folder.mkdir(parents=True, exist_ok=True)
+            encode(cfg, build_image_command(cfg, list_file, out, video_filter, seq.start))
+            log.info("Done: %s (%s)", out.describe(), format_frames(seq.full_range))
+            cfg.stills_folder = out.folder
+            context = output_context(cfg, seq, info, timecode, reel_name)
+            if cfg.thumbnail is not None:
+                make_thumbnail(cfg, seq, info, pick, depth, None, context)
+            if cfg.filmstrip is not None:
+                make_filmstrip(cfg, seq, pick, depth, work_dir, context, available=available)
+            return exit_code
         output = resolve_output(cfg, seq, name, output_context(cfg, seq, info, timecode, reel_name))
         output.parent.mkdir(parents=True, exist_ok=True)
         encode(cfg, build_command(cfg, list_file, output, video_filter, movie_tc, metadata,
@@ -1227,6 +1610,275 @@ def run(cfg):
         else:
             cleanup(created_files, work_dir, created_dir,
                     whole_folder=cfg.temp_location == "user" and created_dir)
+
+
+def trim_sequence(cfg, seq):
+    """seq limited to -in / -out (inclusive frame numbers)."""
+    if cfg.trim_in is None and cfg.trim_out is None:
+        return seq
+    lo = cfg.trim_in if cfg.trim_in is not None else seq.start
+    hi = cfg.trim_out if cfg.trim_out is not None else seq.end
+    if lo > hi:
+        raise TranscodeError("-in {} is after -out {}.".format(lo, hi))
+    frames = tuple(f for f in seq.frames if lo <= f <= hi)
+    if not frames:
+        raise TranscodeError("-in / -out {}-{}: no frames of {}-{} in that range.".format(
+            lo, hi, seq.start, seq.end))
+    log.info("Trim: frames %d-%d (%d of %d)", frames[0], frames[-1], len(frames), len(seq.frames))
+    return replace(seq, frames=frames)
+
+
+def warn_unused_for_sequences(cfg, oiio_only):
+    """An image sequence output has no slate or container metadata; without ffmpeg, no
+    burn-ins, ffmpeg letterbox or ffmpeg transform either."""
+    if cfg.slate:
+        log.warning("Slate: not made for an image sequence output.")
+        cfg.slate = None
+    if oiio_only:
+        unused = [name for name, on in (("-letterbox (use -oiio_letterbox)", cfg.letterbox),
+                                        ("-ff_transform", cfg.ff_transform),
+                                        ("-ff_filter", cfg.ff_filter.strip())) if on]
+        if unused:
+            log.warning("No ffmpeg runs for this output, so these are not applied: %s.",
+                        ", ".join(unused))
+        if any(cfg.burn.values()):
+            log.info("Burn-ins: not drawn, no ffmpeg runs for this output.")
+        cfg.burn = {}
+        cfg.letterbox = None
+
+
+def oiio_letterbox_steps(cfg, source, mid):
+    """oiiotool --box steps for -oiio_letterbox, from the size the steps give one frame
+    (measured once)."""
+    if cfg.oiio_letterbox is None:
+        return []
+    if cfg.oiio_letterbox_args is None:
+        width, height, channels = outseq.measure(cfg.oiiotool, source, mid, cfg.verbose)
+        par = resolve_par(cfg, quiet=True)[0]
+        args, kind, bar = outseq.letterbox_args(cfg.oiio_letterbox, width, height, channels, par)
+        cfg.oiio_letterbox_args = args
+        cfg.oiio_letterbox_info = (kind, bar, width, height)
+        if kind == "none":
+            log.info("oiiotool letterbox %s: the %dx%d frames already have that ratio, no bars.",
+                     cfg.oiio_letterbox.ratio_text, width, height)
+        else:
+            log.info("oiiotool letterbox %s: %s, bars of %d px on the %dx%d frames",
+                     cfg.oiio_letterbox.ratio_text, kind, bar, width, height)
+    return list(cfg.oiio_letterbox_args)
+
+
+def setup_oiio_for_other_input(cfg, seq, info, base, preview_frame):
+    """oiiotool for PNG / JPG / a movie's frames: the tool, OCIO when a colour was given, the
+    header (for sizes and keywords) and the OIIO transform."""
+    cfg.oiiotool = resolve_tool(cfg.oiiotool, base, "oiiotool", cfg.tool_sources.get("oiiotool", ""))
+    if cfg.colour_given and not cfg.skip_colour:
+        if cfg.clf:
+            log.warning("-clf only applies to EXR input; not used for %s frames.", seq.ext.lstrip("."))
+        else:
+            setup_ocio(cfg)
+            log.info("Colour: %s", describe_colour(cfg))
+    first = seq.path(preview_frame if preview_frame is not None else seq.start)
+    if info is None:
+        info = get_image_info(cfg.oiiotool, str(first), cfg.verbose)
+        cfg.header_file = str(first)
+        cfg.header_attribs = md.header_attribs(info)
+    add_custom_tokens(cfg, seq, info)
+    if cfg.oiio_transform_explicit is not None:
+        context = transform_context(cfg, seq, info)
+        cfg.oiio_transform_args = [md.expand(a, context) for a in cfg.oiio_transform_explicit]
+        cfg.transform_choice = "-oiio_transform_args"
+        log.info("OIIO transform: %s", " ".join(cfg.oiio_transform_args) or "(none)")
+    elif cfg.oiio_transform is not None:
+        cfg.oiio_transform_args = choose_transform(cfg, seq, info)
+    return info
+
+
+ALPHA_NAMES = ("A", "ALPHA")
+
+
+def plan_plain_alpha(cfg, seq, info, movie):
+    """Alpha for oiiotool on frames that are not EXR: kept with -alpha keep when the frames
+    have one, else removed (--ch with the other channels)."""
+    if movie is not None:       # the frames were unpacked with alpha only for -alpha keep
+        names, alpha = [], cfg.alpha == "keep" and bool(movie.alpha)
+    else:
+        names = list((info[0] if info else {}).get("channelnames") or [])
+        alpha = [n for n in names if n.upper() in ALPHA_NAMES]
+    if cfg.alpha == "keep":
+        cfg.alpha_active = bool(alpha)
+        if alpha:
+            log.info("Alpha: kept (%s input)", "movie" if movie is not None else seq.ext.lstrip("."))
+        else:
+            alpha_missing(cfg, "Alpha: the %s input has no alpha; the output gets none.",
+                          "movie" if movie is not None else seq.ext.lstrip("."))
+    elif alpha and names:
+        cfg.alpha_strip = ",".join(n for n in names if n not in alpha)
+
+
+def resolve_output_seq(cfg, seq, context):
+    """-o as an image sequence (outseq.OutputSeq); never onto the input files."""
+    ext = cfg.seq_out_ext.lstrip(".")
+    context = dict(context, ext=ext)
+    zfill = seq.zfill or 4
+    default = "{}.{}.{}".format(seq.clean_name or "frames", "#" * zfill, ext)
+    path = resolve_path_template(cfg.output, seq, default, ext, outseq.SEQ_EXT_RE, "-o", context)
+    out = outseq.from_path(path, zfill)
+    if not seq.frames_folder and any(out.path(f).resolve() == seq.path(f).resolve()
+                                     for f in seq.frames[:1] + seq.frames[-1:]):
+        raise TranscodeError("-o {}: the output would overwrite the input frames.".format(out.describe()))
+    return out
+
+
+def sequence_mid(cfg, seq, pick, depth, source, tags=None, stamp=()):
+    """oiiotool steps for an image sequence output: the movie's processing (EXR) or the plain
+    steps (other input), the oiiotool letterbox, the metadata tags, the output format."""
+    if seq.is_exr:
+        mid = _without_depth(process_args(cfg, pick, depth))
+        if pick is not None and pick.alpha and not cfg.skip_colour and cfg.seq_out_ext == ".exr":
+            mid += ["--premult"]                    # EXR keeps premultiplied colour
+    else:
+        mid = plain_args(cfg)
+    mid += oiio_letterbox_steps(cfg, source, mid)
+    mid += md.oiio_args(tags) + list(stamp)
+    return mid + outseq.oiio_output_args(cfg.seq_out_ext, cfg.seq_args, cfg.mezzanine_16bit)
+
+
+def write_sequence_oiio(cfg, seq, info, pick, depth, work_dir, preview_frame, exit_code):
+    """Sequence in -> image sequence out (or a movie's frames -> EXR) with oiiotool alone."""
+    cfg.fps, fps_source = resolve_fps(cfg, info)
+    cfg.par_in = resolve_par(cfg, quiet=True)[0]
+    cfg.par_out_value = cfg.par_in
+    timecode, tc_source = resolve_timecode(cfg, seq, info, cfg.header_frame)
+    log.info("Frame rate: %s (%s), timecode %s (%s)", fps_display(cfg.fps), fps_source, timecode,
+             tc_source)
+    source = seq.path(preview_frame if preview_frame is not None else seq.start)
+    tags = sequence_metadata(cfg, seq, timecode)
+    reel_name, reel_source = resolve_reel_name(cfg, seq, info, timecode)
+    if reel_name:
+        log.info("Reel name: %s (%s)", reel_name, reel_source)
+    per_frame, tc_args = sequence_timecode(cfg, seq, timecode)
+    mid = sequence_mid(cfg, seq, pick, depth, source, tags, tc_args + sequence_reel(cfg, reel_name))
+    context = output_context(cfg, seq, info, timecode, reel_name)
+    if cfg.preview:
+        return write_preview_oiio(cfg, seq, info, mid, work_dir, preview_frame, timecode, exit_code,
+                                  tags, reel_name)
+    out = resolve_output_seq(cfg, seq, context)
+    out.folder.mkdir(parents=True, exist_ok=True)
+    log.info("Writing %s (%s: %s)", out.describe(), cfg.seq_preset or "built-in settings",
+             " ".join(outseq.oiio_output_args(cfg.seq_out_ext, cfg.seq_args, cfg.mezzanine_16bit)))
+    result = convert_sequence(cfg, seq, pick, work_dir, depth, target=out, mid=mid, per_frame=per_frame)
+    if result.failed:
+        message = "Frames failed to convert: {}".format(format_frames(result.failed))
+        if cfg.missing_frames == "error" or not result.outputs:
+            raise TranscodeError(message)
+        log.warning(message)
+        exit_code = EXIT_FRAMES_FAILED
+    log.info("Done: %s (%s)", out.describe(), format_frames(sorted(result.outputs)))
+    cfg.stills_folder = out.folder
+    if cfg.thumbnail is not None:
+        make_thumbnail(cfg, seq, info, pick, depth, None, context)
+    if cfg.filmstrip is not None:
+        make_filmstrip(cfg, seq, pick, depth, work_dir, context)
+    return exit_code
+
+
+def write_preview_oiio(cfg, seq, info, mid, work_dir, frame, timecode, exit_code, tags=None,
+                       reel_name=""):
+    """-preview of an oiiotool-only output: the frame through the same steps into the output
+    format, then as 8-bit PNG (an EXR's values clipped, no view transform) and the JSON."""
+    image = Path(cfg.preview)
+    image.parent.mkdir(parents=True, exist_ok=True)
+    written = Path(work_dir) / ("preview_out" + cfg.seq_out_ext)
+    run_tool([cfg.oiiotool, "-i", seq.path(frame).as_posix()] + mid + ["-o", written.as_posix()],
+             "oiiotool (preview)", cfg.verbose)
+    run_tool([cfg.oiiotool, "-i", written.as_posix(), "-d", "uint8", "-o", image.as_posix()],
+             "oiiotool (preview png)", cfg.verbose)
+    width, height, channels = outseq.measure(cfg.oiiotool, image, [], cfg.verbose)
+    context = transform_context(cfg, seq, info)
+    is_movie = cfg.header_label == "movie"
+    lb = cfg.oiio_letterbox_info
+    report = {
+        "image": str(image), "slate": None, "frame": frame,
+        "frame_file": cfg.header_file if is_movie else str(seq.path(frame)),
+        "input": {"first_file": cfg.header_file if is_movie else str(seq.path(seq.start)),
+                  "frames": format_frames(seq.frames), "first_frame": seq.start,
+                  "last_frame": seq.end, "movie": is_movie, "is_exr": seq.is_exr,
+                  "header": cfg.header_attribs, "par": par_display(cfg.par_in)},
+        "keywords": {k: v for k, v in context.items() if k != "meta"},
+        "output": {"width": width, "height": height, "par": float(cfg.par_in),
+                   "pix_fmt": "{} {}".format(cfg.seq_out_ext.lstrip("."), " ".join(
+                       outseq.oiio_output_args(cfg.seq_out_ext, cfg.seq_args, cfg.mezzanine_16bit))),
+                   "fps": fps_display(cfg.fps), "timecode": timecode,
+                   "movie_timecode": offset_timecode(timecode, frame - seq.start, nominal_fps(cfg.fps)),
+                   "reel_name": reel_name, "metadata": dict(tags or {}),
+                   "timecode_source": cfg.timecode_found, "reel_source": cfg.reel_found,
+                   "colour": describe_colour(cfg) if (seq.is_exr and not cfg.skip_colour) or (
+                       cfg.colour_given and not cfg.skip_colour) else "none",
+                   "transform": cfg.transform_choice, "transform_args": cfg.oiio_transform_args,
+                   "letterbox": None if not lb or lb[0] == "none" else {"kind": lb[0], "bar": lb[1]},
+                   "encode_preset": "", "pipeline": "oiiotool",
+                   "sequence": cfg.seq_out_ext},
+    }
+    with open(str(image.with_suffix(".json")), "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, default=str)
+    log.info("Preview: %s (oiiotool, %s output), %s", image, cfg.seq_out_ext.lstrip("."),
+             image.with_suffix(".json").name)
+    return exit_code
+
+
+SEEK_UNPACK_RATIO = 8      # stills only: seek frame by frame when the movie is this many times longer
+
+
+def stills_frames(cfg, seq):
+    """Stills without the movie: the frames the thumbnail and the filmstrip will use, when that
+    is few enough to seek to one by one; None means unpack the whole movie."""
+    if cfg.thumbnail is not None and cfg.thumbnail.frame == "largest":
+        return None                           # needs every frame's size
+    wanted = set()
+    if cfg.thumbnail is not None:
+        wanted.add(choose_thumbnail_frame(cfg.thumbnail.frame, seq.frames, None)[0])
+    if cfg.filmstrip is not None:
+        wanted.update(fs.choose_frames(seq.frames, cfg.filmstrip.layout()[0]))
+    if not wanted or len(wanted) * SEEK_UNPACK_RATIO > len(seq.frames):
+        return None
+    return wanted
+
+
+def unpack_movie(cfg, movie, seq, work_dir, preview_frame, created_files):
+    """Unpack the movie's frames (a preview: only its frame) into work_dir. Returns the
+    sequence of the files written and the movie's header."""
+    if Path(work_dir).resolve() == Path(seq.folder).resolve():
+        clash = [seq.name(f) for f in seq.frames if (Path(work_dir) / seq.name(f)).exists()]
+        if clash:
+            raise TranscodeError("-temp is empty and the movie's frames would overwrite existing "
+                                 "files, e.g. {}".format(clash[0]))
+    seq = mv.with_frames(seq, work_dir)
+    alpha = cfg.alpha == "keep" and movie.alpha
+    some = stills_frames(cfg, seq) if not cfg.movie and preview_frame is None else None
+    if preview_frame is not None:
+        targets = [preview_frame]
+    elif some is not None:
+        targets = sorted(some)
+    else:
+        targets = list(seq.frames)
+    created_files += [seq.path(f) for f in targets]
+    log.info("Movie: unpacking %s as %s%s", "frame {}".format(preview_frame) if preview_frame
+             is not None else "{} frames".format(len(targets)), seq.ext.lstrip("."),
+             " with alpha" if alpha else "")
+    if some is not None:
+        found = mv.unpack_some(cfg.ffmpeg, movie, seq, targets, cfg.mezzanine_16bit, alpha,
+                               cfg.verbose, cfg.workers, cfg.movie_first_frame)
+    else:
+        found = mv.unpack(cfg.ffmpeg, movie, seq, preview_frame, cfg.mezzanine_16bit, alpha,
+                          cfg.verbose, cfg.movie_first_frame)
+    if preview_frame is None and some is None:
+        seq = mv.with_frames(seq, work_dir, found)
+    # (a preview or stills: the full range stays, so the frames chosen from it are the ones
+    # unpacked)
+    info = movie.header()
+    cfg.header_file = str(movie.path)
+    cfg.header_attribs = md.header_attribs(info)
+    return seq, info
 
 
 def transform_context(cfg, seq, info):
@@ -1330,15 +1982,17 @@ def choose_preview_frame(cfg, seq):
     return frame
 
 
-def convert_preview_frame(cfg, seq, frame, pick, work_dir, depth):
+def convert_preview_frame(cfg, seq, frame, pick, work_dir, depth, mid=None):
     """oiiotool for the one preview frame, cached by its exact oiiotool arguments and source
     file, so burn-in / slate / letterbox changes don't convert it again."""
     import hashlib
     from .oiio import ConversionResult
+    if mid is None:
+        mid = process_args(cfg, pick, depth)
     src = seq.path(frame)
     stat = os.stat(str(src))
     parts = [str(src), str(stat.st_mtime_ns), str(stat.st_size), cfg.mezzanine_ext,
-             os.environ.get("OCIO", "")] + process_args(cfg, pick, depth)
+             os.environ.get("OCIO", "")] + list(mid)
     key = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
     cache_dir = Path(tempfile.gettempdir()) / TEMP_ROOT_NAME / "preview-cache"
     cached = cache_dir / (key + cfg.mezzanine_ext)
@@ -1347,7 +2001,7 @@ def convert_preview_frame(cfg, seq, frame, pick, work_dir, depth):
         shutil.copyfile(str(cached), str(target))
         log.info("Preview: converted frame taken from the cache")
         return ConversionResult(outputs={frame: target})
-    result = convert_sequence(cfg, replace(seq, frames=(frame,)), pick, work_dir, depth)
+    result = convert_sequence(cfg, replace(seq, frames=(frame,)), pick, work_dir, depth, mid=mid)
     if frame in result.outputs:
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1361,6 +2015,8 @@ def convert_preview_frame(cfg, seq, frame, pick, work_dir, depth):
 
 
 def preview_pix_fmt(cfg):
+    if cfg.image_output:
+        return "rgb24"
     args = encode_args(cfg, "{videofilter}")
     if "-pix_fmt" in args[:-1]:
         return args[args.index("-pix_fmt") + 1]
@@ -1390,16 +2046,21 @@ def write_preview(cfg, seq, info, list_file, video_filter, work_dir, frame, time
         shutil.move(str(src), str(dst))
     fmt = probe_frame(cfg.ffmpeg, image, cfg.verbose)
     context = transform_context(cfg, seq, info)
+    is_movie = cfg.header_label == "movie"
     report = {
         "image": str(image), "slate": str(slate) if slate else None,
-        "frame": frame, "frame_file": str(seq.path(frame)),
-        "input": {"first_file": str(seq.path(seq.start)), "frames": format_frames(seq.frames),
+        "frame": frame,
+        "frame_file": cfg.header_file if is_movie else str(seq.path(frame)),
+        "input": {"first_file": cfg.header_file if is_movie else str(seq.path(seq.start)),
+                  "frames": format_frames(seq.frames), "first_frame": seq.start,
+                  "last_frame": seq.end, "movie": is_movie,
                   "is_exr": seq.is_exr, "header": cfg.header_attribs,
                   "par": par_display(cfg.par_in)},
         "keywords": {k: v for k, v in context.items() if k != "meta"},
         "output": {"width": fmt.width, "height": fmt.height, "par": float(cfg.par_out_value),
                    "pix_fmt": pix_fmt, "fps": fps_display(cfg.fps), "timecode": timecode,
                    "movie_timecode": movie_tc, "reel_name": reel_name, "metadata": metadata,
+                   "timecode_source": cfg.timecode_found, "reel_source": cfg.reel_found,
                    "colour": describe_colour(cfg) if seq.is_exr else "",
                    "transform": cfg.transform_choice,
                    "transform_args": cfg.oiio_transform_args,
@@ -1454,7 +2115,7 @@ def make_thumbnail(cfg, seq, info, pick, depth, sizes, context, movie_output=Non
     frame, how = choose_thumbnail_frame(preset.frame, seq.frames, sizes)
     name = seq.clean_name or seq.folder.name or "thumbnail"
     context = dict(context, frame=frame, ext=preset.ext)
-    default_folder = movie_output.parent if movie_output is not None else seq.folder
+    default_folder = movie_output.parent if movie_output is not None else (cfg.stills_folder or seq.folder)
     path = resolve_path_template(cfg.thumbnail_output or "", seq, "{}.{}".format(name, preset.ext),
                                  preset.ext, _THUMB_EXT_RE, "-ot", context, default_folder)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1464,6 +2125,7 @@ def make_thumbnail(cfg, seq, info, pick, depth, sizes, context, movie_output=Non
         # the thumbnail's own size replaces the movie's -width resize (one resize, not two);
         # an OIIO transform stays, it is part of the look (crop, reformat)
         look = replace(cfg, width=0) if (preset.width or preset.height) else cfg
+        look = replace(look, skip_colour=False)       # stills are display-referred
         cmd = thumbnail_oiiotool(cfg.oiiotool, src, path, process_args(look, pick, depth), preset,
                                  par, alpha=bool(pick is not None and pick.alpha and depth is None))
         run_tool(cmd, "oiiotool (thumbnail)", cfg.verbose)
@@ -1517,7 +2179,7 @@ def make_filmstrip(cfg, seq, pick, depth, work_dir, context, movie_output=None, 
                                            bool(cfg.slate))
     name = seq.clean_name or seq.folder.name or "filmstrip"
     context = dict(context, ext=preset.ext)
-    default_folder = movie_output.parent if movie_output is not None else seq.folder
+    default_folder = movie_output.parent if movie_output is not None else (cfg.stills_folder or seq.folder)
     path = resolve_path_template(cfg.filmstrip_output or "", seq, "{}_filmstrip.{}".format(
         name, preset.ext), preset.ext, _FILMSTRIP_EXT_RE, "-of", context, default_folder)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1540,7 +2202,7 @@ def make_filmstrip(cfg, seq, pick, depth, work_dir, context, movie_output=None, 
             jobs += [("frame {}".format(f), available[f], chans) for f in frames]
         else:
             # the tile size replaces the movie's -width resize (one resize, not two)
-            mid = fs.source_tile_args(process_args(replace(cfg, width=0), pick, depth)) + chans
+            mid = fs.source_tile_args(process_args(replace(cfg, width=0, skip_colour=False), pick, depth)) + chans
             jobs += [("frame {}".format(f), seq.path(f), mid) for f in frames]
         failed = fs.render_oiiotool(cfg.oiiotool, jobs, path, preset, work_dir, cfg.par_in,
                                     workers=cfg.workers, verbose=cfg.verbose, keep=cfg.temp_keep,
@@ -1661,24 +2323,46 @@ def setup_logging(verbose):
     log.propagate = False
 
 
-def load_presets_for(argv):
-    """Load the presets file before the full parse, so --help can list the presets.
-    "-preset" must not be taken for "-presets_file"."""
+def presets_choice_for(argv):
+    """The presets file to use: -presets_file, else the studio preferences from
+    vfx-transcode.ini, else ./presets.json. "-preset" must not be taken for "-presets_file"."""
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    pre.add_argument("-presets_file", default=DEFAULT_PRESETS_FILE)
+    pre.add_argument("-presets_file", default=None)
     pre.add_argument("-preset")   # exact match, else some Pythons read it as -presets_file
     known, _ = pre.parse_known_args(argv)
+    if known.presets_file:
+        return studio.PresetsChoice(resolve_path(known.presets_file, app_dir()), "-presets_file")
+    return studio.choose_presets()
+
+
+def presets_path_for(argv):
+    return presets_choice_for(argv).path
+
+
+def load_presets_for(argv, choice=None):
+    """Load the presets file before the full parse, so --help can list the presets."""
+    choice = choice or presets_choice_for(argv)
     try:
-        return load_presets(resolve_path(known.presets_file, app_dir())), None
+        return (choice.presets or load_presets(choice.path)), None
     except TranscodeError as exc:
         return None, exc
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
-    presets, presets_error = load_presets_for(argv)
+    choice = presets_choice_for(argv)
+    try:
+        argv = sp.expand_argv(argv, choice.path)
+    except TranscodeError as exc:
+        print("Error: {}".format(exc), file=sys.stderr)
+        return EXIT_ERROR
+    presets, presets_error = load_presets_for(argv, choice)
     ns = build_parser(presets, presets_error).parse_args(argv)
     setup_logging(ns.verbose)
+    for problem in choice.problems:
+        log.warning("Studio preferences not used: %s; using %s", problem, choice.path)
+    if choice.presets is not None:
+        log.info("Presets: %s (%s)", choice.path, choice.source)
     try:
         if ns.ocio_info:
             return show_ocio_info(ns, presets)

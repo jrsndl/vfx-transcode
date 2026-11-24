@@ -8,7 +8,7 @@ Turns an image sequence into a review movie. OpenEXRs go through `oiiotool`, whi
 
 ```
 python vfx-transcode.py -i D:/shots/sh010/sh010_comp.1001.exr -burn_preset review
-python vfx-transcode.py -i D:/shots/sh010/sh010_comp.1001.exr -preset prores422hq -timecode_source exr
+python vfx-transcode.py -i D:/shots/sh010/sh010_comp.1001.exr -preset prores422hq -timecode_source metadata
 python vfx-transcode.py --help
 ```
 
@@ -32,7 +32,9 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - Burn-ins in six places (corners plus top/bottom centre) and a centred watermark, with name, frame counter, frame range, running timecode, fps and date; colour, opacity, size and black box per preset or per place.
 - Letterbox or pillarbox bars for a target ratio, optionally see-through and with an edge line; burn-ins stay on top.
 - Alpha: dropped by default, or kept into ProRes 4444 (or any alpha codec), straight or premultiplied.
-- A tuner app (PySide6) to tune presets by eye on a test frame, with compare image and copy-paste output: see [docs/TUNER.md](docs/TUNER.md).
+- Trim with `-in` / `-out` (sequences and movies), and image sequences as output (`-o ./{clean_name}.####.exr`, `.jpg`, `.png`, `.tif`, `.dpx`). Sequence to sequence runs oiiotool only, with no ffmpeg step at all, and has an oiiotool letterbox; sequence presets for JPEG quality, PNG 8/16-bit and EXR half with PIZ, ZIP (1 / 16 lines) or DWAB compression; `-ff_transform` sets the ffmpeg scale / zscale chain.
+- Movie files as input (QuickTime, MP4, MXF, MKV …): ffprobe reads rate, frame count and timecode, and ffmpeg unpacks the frames, so slate, burn-ins, letterbox, thumbnail and filmstrip work the same as for sequences; a preview unpacks only its one frame.
+- A tuner app (PySide6) to tune presets by eye and convert: sequences or movies as input, a timeline to scrub to any frame, frame rate detection, compare to the source or another image, movie or sequence, super-presets (encode, transform, burn-in, slate, filmstrip, metadata and letterbox saved together, also usable with `-super_preset` on the command line) and a Process button: see [docs/TUNER.md](docs/TUNER.md).
 - Thumbnails (jpg/png) with the same look as the movie, from the middle, first, last or busiest frame; or thumbnails only.
 - Filmstrip: one jpg of evenly spaced frames in equal tiles (default 24 tiles of 480x270 in one row, black-padded), same look as the thumbnail; tiles from the source frames, oiiotool's intermediates or the encoded movie (with burn-ins), optional slate as the first tile; grid, tile count, tile size and jpg quality from presets or the command line; its own view in the tuner.
 - VFX slate: one frame before the pictures (frame and timecode start − 1), same size and pixel aspect as the pictures, with a shot thumbnail and rows from presets, header values or the command line.
@@ -44,6 +46,7 @@ vfx-transcode.py      entry script (also used by the PyInstaller spec)
 vfx_transcode/        the package; python -m vfx_transcode works too
 vfx-transcode-tuner.py  the tuner app (needs PySide6); vfx_tuner/ is its package
 presets.json          encode, burn-in, metadata and slate presets, channel preferences
+vfx-transcode.ini     optional path to the studio preferences (a presets.json on a share)
 docs/OPTIONS.md       options reference
 docs/TUNER.md         the tuner
 tests/                unit tests
@@ -72,7 +75,8 @@ build_exe.bat                                 # both executables into dist\vfx-t
 console file (from `vfx-transcode.spec`) and `vfx-transcode-tuner.exe` as a windowed one-folder build
 (its `_internal` folder must stay next to it). Both land in `dist\vfx-transcode\` with `presets.json`,
 `docs`, and the `ffmpeg`, `oiio`, `ocio` and `fonts` folders; `build_exe.bat notools` skips those four
-and leaves only their READMEs. The frozen tuner runs the `vfx-transcode.exe` beside it, and both look
+and leaves only their READMEs. `vfx-transcode.ini` is copied only if `dist\vfx-transcode` has none
+yet, so an ini already pointing to the studio preferences is kept. The frozen tuner runs the `vfx-transcode.exe` beside it, and both look
 for `./presets.json` and the tool folders next to the executables, so the folder can be copied anywhere.
 
 `uv sync` without `--extra tuner` leaves PySide6 out. The Python version comes from `.python-version`;

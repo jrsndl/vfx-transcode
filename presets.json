@@ -88,11 +88,11 @@
     "                   keywords, and {slate_length} (1 or 0), {burnins} (true/false: any burn-in or",
     "                   watermark) and {colour} (the colour conversion) for delivery tags",
     "  copy             EXR header attributes to copy, like -metadata_copy (\"all,-husk:*\", \"Artist,DateTime\")",
-    "  reelid_source    auto | arg | exr | off, like -reelid_source",
+    "  reelid_source    auto | arg | metadata | off, like -reelid_source (exr = old name of metadata)",
     "  reelid           explicit reel name, like -reelid",
     "  reelid_attr      EXR attribute with the reel name (default owner)",
     "  reelid_pattern   regex to cut the reel name out of that attribute",
-    "  timecode_source  counter | arg | exr, like -timecode_source",
+    "  timecode_source  counter | arg | metadata, like -timecode_source (exr = old name of metadata)",
     "  All fields are optional. Command-line options override the preset field by field; -metadata",
     "  KEY=VALUE adds or replaces one tag, and -metadata KEY= removes one.",
     "  Tag order, later wins: copied header < encode preset metadata < metadata preset tags < -metadata.",
@@ -167,6 +167,35 @@
     "               -skipffmpeg) or movie (the encoded movie: burn-ins and letterbox included)",
     "  slate        true: the slate is the first tile (when the run makes one); default false",
     "",
+    "SEQUENCE PRESETS (-seq_preset NAME, for an image sequence -o such as ./{clean_name}.####.exr)",
+    "  oiiotool output settings: bit depth, compression, quality. -seq_args replaces them for one run.",
+    "  default_sequence_presets: the preset used for each format without -seq_preset.",
+    "  notes        free text, shown in --help",
+    "  ext          exr, jpg, png, tif, dpx or bmp: the format the preset is for",
+    "  args         oiiotool output arguments, one string or a list: -d half --compression piz.",
+    "               EXR compressions: zips (zip, 1 scanline), zip (16 scanlines), piz, dwaa:Q,",
+    "               dwab:Q (Q = quality, 45 is OpenEXR's default), pxr24, b44, none.",
+    "               jpg: --compression jpeg:QUALITY, --attrib jpeg:subsampling 4:4:4|4:2:2|4:2:0",
+    "",
+    "COLOUR PRESETS (-colour_preset NAME; -ci, -co, -display ... given on the command line win)",
+    "  Named colour settings for the OCIO config, e.g. rec709_to_acescg. All fields optional;",
+    "  the tuner saves them from its Color tab. Names are the config's (here ACES 1.2).",
+    "  notes        free text, shown in --help",
+    "  ci, co       colourspace in / out, like -ci / -co",
+    "  display, view, looks  like -display / -view / -looks (instead of co)",
+    "  clf          a CLF file, like -clf (not with display / view / looks)",
+    "  ocio         the OCIO config, like -ocio",
+    "",
+    "FFMPEG TRANSFORM PRESETS (\"ff_transforms\": -ff_transform_preset NAME; -ff_transform wins)",
+    "  ffmpeg scale / zscale filters for movie output, replacing the -width scale.",
+    "  notes        free text, shown in --help",
+    "  filters      one filter per entry (or one string); joined with commas; \"#...\" entries skipped",
+    "",
+    "SAVING FROM THE TUNER: the tuner can save colour, ffmpeg transform, oiiotool transform,",
+    "  burn-in, slate and filmstrip presets into this file (multi-user safe: the previous version",
+    "  is kept as presets_safecopyNNN.json). It rewrites the file with this layout, keeping all",
+    "  other entries and these notes.",
+    "",
     "TOOLS (paths to the executables; -ffmpeg / -ffprobe / -oiio on the command line win)",
     "  ffmpeg, ffprobe, oiiotool  a path each, all optional. ./ and ../ are relative to the",
     "               application folder; %VAR% / $VAR and ~ are expanded. A tool left out (or \"\")",
@@ -185,6 +214,11 @@
   "default_oiio_transform": "none",
   "default_thumbnail": "middle1280",
   "default_filmstrip": "row24",
+  "default_sequence_presets": {
+    "exr": "exr_zip16_half",
+    "jpg": "jpg_high",
+    "png": "png_8bit"
+  },
   "channel_preferences": [
     "rgba.R,rgba.G,rgba.B,rgba.A",
     "rgba.R,rgba.G,rgba.B",
@@ -408,8 +442,8 @@
         "vfx-transcode_first_frame": "{frame_start}",
         "vfx-transcode_last_frame": "{frame_end}"
       },
-      "timecode_source": "exr",
-      "reelid_source": "exr",
+      "timecode_source": "metadata",
+      "reelid_source": "metadata",
       "reelid_attr": "owner"
     },
     "client": {
@@ -487,6 +521,76 @@
         "Date": "{date}"
       },
       "thumbnail": "none"
+    }
+  },
+  "colour_presets": {
+    "acescg_to_rec709": {
+      "notes": "CG renders (ACEScg) to the Rec.709 output transform: the usual review look.",
+      "ci": "ACES - ACEScg",
+      "co": "Output - Rec.709"
+    },
+    "acescg_to_srgb": {
+      "notes": "CG renders (ACEScg) to the sRGB output transform, for web / monitors.",
+      "ci": "ACES - ACEScg",
+      "co": "Output - sRGB"
+    },
+    "aces2065_to_rec709": {
+      "notes": "ACES2065-1 (AP0) plates / deliveries to the Rec.709 output transform.",
+      "ci": "ACES - ACES2065-1",
+      "co": "Output - Rec.709"
+    },
+    "rec709_to_acescg": {
+      "notes": "Rec.709 video (inverse output transform) into ACEScg; bright values can go well above 1.0.",
+      "ci": "Output - Rec.709",
+      "co": "ACES - ACEScg"
+    },
+    "srgb_to_acescg": {
+      "notes": "sRGB images (inverse output transform) into ACEScg.",
+      "ci": "Output - sRGB",
+      "co": "ACES - ACEScg"
+    },
+    "srgb_texture_to_acescg": {
+      "notes": "sRGB textures / matte paintings (plain sRGB curve, no tone mapping) into ACEScg.",
+      "ci": "Utility - sRGB - Texture",
+      "co": "ACES - ACEScg"
+    },
+    "logc3_to_rec709": {
+      "notes": "ARRI LogC3 (EI800, AWG) plates to the Rec.709 output transform.",
+      "ci": "Input - ARRI - V3 LogC (EI800) - Wide Gamut",
+      "co": "Output - Rec.709"
+    },
+    "acescg_display_rec709": {
+      "notes": "ACEScg through the config's ACES display, Rec.709 view (oiiotool --ociodisplay).",
+      "ci": "ACES - ACEScg",
+      "display": "ACES",
+      "view": "Rec.709"
+    }
+  },
+  "ff_transforms": {
+    "hd_lanczos": {
+      "notes": "1920 wide, height to match (even), lanczos.",
+      "filters": [
+        "scale=w=1920:h=-2:flags=lanczos"
+      ]
+    },
+    "hd720_bicubic": {
+      "notes": "1280 wide, height to match, bicubic: small review files.",
+      "filters": [
+        "scale=w=1280:h=-2:flags=bicubic"
+      ]
+    },
+    "2k_zscale": {
+      "notes": "2048 wide with zscale (spline36).",
+      "filters": [
+        "zscale=w=2048:h=-2:filter=spline36"
+      ]
+    },
+    "hd_fit_pad": {
+      "notes": "Fit inside 1920x1080 keeping the aspect, black bars to fill.",
+      "filters": [
+        "scale=w=1920:h=1080:force_original_aspect_ratio=decrease",
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+      ]
     }
   },
   "oiio_transforms": [
@@ -590,6 +694,53 @@
       "frame": "middle",
       "format": "png",
       "compression": 6
+    }
+  },
+  "sequence_presets": {
+    "jpg_high": {
+      "notes": "JPEG, high quality: quality 95, no chroma subsampling (4:4:4).",
+      "ext": "jpg",
+      "args": "-d uint8 --compression jpeg:95 --attrib jpeg:subsampling 4:4:4"
+    },
+    "jpg_medium": {
+      "notes": "JPEG, medium quality: quality 80, 4:2:0. Small files for review and web.",
+      "ext": "jpg",
+      "args": "-d uint8 --compression jpeg:80 --attrib jpeg:subsampling 4:2:0"
+    },
+    "png_8bit": {
+      "notes": "PNG, 8 bits per channel.",
+      "ext": "png",
+      "args": "-d uint8"
+    },
+    "png_16bit": {
+      "notes": "PNG, 16 bits per channel: for 10-bit sources and grading.",
+      "ext": "png",
+      "args": "-d uint16"
+    },
+    "exr_piz_half": {
+      "notes": "EXR, 16-bit half float, PIZ compression (lossless; good for grainy plates).",
+      "ext": "exr",
+      "args": "-d half --compression piz"
+    },
+    "exr_zip1_half": {
+      "notes": "EXR, 16-bit half float, ZIP compression of 1 scanline (ZIPS; lossless, fast to read in compositing).",
+      "ext": "exr",
+      "args": "-d half --compression zips"
+    },
+    "exr_zip16_half": {
+      "notes": "EXR, 16-bit half float, ZIP compression of 16 scanlines (lossless, smaller than ZIPS).",
+      "ext": "exr",
+      "args": "-d half --compression zip"
+    },
+    "exr_dwab30_half": {
+      "notes": "EXR, 16-bit half float, DWAB lossy compression, quality 30 (high quality, small).",
+      "ext": "exr",
+      "args": "-d half --compression dwab:30"
+    },
+    "exr_dwab60_half": {
+      "notes": "EXR, 16-bit half float, DWAB lossy compression, quality 60 (smaller files).",
+      "ext": "exr",
+      "args": "-d half --compression dwab:60"
     }
   },
   "filmstrip_presets": {

@@ -70,13 +70,14 @@ def resolve_par(cfg, quiet=False):
     for source in PAR_ORDER[cfg.par_source]:
         if source == "arg" and cfg.par_arg is not None:
             if header is not None and header != cfg.par_arg:
-                log.info("Pixel aspect: EXR header %s ignored (-par_source %s)",
-                         par_display(header), cfg.par_source)
+                log.info("Pixel aspect: %s %s ignored (-par_source %s)",
+                         getattr(cfg, "header_label", "EXR header"), par_display(header), cfg.par_source)
             return cfg.par_arg, "-par"
         if source == "exr" and header is not None:
             if cfg.par_arg is not None and cfg.par_arg != header:
                 log.info("Pixel aspect: -par %s ignored (-par_source exr)", par_display(cfg.par_arg))
-            return header, "EXR header " + name
+            label = getattr(cfg, "header_label", "EXR header")
+            return header, label if label != "EXR header" else "EXR header " + name
     return Fraction(1), "default"
 
 

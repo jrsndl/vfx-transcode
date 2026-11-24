@@ -63,7 +63,12 @@ class Config:
     # timecode / burn-in
     timecode: str = "01:00:00:00"
     timecode_source: str = "counter"   # counter | arg | exr
+    timecode_source_given: bool = True # False: "counter" only as the default (movies use their own)
     output_timecode: bool = True
+    output_reelid: bool = True         # write the reel name into the movie
+    seq_metadata: bool = True          # tags into an oiiotool-written image sequence
+    timecode_found: str = ""           # set at run time: where the timecode came from
+    reel_found: str = ""               # set at run time: where the reel name came from
 
     # output metadata
     metadata_copy: str = ""            # "", "all" or key patterns, see metadata.py
@@ -85,7 +90,9 @@ class Config:
     slate: Any = None                  # slate.SlateSpec, None = no slate
 
     # alpha
-    alpha: str = "drop"                # drop | keep
+    alpha: str = "drop"                # drop | keep (-alpha auto is resolved to one of them)
+    alpha_auto: bool = False           # -alpha auto: no alpha in the input is not a warning
+    alpha_strip: str = ""              # oiiotool --ch for non-EXR input with alpha and drop
     alpha_premult: bool = False        # with keep: write premultiplied colour (else straight)
     alpha_active: bool = False         # set at run time: the movie really gets an alpha channel
 
@@ -108,6 +115,22 @@ class Config:
 
     # set at run time
     header_file: str = ""              # the file whose header was read (first frame)
+    header_label: str = "EXR header"   # what the header is called in the log: or "movie"
+    movie_first_frame: int = 1001      # movie input: the number of its first frame
+    trim_in: Optional[int] = None      # -in: first frame to use (inclusive)
+    trim_out: Optional[int] = None     # -out: last frame to use (inclusive)
+    ff_transform: str = ""             # -ff_transform: ffmpeg filters replacing the -width scale
+    seq_args: List[str] = field(default_factory=list)   # oiiotool output args for -o sequences
+    seq_preset: str = ""               # where seq_args came from: a preset name, "-seq_args", ""
+    colour_given: bool = False         # -ci / -co / -display / -view / -clf given
+    seq_out_ext: str = ""              # -o names an image sequence: its extension (".exr")
+    image_output: bool = False         # ffmpeg writes an image sequence (movie in -> jpg ...)
+    oiio_letterbox: Any = None         # LetterboxSpec drawn by oiiotool, or None
+    oiio_letterbox_args: Optional[List[str]] = None   # its --box steps, once measured
+    oiio_letterbox_info: Any = None    # (kind, bar, width, height) for the log / preview
+    stills_folder: Any = None          # thumbnail / filmstrip default folder (sequence output)
+    skip_colour: bool = False          # no OCIO step (EXR -> EXR without -ci / -co)
+    header_frame: Optional[int] = None # the frame the header belongs to (a movie: its first)
     header_attribs: Dict[str, Any] = field(default_factory=dict)   # its attributes, {meta:NAME}
 
     # ffmpeg
