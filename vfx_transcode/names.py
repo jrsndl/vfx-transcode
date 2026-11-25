@@ -18,6 +18,9 @@ default ("" unless given) if nothing matches.
 """
 
 import logging
+import ntpath
+import os
+import posixpath
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -30,7 +33,23 @@ DEFAULT_VERSION_REGEX = r"_v(\d\d\d)"
 MAX_SPLITS = 9
 SPLIT_KEYS = tuple("namesplit{}".format(i) for i in range(1, MAX_SPLITS + 1)) + \
     tuple("namesplit-{}".format(i) for i in range(1, MAX_SPLITS + 1))
-NAME_KEYWORDS = ("version_string", "version_number") + SPLIT_KEYS
+# path keywords: the source's folders, the source path and its parents, the scanned base folder
+MAX_PATH_SPLITS = 20
+FOLDER_KEYS = tuple("sourcefolder{}".format(i) for i in range(1, MAX_PATH_SPLITS + 1)) + \
+    tuple("sourcefolder-{}".format(i) for i in range(1, MAX_PATH_SPLITS + 1))
+SOURCEPATH_KEYS = ("sourcepath",) + tuple("sourcepath-{}".format(i) for i in range(1, MAX_PATH_SPLITS + 1))
+BASE_FOLDER_KEYS = ("base_folder",) + tuple("base_folder-{}".format(i) for i in range(1, MAX_PATH_SPLITS + 1))
+PATH_KEYWORDS = FOLDER_KEYS + SOURCEPATH_KEYS + BASE_FOLDER_KEYS
+# values the user types in vfx-transcode-process (-custom_destination_path / _name), for
+# destinations saved in super-presets: "{custom_destination_path}/{sourcefolder-3}/"
+CUSTOM_KEYWORDS = ("custom_destination_path", "custom_destination_name")
+# the frame rate in use (-r, the EXR header, the movie, else 24): set once it is known
+FPS_KEYWORDS = ("source_fps_float", "source_fps_int", "source_fps_frac")
+# the EXR's layers (Multichannel): set once the header is read, empty for movies
+LAYER_KEYWORDS = ("multi_layers_line", "multi_layers_column",
+                  "multi_layerschannels_line", "multi_layerschannels_column")
+NAME_KEYWORDS = ("version_string", "version_number") + SPLIT_KEYS + PATH_KEYWORDS + CUSTOM_KEYWORDS \
+    + FPS_KEYWORDS + LAYER_KEYWORDS
 
 
 def compile_version_regex(pattern, where="-version_regex"):
@@ -61,6 +80,81 @@ def name_splits(name):
     for i in range(1, MAX_SPLITS + 1):
         out["namesplit{}".format(i)] = parts[i - 1] if i <= len(parts) else ""
         out["namesplit-{}".format(i)] = parts[-i] if i <= len(parts) else ""
+    return out
+
+
+def _flavour(path):
+    """ntpath for Windows paths (on Windows, or any path with a drive letter or \\\\server),
+    else posixpath."""
+    if os.name == "nt" or re.match(r"^([A-Za-z]:|[\\/]{2}[^\\/])", path or ""):
+        return ntpath
+    return posixpath
+
+
+def split_folder(folder):
+    """A folder's parts, from the top: "D:\\shots\\sh010" -> ["D:", "shots", "sh010"];
+    "\\\\server\\share\\sh010" -> ["\\\\server", "share", "sh010"]; "/mnt/shots" -> ["mnt", "shots"]."""
+    if not folder:
+        return []
+    flavour = _flavour(folder)
+    if flavour is ntpath:
+        drive, rest = ntpath.splitdrive(folder)
+        if drive.startswith(("\\\\", "//")):                  # UNC: \\server\share
+            server, _sep, share = drive[2:].replace("/", "\\").partition("\\")
+            head = ["\\\\" + server] + ([share] if share else [])
+        else:
+            head = [drive] if drive else []
+        parts = [p for p in re.split(r"[\\/]+", rest) if p]
+        return head + parts
+    return [p for p in folder.split("/") if p]
+
+
+def _strip(path, flavour):
+    """No trailing separator, except on a root: "D:\\", "/", "\\\\server\\share\\"."""
+    drive, rest = flavour.splitdrive(path)
+    if rest.strip("\\/") == "":
+        if flavour is ntpath and drive and not drive.startswith(("\\\\", "//")):
+            return drive + "\\"
+        if drive.startswith(("\\\\", "//")):
+            return drive                          # \\server\share
+        return drive + rest[:1] if (rest or not drive) else drive
+    return path.rstrip("\\/")
+
+
+def parents(path, count=MAX_PATH_SPLITS):
+    """[path, its folder, the folder above ...]: count entries after path, "" past the top
+    (the top is "D:\\", "\\\\server\\share" or "/")."""
+    flavour = _flavour(path)
+    out, current = [path], _strip(path, flavour) if path else ""
+    for _i in range(count):
+        parent = _strip(flavour.dirname(current), flavour) if current else ""
+        if parent == current:
+            parent = ""
+        out.append(parent)
+        current = parent
+    return out
+
+
+def path_tokens(source_path, base_folder=""):
+    """{sourcefolder1..20} {sourcefolder-1..-20}: the source's folders from the top (a drive
+    letter "D:", or "\\\\server", first) and from the end; {sourcepath}: the folder the source
+    is in; {sourcepath-1}: the folder above it, {sourcepath-2} the one above that ...;
+    {base_folder} the folder a scan started from (-base_folder, default the source's folder)
+    and {base_folder-1}, -2 ... above it. Past the top, a keyword is empty."""
+    source_path = source_path or ""
+    flavour = _flavour(source_path)
+    folder = flavour.dirname(source_path) if source_path else ""
+    parts = split_folder(folder)
+    out = {}
+    for i in range(1, MAX_PATH_SPLITS + 1):
+        out["sourcefolder{}".format(i)] = parts[i - 1] if i <= len(parts) else ""
+        out["sourcefolder-{}".format(i)] = parts[-i] if i <= len(parts) else ""
+    for key, value in zip(SOURCEPATH_KEYS, parents(_strip(folder, flavour) if folder else "")):
+        out[key] = value
+    base = base_folder or folder
+    base = _strip(base, _flavour(base)) if base else ""
+    for key, value in zip(BASE_FOLDER_KEYS, parents(base)):
+        out[key] = value
     return out
 
 
@@ -97,7 +191,8 @@ def check_token_name(name, where):
     if not _TOKEN_NAME.match(name or ""):
         raise TranscodeError('{}: "{}" is not a usable keyword name (letters, digits, _; not '
                              "starting with a digit).".format(where, name))
-    if name in RESERVED_KEYWORDS or name.startswith("namesplit"):
+    if name in RESERVED_KEYWORDS or name.startswith(("namesplit", "sourcefolder", "sourcepath", "base_folder",
+                                                     "custom_destination", "source_fps")):
         raise TranscodeError('{}: "{}" is a built-in keyword; pick another name.'.format(where, name))
 
 

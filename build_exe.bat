@@ -1,15 +1,18 @@
 @echo off
-rem Freezes vfx-transcode.py and vfx-transcode-tuner.py into dist\vfx-transcode\
+rem Freezes vfx-transcode.py, vfx-transcode-tuner.py and vfx-transcode-process.py into dist\vfx-transcode\
 rem
-rem   build_exe.bat            build both, copy presets, docs and the tool folders
+rem   build_exe.bat            build all three, copy presets, docs and the tool folders
 rem   build_exe.bat notools    same, but skip ffmpeg, oiio, ocio and fonts - they are large
 rem
 rem Result:
 rem   dist\vfx-transcode\vfx-transcode.exe          one-file console exe
 rem   dist\vfx-transcode\vfx-transcode-tuner.exe    windowed tuner, uses the _internal folder
+rem   dist\vfx-transcode\vfx-transcode-process.exe  windowed process app, shares the _internal folder
 rem   dist\vfx-transcode\presets.json, vfx-transcode.ini, docs\, README.md, ffmpeg\, oiio\, ocio\, fonts\
-rem The tuner runs the vfx-transcode.exe that sits next to it; both read ./presets.json and the
-rem ./ffmpeg, ./oiio, ./ocio tool paths relative to the exe folder.
+rem The tuner and the process app run the vfx-transcode.exe that sits next to them; all read
+rem ./presets.json, ./vfx-transcode.ini and the ./ffmpeg, ./oiio, ./ocio tool paths relative to
+rem the exe folder. An existing dist\vfx-transcode\vfx-transcode.ini (e.g. pointing to the studio
+rem preferences) is kept; delete it to get the one from the repo.
 
 setlocal
 cd /d "%~dp0"
@@ -44,10 +47,14 @@ if errorlevel 1 (
     goto :fail
 )
 
-rem --- clean ------------------------------------------------------------------------------------
+rem --- clean (an edited vfx-transcode.ini in dist is set aside and put back) ---------------------
+rem (a .keep left by a failed build is used, unless dist has an ini again)
+if not exist build mkdir build
+if exist "%OUT%\vfx-transcode.ini" copy /y "%OUT%\vfx-transcode.ini" "build\vfx-transcode.ini.keep" >nul
 if exist "%OUT%" rmdir /s /q "%OUT%"
 if exist "build\cli" rmdir /s /q "build\cli"
 if exist "build\tuner" rmdir /s /q "build\tuner"
+if exist "build\process" rmdir /s /q "build\process"
 
 rem --- vfx-transcode: one-file console exe, from vfx-transcode.spec ----------------------------
 echo.
@@ -65,16 +72,34 @@ echo === building vfx-transcode-tuner.exe
 if errorlevel 1 goto :fail
 if not exist "build\tuner\vfx-transcode-tuner\vfx-transcode-tuner.exe" goto :fail
 
+rem --- process app: one-folder windowed exe, merged into the tuner's folder (same Qt files) ------
+echo.
+echo === building vfx-transcode-process.exe
+%PY% -m PyInstaller --noconfirm --clean --onedir --windowed --noupx --name vfx-transcode-process ^
+    --distpath build\process --workpath "%WORK%\process" --specpath build ^
+    --paths "%CD%" "%CD%\vfx-transcode-process.py"
+if errorlevel 1 goto :fail
+if not exist "build\process\vfx-transcode-process\vfx-transcode-process.exe" goto :fail
+
 rem --- assemble ---------------------------------------------------------------------------------
 echo.
 echo === assembling %OUT%
 xcopy /e /i /q /y "build\tuner\vfx-transcode-tuner" "%OUT%" >nul
 if errorlevel 1 goto :fail
+xcopy /e /i /q /y "build\process\vfx-transcode-process" "%OUT%" >nul
+if errorlevel 1 goto :fail
 copy /y "build\cli\vfx-transcode.exe" "%OUT%\" >nul
 if errorlevel 1 goto :fail
 copy /y presets.json "%OUT%\" >nul
-rem the ini may already point to the studio preferences: keep an existing one
-if not exist "%OUT%\vfx-transcode.ini" copy /y vfx-transcode.ini "%OUT%\" >nul
+rem the ini may already point to the studio preferences: keep the one dist had, else the repo's
+if exist "build\vfx-transcode.ini.keep" (
+    copy /y "build\vfx-transcode.ini.keep" "%OUT%\vfx-transcode.ini" >nul
+    if errorlevel 1 goto :fail
+    del /q "build\vfx-transcode.ini.keep"
+    echo     kept the existing vfx-transcode.ini
+) else (
+    copy /y vfx-transcode.ini "%OUT%\" >nul
+)
 copy /y README.md "%OUT%\" >nul
 xcopy /e /i /q /y docs "%OUT%\docs" >nul
 

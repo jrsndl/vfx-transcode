@@ -78,11 +78,18 @@ def _tail(text, lines=OUTPUT_TAIL_LINES):
     return "\n".join(parts[-lines:])
 
 
+QUERY_LABELS = {"ffprobe", "ffmpeg probe", "ffmpeg -filters", "oiiotool (measure)",
+                "oiiotool --colorconfiginfo", "Reading image info", "Measuring depth range"}
+
+
 def run_tool(cmd, what, verbose=0, check=True, cwd=None):
     """Run a command, return CompletedProcess. Raise ToolError with the output tail on failure
     (unless check is False: `ffmpeg -i` alone exits 1 but prints what we need)."""
     cmd = [str(c) for c in cmd]
-    log.debug("%s: %s", what, cmdline(cmd))
+    # the commands that make something go into the log (to rerun or report them); the
+    # questions asked of the tools (probing, reading headers) only with -v
+    level = logging.DEBUG if what in QUERY_LABELS else logging.INFO
+    log.log(level, "Command (%s): %s", what, cmdline(cmd))
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="backslashreplace",

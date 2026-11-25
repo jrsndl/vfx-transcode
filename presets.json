@@ -776,5 +776,64 @@
       "source": "movie",
       "slate": true
     }
+  },
+  "destination_paths": {
+    "Same folder as the source": {
+      "path": "./",
+      "notes": "Next to the input."
+    },
+    "review folder next to the source": {
+      "path": "./review/"
+    },
+    "review folder beside the source folder": {
+      "path": "./../review/"
+    },
+    "Source and name subfolder": {
+      "path": "{sourcepath}/{clean_name}/",
+      "notes": "A folder named after the input, next to it."
+    },
+    "Custom destination path": {
+      "path": "{custom_destination_path}/",
+      "notes": "The folder vfx-transcode-process users type (or pick) themselves."
+    }
+  },
+  "destination_names": {
+    "Same name as the source": {
+      "name": "{clean_name}",
+      "notes": "The input's name."
+    },
+    "Source _transcoded": {
+      "name": "{clean_name}_transcoded"
+    },
+    "Name + _review": {
+      "name": "{clean_name}_review"
+    },
+    "Name + date": {
+      "name": "{clean_name}_{date}"
+    },
+    "Shot + version": {
+      "name": "{namesplit1}_{namesplit2}_v{version_string}"
+    },
+    "Custom destination name": {
+      "name": "{custom_destination_name}",
+      "notes": "The name vfx-transcode-process users type themselves."
+    }
+  },
+  "channel_preference_presets": {
+    "rgb_beauty_P": {
+      "channels": [
+        "rgba.R,rgba.G,rgba.B,rgba.A",
+        "rgba.R,rgba.G,rgba.B",
+        "rgb.R,rgb.G,rgb.B,rgb.A",
+        "rgb.R,rgb.G,rgb.B",
+        "R,G,B,A",
+        "r,g,b,a",
+        "R,G,B",
+        "r,g,b",
+        "beauty.R,beauty.G,beauty.B,beauty.A",
+        "beauty.R,beauty.G,beauty.B",
+        "P.x,P.y,P.z"
+      ]
+    }
   }
 }

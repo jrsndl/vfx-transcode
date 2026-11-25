@@ -23,7 +23,7 @@ import sys
 from pathlib import Path, PureWindowsPath
 
 from . import __version__
-from .channels import pick_channels
+from .channels import layer_tokens, pick_channels
 from .aspect import output_par, par_display, parse_par, resolve_par
 from dataclasses import replace
 from .burnin import (BURN_PLACES, DEFAULT_MARGINS, PLACE_NAMES, BurnStyle, margins_from_values,
@@ -43,11 +43,12 @@ from .letterbox import (DEFAULT_FILL as LB_FILL, DEFAULT_LINE_COLOR as LB_LINE_C
                         plan as letterbox_plan)
 from .smart_tokens import evaluate_preset as evaluate_smart_tokens, parse_smart_token_presets
 from .names import (NAME_KEYWORDS, DEFAULT_VERSION_REGEX, compile_version_regex, custom_tokens,
-                    merge_rules, name_tokens)
+                    merge_rules, name_tokens, path_tokens, PATH_KEYWORDS)
 from .transforms import INPUT_KEYWORDS, input_tokens, select as select_transform, transform_args
 from . import filmstrip as fs
 from .thumbnails import (choose_frame as choose_thumbnail_frame, ffmpeg_command as thumbnail_ffmpeg,
-                         oiiotool_command as thumbnail_oiiotool, parse_frame as parse_thumbnail_frame)
+                         oiiotool_command as thumbnail_oiiotool, parse_frame as parse_thumbnail_frame,
+                         apply_options as thumbnail_options)
 from .oiio import plain_args, process_args
 from .thumbnails import _without_depth
 from .sequence import fill_holes, find_sequence, format_frames
@@ -60,7 +61,7 @@ from .channels import find_alpha
 from .slate import (PLAIN_SLATE, SLATE_STYLE_FIELDS, SlateSpec, apply_field_options, has_alpha, movie_size,
                     parse_thumbnail, pick_thumbnail, probe_frame, probe_frames, render_slate,
                     slate_timecode, style_values)
-from .timecode import (fps_display, fps_from_attribs, fps_to_str, frame_to_tc, nominal_fps,
+from .timecode import (fps_display, fps_from_attribs, fps_to_str, fps_tokens, frame_to_tc, nominal_fps,
                        offset_timecode, parse_fps, timecode_from_attribs, validate_timecode)
 from .tools import TOOLS, app_dir, expand_path, ffmpeg_filters, resolve_path, resolve_tool, run_tool, split_args
 
@@ -116,6 +117,17 @@ def build_parser(presets=None, presets_error=None):
     p.add_argument("-thumbnail_frame", default=None, metavar="middle|first|last|largest|FRAME",
                    help="Which frame: overrides the preset. largest = the frame whose converted "
                         "image is the biggest file (needs the movie; else middle)")
+    p.add_argument("-thumbnail_size", default=None, metavar="WxH",
+                   help="Thumbnail size: overrides the preset. 0 or empty = follow the other side "
+                        "(1920x0, x540); 0x0 = the movie's size")
+    p.add_argument("-thumbnail_format", default=None, choices=("jpg", "png"),
+                   help="Thumbnail file format: overrides the preset")
+    p.add_argument("-thumbnail_quality", default=None, metavar="1-100",
+                   help="jpg quality of the thumbnail: overrides the preset")
+    p.add_argument("-thumbnail_compression", default=None, metavar="0-9",
+                   help="png compression of the thumbnail (0 none - 9 smallest): overrides the preset")
+    p.add_argument("-thumbnail_bits", default=None, choices=("8", "16"),
+                   help="png bit depth of the thumbnail: overrides the preset (jpg is 8-bit)")
     p.add_argument("-of", default=None, nargs="?", const="", metavar="PATH",
                    help="Write a filmstrip: one jpg of evenly spaced frames in a grid of equal "
                         "tiles, same look as the thumbnail (no burn-ins). PATH works like -ot; -of "
@@ -147,6 +159,10 @@ def build_parser(presets=None, presets_error=None):
                         "letterbox, pixel format), as FILE.png; the slate as FILE_slate.png; and "
                         "FILE.json with the input and output metadata. The frame: "
                         "-thumbnail_frame (default middle). Used by vfx-transcode-tuner")
+    flag(p, "-preview_alpha", False,
+         "With -preview: 1 = the preview picture keeps the input's alpha even when the output "
+         "drops it (-alpha drop, or an output that cannot store alpha), so the tuner can show "
+         "it. Only the preview: the report's output.alpha_output tells what the output gets")
     p.add_argument("-r", "--fps", default=None, metavar="RATE",
                    help="Frame rate: 24, 25, 23.976, 24000/1001. See -fps_source for how it "
                         "combines with the EXR header (or a movie's own rate); 24 if neither "
@@ -167,6 +183,13 @@ def build_parser(presets=None, presets_error=None):
     p.add_argument("-movie_first_frame", type=int, default=None, metavar="N",
                    help="Movie input (.mov .mp4 .mxf ...): the frame number of its first frame, "
                         "for burn-ins, -thumbnail_frame and the frame counter. Default 1001")
+    p.add_argument("-output_fps", default="same", metavar="same|RATE",
+                   help="Play the output at another frame rate: every frame is kept, each is shown "
+                        "for 1/RATE s (24 -> 25: 100 frames last 4 s instead of 4.17 s). The movie, "
+                        "its timecode, the burn-ins' {fps} and the slate use RATE; "
+                        "{source_fps_float} ... keep the source's. A start timecode read from the "
+                        "file keeps its digits when they fit RATE; else its frame is scaled to RATE "
+                        "(27 of 30 -> 22 of 25). same (default): the input's rate")
     p.add_argument("-fps_source", choices=("arg", "exr", "arg_only"), default="arg",
                    help="arg (default): -r wins, else the EXR header, else 24. "
                         "exr: the EXR header wins, else -r, else 24. "
@@ -228,14 +251,31 @@ def build_parser(presets=None, presets_error=None):
                         "colour preset's, else " + DEFAULT_OCIO)
 
     g = p.add_argument_group("EXR conversion (oiiotool)")
-    g.add_argument("-oiio_threads", type=int, default=0,
-                   help="Threads for oiiotool. 0 = number of cores")
+    g.add_argument("-oiio_threads", default=DEFAULT_THREADS, metavar="N|N%",
+                   help="Threads for oiiotool (and the other parallel work): a number, or a share "
+                        "of this machine's threads, e.g. 50%% = 8 on a 16-thread machine (worked "
+                        "out where vfx-transcode runs, so a super-preset or a Deadline job adapts "
+                        "to each machine). 0 = all. Default " + DEFAULT_THREADS.replace("%", "%%")
+                        + ": all threads at once have been seen to give oiiotool random black frames")
     g.add_argument("-oiio_channel", default="",
                    help="Channels to use, e.g. R,G,B or diffuse.R,diffuse.G,diffuse.B. Default: "
                         "automatic, from channel_preferences in the presets file")
     flag(g, "-oiio_channel_use_first", False,
          "Skip the automatic search (channel_preferences in the presets file) and use the "
          "first layer")
+    g.add_argument("-channel_preferences", default="", metavar="NAME",
+                   help="The order the automatic channel search tries: a preset from the presets "
+                        "file's channel_preference_presets. Default: its channel_preferences")
+    g.add_argument("-channel_order", default="", metavar="SETS",
+                   help="The order the automatic channel search tries, given here: channel sets "
+                        "separated by ; e.g. \"rgba.R,rgba.G,rgba.B;R,G,B;beauty.R,beauty.G,beauty.B\". "
+                        "Wins over -channel_preferences. Wildcards * ? [abc] work (case counts): "
+                        "\"Actor*.R,Actor*.G,Actor*.B\" takes the first layer starting with Actor that has "
+                        "all three. The first set found is used; if none is, the first layer")
+    g.add_argument("-oiio_subimage", default="", metavar="N|NAME",
+                   help="Multi-part EXR: look for the channels only in this part, by number (0 = "
+                        "the first) or name, e.g. diffuse. -oiio_channel, -oiio_channel_use_first "
+                        "and the automatic search all keep to it. Default: all parts, in order")
     g.add_argument("-oiio_command", default="",
                    help="Extra oiiotool arguments, added after colorconvert and resize")
     g.add_argument("-oiio_transform_args", default=None, metavar="ARGS",
@@ -249,6 +289,9 @@ def build_parser(presets=None, presets_error=None):
                         "Default: the file's default_oiio_transform. EXR only")
     flag(g, "-oiio_per_file", False,
          "Run one oiiotool per file instead of --parallel-frames batches")
+    flag(g, "-oiio_verify", True,
+         "After converting, frames far smaller than the others (oiiotool's random black "
+         "frames) are converted again one at a time; 0 = off")
     g.add_argument("-mezzanine", default="png", help="Intermediate file format. Default png")
     flag(g, "-mezzanine_16bit", False,
          "Write 16-bit intermediates (slower; useful for 10-bit presets)")
@@ -304,6 +347,22 @@ def build_parser(presets=None, presets_error=None):
                         "keywords {namesplit1}..{namesplit9} and {namesplit-1}..{namesplit-9} are "
                         "the name's parts split at _, counted from the start or the end; all of "
                         "them work in burn-ins, slate, metadata and -reelid")
+    g.add_argument("-base_folder", default="", metavar="PATH",
+                   help="The folder a batch was found in (vfx-transcode-process sends it for a "
+                        "scanned folder), for the keywords {base_folder} and {base_folder-1}, "
+                        "{base_folder-2} ... (the folders above it). Default: the input's folder. "
+                        "Path keywords that need nothing: {sourcepath} (the input; a sequence with "
+                        "####), {sourcepath-1} its folder, {sourcepath-2} the one above ...; "
+                        "{sourcefolder1}..{sourcefolder20} the folders from the top (a drive "
+                        "\"D:\" or \"\\\\server\" first) and {sourcefolder-1}..{sourcefolder-20} "
+                        "from the end")
+    g.add_argument("-custom_destination_path", default="", metavar="TEXT",
+                   help="The value of {custom_destination_path}: what the user typed in "
+                        "vfx-transcode-process for a super-preset destination that uses it, e.g. "
+                        "-o \"{custom_destination_path}/{sourcefolder-3}/\". Empty if not given")
+    g.add_argument("-custom_destination_name", default="", metavar="TEXT",
+                   help="The value of {custom_destination_name}, the same way, e.g. "
+                        "-o \"./{custom_destination_name}_{clean_name}\"")
     g.add_argument("-name_token", action="append", default=[], metavar="NAME=REGEX",
                    help="Custom keyword {NAME}: group 1 (else the whole match) of the first match "
                         "of REGEX in the sequence name, empty if none; repeatable. Adds to / "
@@ -624,6 +683,17 @@ def check_alpha_args(ns, preset):
     return mode
 
 
+def preview_alpha_blocker(ns):
+    """Why -preview_alpha cannot carry alpha into the preview picture, or None. The preview
+    rebuilds alpha after the codec's pixel format and writes oiiotool frames as TIF when the
+    output format has no alpha, so only the intermediate frames' format matters."""
+    if outseq.sequence_ext(ns.o) == ".exr":
+        return None
+    if ns.mezzanine.strip().lower().lstrip(".") not in ALPHA_MEZZANINES:
+        return "-mezzanine {} cannot store alpha".format(ns.mezzanine)
+    return None
+
+
 def alpha_missing(cfg, text, *args):
     """No alpha in the input: a warning for -alpha keep, information for -alpha auto."""
     (log.info if cfg.alpha_auto else log.warning)(text, *args)
@@ -782,6 +852,9 @@ def config_from_args(ns, presets):
     slate = slate_from_args(ns, presets)
     letterbox = letterbox_from_args(ns)
     alpha_mode = check_alpha_args(ns, preset)
+    alpha_view_only = False
+    if ns.preview and ns.preview_alpha and alpha_mode == "drop" and not preview_alpha_blocker(ns):
+        alpha_mode, alpha_view_only = "keep", True      # the picture only, not the output
     name_rules = merge_rules(presets.name_rules, ns.name_token)
     if ns.smart_tokens_def:
         smart_tokens = smart_tokens_from_json(ns.smart_tokens_def)
@@ -796,10 +869,15 @@ def config_from_args(ns, presets):
         thumbnail = presets.get_thumbnail(ns.thumbnail_preset or presets.default_thumbnail)
         if ns.thumbnail_frame is not None:
             thumbnail = replace(thumbnail, frame=parse_thumbnail_frame(ns.thumbnail_frame))
+        if any(getattr(ns, o) is not None for o in THUMBNAIL_OPTIONS):
+            thumbnail = thumbnail_options(thumbnail, ns.thumbnail_size, ns.thumbnail_format,
+                                          ns.thumbnail_quality, ns.thumbnail_compression,
+                                          ns.thumbnail_bits)
         if ns.ot.strip():
             check_output_template(ns.ot, "-ot", tuple(THUMBNAIL_KEYWORDS) + token_names)
-    elif (ns.thumbnail_preset is not None or ns.thumbnail_frame is not None) and not ns.preview:
-        log.warning("-thumbnail_preset / -thumbnail_frame ignored: no -ot.")
+    elif (ns.thumbnail_preset is not None or ns.thumbnail_frame is not None
+          or any(getattr(ns, o) is not None for o in THUMBNAIL_OPTIONS)) and not ns.preview:
+        log.warning("-thumbnail_* options ignored: no -ot.")
     filmstrip = filmstrip_from_args(ns, presets, token_names)
     seq_args, seq_preset = sequence_args_from(ns, presets)
     # what to make: -o, -ot and/or -of; none of them = the movie at its default place
@@ -824,6 +902,7 @@ def config_from_args(ns, presets):
         output=ns.o,
         fps=fps_arg or DEFAULT_FPS,
         fps_arg=fps_arg,
+        output_fps=parse_output_fps(ns.output_fps),
         fps_source=ns.fps_source,
         par_arg=parse_par(ns.par) if ns.par else None,
         par_source=ns.par_source,
@@ -842,15 +921,17 @@ def config_from_args(ns, presets):
         ocio_view=ns.view,
         ocio_looks=ns.looks,
         clf=ns.clf.strip(),
-        oiio_threads=max(0, ns.oiio_threads),
+        oiio_threads=parse_threads(ns.oiio_threads),
         oiio_channel=[c for c in ns.oiio_channel.split(",") if c.strip()],
         oiio_channel_use_first=ns.oiio_channel_use_first,
-        channel_preferences=presets.channel_preferences,
+        oiio_subimage=ns.oiio_subimage.strip(),
+        channel_preferences=channel_order_from_args(ns, presets),
         oiio_command=split_args(ns.oiio_command),
         oiio_transform=oiio_transform,
         oiio_transform_explicit=(split_args(ns.oiio_transform_args)
                                  if ns.oiio_transform_args is not None else None),
         oiio_per_file=ns.oiio_per_file,
+        oiio_verify=ns.oiio_verify,
         mezzanine=ns.mezzanine,
         mezzanine_16bit=ns.mezzanine_16bit,
         width=max(0, ns.width),
@@ -899,9 +980,13 @@ def config_from_args(ns, presets):
         filmstrip=filmstrip,
         filmstrip_output=ns.of,
         alpha=alpha_mode,
-        alpha_auto=ns.alpha == "auto",
-        alpha_premult=bool(ns.alpha_premult) and alpha_mode == "keep",
+        alpha_auto=ns.alpha == "auto" or alpha_view_only,
+        alpha_premult=bool(ns.alpha_premult) and alpha_mode == "keep" and not alpha_view_only,
+        alpha_view_only=alpha_view_only,
         version_regex=ns.version_regex,
+        base_folder=os.path.abspath(ns.base_folder) if ns.base_folder.strip() else "",
+        custom_tokens={"custom_destination_path": ns.custom_destination_path.strip(),
+                       "custom_destination_name": ns.custom_destination_name.strip()},
         name_rules=name_rules,
         smart_tokens=smart_tokens,
         skip_ffmpeg=skip_ffmpeg,
@@ -931,6 +1016,8 @@ def tool_paths(ns, presets=None):
     return result
 
 
+THUMBNAIL_OPTIONS = ("thumbnail_size", "thumbnail_format", "thumbnail_quality",
+                     "thumbnail_compression", "thumbnail_bits")
 FILMSTRIP_OPTIONS = ("filmstrip_preset", "filmstrip_tiles", "filmstrip_tile", "filmstrip_grid",
                      "filmstrip_quality", "filmstrip_source", "filmstrip_slate")
 
@@ -1065,7 +1152,82 @@ def resolve_fps(cfg, info):
     if cfg.fps_source == "exr" and header_fps is None:
         log.info("Frame rate: %s", "no rate in the EXR header" if info else
                  "input is not EXR, so there is no header rate")
+    cfg.name_tokens.update(fps_tokens(chosen[0]))    # {source_fps_float} {source_fps_int} ...
+    cfg.source_fps = chosen[0]
+    if cfg.output_fps is not None and cfg.output_fps != chosen[0]:
+        log.info("Frame rate: source %s (%s), played at %s (-output_fps): %s", fps_display(chosen[0]),
+                 chosen[1], fps_display(cfg.output_fps),
+                 "faster" if cfg.output_fps > chosen[0] else "slower")
+        return cfg.output_fps, "-output_fps, source {} ({})".format(fps_display(chosen[0]), chosen[1])
     return chosen
+
+
+def channel_order_from_args(ns, presets):
+    """The automatic channel search's order: -channel_order, else the -channel_preferences
+    preset, else the presets file's channel_preferences."""
+    from .presets import parse_channel_order
+    if ns.channel_order.strip():
+        sets = parse_channel_order(ns.channel_order)
+        if not sets:
+            raise TranscodeError("-channel_order: no channel sets in {!r}.".format(ns.channel_order))
+        return sets
+    name = ns.channel_preferences.strip()
+    if name:
+        if name not in presets.channel_orders:
+            raise TranscodeError('Unknown channel preference preset "{}". Available: {} (from {})'.format(
+                name, ", ".join(presets.channel_orders) or "none", presets.path))
+        return presets.channel_orders[name].as_lists()
+    return presets.channel_preferences
+
+
+DEFAULT_THREADS = "50%"
+
+
+def parse_threads(value, cpus=None):
+    """-oiio_threads: "8" -> 8, "50%" -> half this machine's threads (at least 1),
+    "0" or "100%" -> all of them."""
+    cpus = cpus or os.cpu_count() or 4
+    text = str(value).strip()
+    try:
+        if text.endswith("%"):
+            share = float(text[:-1])
+            if not 0 < share <= 100:
+                raise ValueError
+            return max(1, int(round(cpus * share / 100.0)))
+        number = int(text)
+        if number < 0:
+            raise ValueError
+        return number or cpus
+    except ValueError:
+        raise TranscodeError('-oiio_threads: a number of threads or a share like 50%, got "{}".'
+                             .format(value))
+
+
+def parse_output_fps(value):
+    """-output_fps: None for same, else the rate."""
+    text = str(value or "").strip().lower()
+    if text in ("", "same", "source", "input"):
+        return None
+    try:
+        return parse_fps(text)
+    except ValueError as exc:
+        raise TranscodeError("-output_fps: {}".format(exc))
+
+
+def retime_timecode(cfg, tc):
+    """A timecode read from the file at the source rate, for the output rate: the same digits
+    when its frame fits the new rate; else the same hours, minutes and seconds, with the frame
+    scaled to the new rate (27 of 30 -> 22 of 25), so it stays in the same second."""
+    if cfg.output_fps is None or cfg.source_fps is None or not tc:
+        return tc
+    out_int, src_int = nominal_fps(cfg.output_fps), nominal_fps(cfg.source_fps)
+    text = tc.strip()
+    frame = int(text[-2:])
+    if out_int == src_int or frame < out_int:
+        return tc
+    new = "{}{:02d}".format(text[:-2], min(out_int - 1, frame * out_int // src_int))
+    log.info("Timecode: %s has frame %d, past %d fps: %s", tc, frame, out_int, new)
+    return new
 
 
 def today():
@@ -1095,6 +1257,7 @@ def _resolve_timecode(cfg, seq, info, header_frame=None):
                 log.warning("No timecode in the %s; using the frame counter.", cfg.header_label)
         if tc:
             frame = header_frame if header_frame is not None else seq.frame_of(cfg.input)
+            tc = retime_timecode(cfg, tc)
             if frame is not None and frame != seq.start:
                 # the header we read belongs to a later frame, not the first one
                 tc = offset_timecode(tc, seq.start - frame, fps_int)
@@ -1257,7 +1420,11 @@ def output_metadata(cfg, seq, info, timecode):
             attribs = {}
             for sub in reversed(info):          # first subimage wins
                 attribs.update(sub.get("attribs", {}))
-            copied = md.select(md.header_metadata(attribs), cfg.metadata_copy)
+            available = md.header_metadata(attribs)
+            copied = md.select(available, cfg.metadata_copy)
+            hint = md.copy_hint(available, cfg.metadata_copy)
+            if hint:
+                log.warning("-metadata_copy: %s.", hint)
     result = md.build(copied, cfg.metadata, metadata_context(cfg, seq, timecode),
                       [cfg.preset.metadata, cfg.preset_tags])
     if result:
@@ -1358,6 +1525,10 @@ def run(cfg):
     seq = trim_sequence(cfg, seq)
     cfg.header_frame = cfg.movie_first_frame if movie is not None else seq.start
     cfg.name_tokens = name_tokens(seq.clean_name, cfg.version_regex)
+    cfg.name_tokens.update(path_tokens(source_path(cfg, seq, movie), cfg.base_folder))
+    cfg.name_tokens.update(cfg.custom_tokens)
+    cfg.name_tokens.update(fps_tokens(None))         # filled in when the frame rate is settled
+    cfg.name_tokens.update(layer_tokens(None))       # filled in when the EXR header is read
     if cfg.name_tokens["version_string"]:
         log.info("Version: %s (from %s)", cfg.name_tokens["version_string"], seq.clean_name)
     else:
@@ -1411,11 +1582,15 @@ def run(cfg):
                             "right colour tags with -ff_encode for HDR / P3 deliveries.", cfg.ocio_display)
             info = get_image_info(cfg.oiiotool, cfg.header_file, cfg.verbose)
             cfg.header_attribs = md.header_attribs(info)
+            cfg.name_tokens.update(layer_tokens(info))   # {multi_layers_line} ...
             add_custom_tokens(cfg, seq, info)
             if cfg.write_exr_info:
                 write_info_json(info, cfg.header_file + ".json")
-            pick = pick_channels(info, cfg.oiio_channel, cfg.oiio_channel_use_first,
-                                 cfg.channel_preferences or None)
+            try:
+                pick = pick_channels(info, cfg.oiio_channel, cfg.oiio_channel_use_first,
+                                     cfg.channel_preferences or None, cfg.oiio_subimage)
+            except ValueError as exc:
+                raise TranscodeError(str(exc))
             depth = plan_depth_view(cfg, info, pick)
             if cfg.alpha == "keep":
                 if depth is not None:
@@ -1634,6 +1809,13 @@ def run(cfg):
                     whole_folder=cfg.temp_location == "user" and created_dir)
 
 
+def source_path(cfg, seq, movie):
+    """{sourcepath}: the movie, or the sequence with #### for the frame number."""
+    if movie is not None or not seq.numbered:
+        return os.path.abspath(cfg.input)
+    return os.path.join(os.path.abspath(str(seq.folder)), seq.base + "#" * seq.zfill + seq.ext)
+
+
 def trim_sequence(cfg, seq):
     """seq limited to -in / -out (inclusive frame numbers)."""
     if cfg.trim_in is None and cfg.trim_out is None:
@@ -1804,13 +1986,25 @@ def write_sequence_oiio(cfg, seq, info, pick, depth, work_dir, preview_frame, ex
     return exit_code
 
 
+def frame_timecode(cfg, seq, frame, timecode):
+    """The previewed frame's timecode in the output (the first picture's plus the frames
+    since), "" when there is none."""
+    try:
+        return offset_timecode(timecode, frame - seq.start, nominal_fps(cfg.fps)) if timecode else ""
+    except (AttributeError, ValueError, TypeError):
+        return ""
+
+
 def write_preview_oiio(cfg, seq, info, mid, work_dir, frame, timecode, exit_code, tags=None,
                        reel_name=""):
     """-preview of an oiiotool-only output: the frame through the same steps into the output
     format, then as 8-bit PNG (an EXR's values clipped, no view transform) and the JSON."""
     image = Path(cfg.preview)
     image.parent.mkdir(parents=True, exist_ok=True)
-    written = Path(work_dir) / ("preview_out" + cfg.seq_out_ext)
+    ext = cfg.seq_out_ext
+    if cfg.alpha_view_only and ext not in ALPHA_SEQUENCES:
+        ext = ".tif"                     # -preview_alpha: a format that keeps the alpha
+    written = Path(work_dir) / ("preview_out" + ext)
     run_tool([cfg.oiiotool, "-i", seq.path(frame).as_posix()] + mid + ["-o", written.as_posix()],
              "oiiotool (preview)", cfg.verbose)
     run_tool([cfg.oiiotool, "-i", written.as_posix(), "-d", "uint8", "-o", image.as_posix()],
@@ -1826,12 +2020,19 @@ def write_preview_oiio(cfg, seq, info, mid, work_dir, frame, timecode, exit_code
                   "frames": format_frames(seq.frames), "first_frame": seq.start,
                   "last_frame": seq.end, "movie": is_movie, "is_exr": seq.is_exr,
                   "header": cfg.header_attribs, "par": par_display(cfg.par_in)},
-        "keywords": {k: v for k, v in context.items() if k != "meta"},
+        "keywords": {k: v for k, v in context.items()
+                     if k != "meta" and not (k in PATH_KEYWORDS and v == "")},
         "output": {"width": width, "height": height, "par": float(cfg.par_in),
                    "pix_fmt": "{} {}".format(cfg.seq_out_ext.lstrip("."), " ".join(
                        outseq.oiio_output_args(cfg.seq_out_ext, cfg.seq_args, cfg.mezzanine_16bit))),
                    "fps": fps_display(cfg.fps), "timecode": timecode,
+                   "alpha": bool(cfg.alpha_active), "alpha_premult": bool(cfg.alpha_premult),
+                   "alpha_output": bool(cfg.alpha_active and not cfg.alpha_view_only),
+                   "source_fps": fps_display(cfg.source_fps or cfg.fps),
                    "movie_timecode": offset_timecode(timecode, frame - seq.start, nominal_fps(cfg.fps)),
+                   "frame_timecode": frame_timecode(cfg, seq, frame, timecode),
+                   "timecode_written": bool(cfg.output_timecode and timecode
+                                            and cfg.seq_out_ext in SEQ_TIMECODE_EXTS),
                    "reel_name": reel_name, "metadata": dict(tags or {}),
                    "timecode_source": cfg.timecode_found, "reel_source": cfg.reel_found,
                    "colour": describe_colour(cfg) if (seq.is_exr and not cfg.skip_colour) or (
@@ -2014,7 +2215,7 @@ def convert_preview_frame(cfg, seq, frame, pick, work_dir, depth, mid=None):
     src = seq.path(frame)
     stat = os.stat(str(src))
     parts = [str(src), str(stat.st_mtime_ns), str(stat.st_size), cfg.mezzanine_ext,
-             os.environ.get("OCIO", "")] + list(mid)
+             os.environ.get("OCIO", ""), "alpha={}".format(cfg.alpha_active)] + list(mid)
     key = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
     cache_dir = Path(tempfile.gettempdir()) / TEMP_ROOT_NAME / "preview-cache"
     cached = cache_dir / (key + cfg.mezzanine_ext)
@@ -2038,7 +2239,7 @@ def convert_preview_frame(cfg, seq, frame, pick, work_dir, depth, mid=None):
 
 def preview_pix_fmt(cfg):
     if cfg.image_output:
-        return "rgb24"
+        return "rgba" if cfg.alpha_active else "rgb24"
     args = encode_args(cfg, "{videofilter}")
     if "-pix_fmt" in args[:-1]:
         return args[args.index("-pix_fmt") + 1]
@@ -2055,8 +2256,16 @@ def write_preview(cfg, seq, info, list_file, video_filter, work_dir, frame, time
     slate = image.with_name(image.stem + "_slate" + image.suffix) if cfg.slate else None
     pix_fmt = preview_pix_fmt(cfg)
     rgb = "rgba" if cfg.alpha_active else "rgb24"
-    chain = ",".join([video_filter, "format=" + pix_fmt,
-                      "scale=in_range=tv:in_color_matrix=bt709:out_range=pc", "format=" + rgb])
+    look = ["format=" + pix_fmt, "scale=in_range=tv:in_color_matrix=bt709:out_range=pc"]
+    if cfg.alpha_active and not has_alpha(pix_fmt):
+        # the codec's pixel format has no alpha (-preview_alpha): the colour through it, the
+        # alpha taken before it and merged back
+        # (rgba64le before split: else split shares the codec's format and loses the alpha)
+        chain = (video_filter + ",format=rgba64le,split[pc][pa];[pc]"
+                 + ",".join(look + ["format=rgb24"])
+                 + "[pcc];[pa]alphaextract[paa];[pcc][paa]alphamerge,format=rgba")
+    else:
+        chain = ",".join([video_filter] + look + ["format=" + rgb])
     pattern = Path(work_dir) / "preview_%d.png"
     cmd = [cfg.ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0",
            "-r", fps_to_str(cfg.fps), "-i", Path(list_file).as_posix(), "-vf", chain,
@@ -2078,10 +2287,16 @@ def write_preview(cfg, seq, info, list_file, video_filter, work_dir, frame, time
                   "last_frame": seq.end, "movie": is_movie,
                   "is_exr": seq.is_exr, "header": cfg.header_attribs,
                   "par": par_display(cfg.par_in)},
-        "keywords": {k: v for k, v in context.items() if k != "meta"},
+        "keywords": {k: v for k, v in context.items()
+                     if k != "meta" and not (k in PATH_KEYWORDS and v == "")},
         "output": {"width": fmt.width, "height": fmt.height, "par": float(cfg.par_out_value),
                    "pix_fmt": pix_fmt, "fps": fps_display(cfg.fps), "timecode": timecode,
-                   "movie_timecode": movie_tc, "reel_name": reel_name, "metadata": metadata,
+                   "alpha": bool(cfg.alpha_active), "alpha_premult": bool(cfg.alpha_premult),
+                   "alpha_output": bool(cfg.alpha_active and not cfg.alpha_view_only),
+                   "source_fps": fps_display(cfg.source_fps or cfg.fps), "movie_timecode": movie_tc,
+                   "frame_timecode": frame_timecode(cfg, seq, frame, timecode),
+                   "timecode_written": bool(cfg.output_timecode and timecode),
+                   "reel_name": reel_name, "metadata": metadata,
                    "timecode_source": cfg.timecode_found, "reel_source": cfg.reel_found,
                    "colour": describe_colour(cfg) if seq.is_exr else "",
                    "transform": cfg.transform_choice,

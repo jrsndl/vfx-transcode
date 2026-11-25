@@ -35,6 +35,7 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 - Trim with `-in` / `-out` (sequences and movies), and image sequences as output (`-o ./{clean_name}.####.exr`, `.jpg`, `.png`, `.tif`, `.dpx`). Sequence to sequence runs oiiotool only, with no ffmpeg step at all, and has an oiiotool letterbox; sequence presets for JPEG quality, PNG 8/16-bit and EXR half with PIZ, ZIP (1 / 16 lines) or DWAB compression; `-ff_transform` sets the ffmpeg scale / zscale chain.
 - Movie files as input (QuickTime, MP4, MXF, MKV …): ffprobe reads rate, frame count and timecode, and ffmpeg unpacks the frames, so slate, burn-ins, letterbox, thumbnail and filmstrip work the same as for sequences; a preview unpacks only its one frame.
 - A tuner app (PySide6) to tune presets by eye and convert: sequences or movies as input, a timeline to scrub to any frame, frame rate detection, compare to the source or another image, movie or sequence, super-presets (encode, transform, burn-in, slate, filmstrip, metadata and letterbox saved together, also usable with `-super_preset` on the command line) and a Process button: see [docs/TUNER.md](docs/TUNER.md).
+- A process app (PySide6) for everyone else: pick files or a folder (searched with filters, e.g. latest versions of `*comp*` EXR sequences), where the outputs go, and a super-preset (checked against each input), then Go; a queue with progress, pause, retry, and Send to Deadline: see [docs/PROCESS.md](docs/PROCESS.md).
 - Thumbnails (jpg/png) with the same look as the movie, from the middle, first, last or busiest frame; or thumbnails only.
 - Filmstrip: one jpg of evenly spaced frames in equal tiles (default 24 tiles of 480x270 in one row, black-padded), same look as the thumbnail; tiles from the source frames, oiiotool's intermediates or the encoded movie (with burn-ins), optional slate as the first tile; grid, tile count, tile size and jpg quality from presets or the command line; its own view in the tuner.
 - VFX slate: one frame before the pictures (frame and timecode start − 1), same size and pixel aspect as the pictures, with a shot thumbnail and rows from presets, header values or the command line.
@@ -45,10 +46,12 @@ Point `-i` at any frame; the whole sequence is found automatically. The movie is
 vfx-transcode.py      entry script (also used by the PyInstaller spec)
 vfx_transcode/        the package; python -m vfx_transcode works too
 vfx-transcode-tuner.py  the tuner app (needs PySide6); vfx_tuner/ is its package
+vfx-transcode-process.py  the process app: inputs, output, super-preset, queue (needs PySide6); vfx_process/
 presets.json          encode, burn-in, metadata and slate presets, channel preferences
 vfx-transcode.ini     optional path to the studio preferences (a presets.json on a share)
 docs/OPTIONS.md       options reference
 docs/TUNER.md         the tuner
+docs/PROCESS.md       the process app
 tests/                unit tests
 test_conversion.bat   end-to-end test on the sample media in ./media
 oiio/ ffmpeg/ ocio/ fonts/   tools and data used by default; only their README is in git

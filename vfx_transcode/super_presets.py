@@ -1,5 +1,6 @@
-"""Super-presets: the settings of several areas (encode, transform sequence (oiiotool),
-transform (ffmpeg), burn-in, slate, filmstrip, metadata) saved together under one name, in
+"""Super-presets: the settings of several areas (input interpretation, colour, tokens, encode,
+intermediate, multichannel, transform sequence (oiiotool), transform (ffmpeg), burn-in, slate,
+filmstrip, thumbnail, metadata) saved together under one name, in
 super_presets.json next to the presets file. The two transform areas include their letterbox.
 
 vfx-transcode-tuner writes them. Each area holds two things:
@@ -13,6 +14,10 @@ on the command line wins over the super-preset's (options that add up, such as -
 File layout:
   {"super_presets": {"NAME": {"notes": "...", "areas": {"burnin": {"state": {...},
                                                                    "args": ["-burn_preset", ...]}}}}}
+
+Optional "inputs": ["exr", "image", "movie"] on a super-preset limits the inputs it is meant for
+(EXR sequences, other image sequences and stills, movies); vfx-transcode-process offers it only
+for those. Without it, the process app works out what fits from the areas.
 """
 
 import json
@@ -23,10 +28,16 @@ from pathlib import Path
 from . import safe_save
 from .errors import TranscodeError
 
-AREAS = ("encode", "transform_sequence", "transform", "burnin", "slate", "filmstrip", "metadata")
-AREA_TITLES = OrderedDict([("encode", "Encode"), ("transform_sequence", "Transform Sequence"),
+INPUT_KINDS = ("exr", "image", "movie")
+AREAS = ("input", "colour", "tokens", "encode", "intermediate", "channels", "transform_sequence",
+         "transform", "burnin", "slate", "filmstrip", "thumbnail", "metadata")
+AREA_TITLES = OrderedDict([("input", "Input"), ("colour", "Color"), ("tokens", "Tokens"),
+                           ("encode", "Encode"), ("intermediate", "Intermediate"),
+                           ("channels", "Multichannel"),
+                           ("transform_sequence", "Transform Sequence"),
                            ("transform", "Transform"), ("burnin", "Burn-in"), ("slate", "Slate"),
-                           ("filmstrip", "Filmstrip"), ("metadata", "Metadata")])
+                           ("filmstrip", "Filmstrip"), ("thumbnail", "Thumbnail"),
+                           ("metadata", "Metadata")])
 # written by older tuners: "letterbox" (now part of Transform); read, never written
 LEGACY_AREAS = ("letterbox",)
 FILE_NAME = "super_presets.json"
@@ -36,6 +47,13 @@ NOTES = [
     "Each area has the tuner's values (state) and the matching vfx-transcode options (args).",
     "vfx-transcode reads only args; the tuner reads state. Edit args by hand if you like, but the",
     "tuner will not see the change: save the super-preset again from the tuner instead.",
+    "input_type: the input it was made for (movie, exr, png, jpg, tif, dpx); the tuner sets its",
+    "Input type from it when there is no input. inputs: the kinds of input it is for (exr, image,",
+    "movie); the process app offers it only for those. The tuner writes the kind it was saved for;",
+    "widen the list by hand if it fits more. vfx-transcode ignores both.",
+    "destination: {path, name, thumbnail: {path, name}, filmstrip: {path, name}}, where the process",
+    "app puts the output by default (its users can change the path and name there); \"\" = as the",
+    "output. vfx-transcode ignores it.",
 ]
 
 
@@ -71,6 +89,19 @@ def load_merged(paths):
     return presets, origin
 
 
+def _threads_upgrade(state, args):
+    """Super-presets saved before -oiio_threads took a share wrote the old default, all
+    threads, as the number 0. All threads at once gave oiiotool random black frames, so that
+    old default becomes the new one, 50% of the running machine's threads. A count saved on
+    purpose (or 0 saved as text, by a newer tuner) stays."""
+    if state.get("oiio_threads") == 0 and not isinstance(state.get("oiio_threads"), bool):
+        state["oiio_threads"] = "50%"
+        for index in range(len(args) - 1):
+            if args[index] == "-oiio_threads" and args[index + 1] == "0":
+                args[index + 1] = "50%"
+    return state, args
+
+
 def load(path):
     """{name: {"notes": str, "areas": {area: {"state": dict, "args": [str]}}}}; empty when the
     file does not exist."""
@@ -99,8 +130,37 @@ def load(path):
             args = value.get("args", [])
             if not (isinstance(args, list) and all(isinstance(a, str) for a in args)):
                 raise TranscodeError("{}: {} args must be a list of text.".format(where, area))
-            areas[area] = OrderedDict([("state", value.get("state") or {}), ("args", list(args))])
-        out[name] = OrderedDict([("notes", str(entry.get("notes", ""))), ("areas", areas)])
+            state = dict(value.get("state") or {})
+            if area == "intermediate":
+                state, args = _threads_upgrade(state, list(args))
+            areas[area] = OrderedDict([("state", state), ("args", list(args))])
+        out[name] = OrderedDict([("notes", str(entry.get("notes", "")))])
+        if entry.get("input_type"):                   # the tuner's Input type it was made for
+            out[name]["input_type"] = str(entry["input_type"])
+        out[name]["areas"] = areas
+        inputs = entry.get("inputs")
+        if inputs is not None:
+            if not (isinstance(inputs, list) and all(i in INPUT_KINDS for i in inputs)):
+                raise TranscodeError("{}: inputs must be a list of {}.".format(where, ", ".join(INPUT_KINDS)))
+            out[name]["inputs"] = list(inputs)
+        dest = entry.get("destination")
+        if dest is not None:
+            out[name]["destination"] = _destination(dest, where)
+    return out
+
+
+def _path_name(value, where):
+    if not (isinstance(value, dict) and all(isinstance(value.get(k, ""), str) for k in ("path", "name"))):
+        raise TranscodeError('{} must be {{"path": "...", "name": "..."}}.'.format(where))
+    return OrderedDict([("path", value.get("path", "")), ("name", value.get("name", ""))])
+
+
+def _destination(dest, where):
+    """{"path", "name"} of the output, and optional "thumbnail" / "filmstrip" ones."""
+    out = _path_name(dest, where + ": destination")
+    for key in ("thumbnail", "filmstrip"):
+        if dest.get(key) is not None:
+            out[key] = _path_name(dest[key], "{}: destination {}".format(where, key))
     return out
 
 

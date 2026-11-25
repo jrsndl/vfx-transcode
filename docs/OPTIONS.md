@@ -89,6 +89,8 @@ Examples, for frames in `D:/shows/abc/sh010/comp/v003/sh010_comp_v003.1001.exr`:
 | *(none)* | `D:/shows/abc/sh010/comp/v003/sh010_comp_v003.mp4` |
 | `./../../review/` | `D:/shows/abc/sh010/review/sh010_comp_v003.mp4` |
 | `./../review/{namesplit1}_v{version_number}` | `D:/shows/abc/sh010/comp/review/sh010_v3.mp4` |
+| `{sourcepath-3}/review/{sourcefolder-3}_{sourcefolder-2}` | `D:/shows/abc/review/sh010_comp.mp4` |
+| `{sourcepath}/{clean_name}/` | `D:/shows/abc/sh010/comp/v003/sh010_comp_v003/sh010_comp_v003.mp4` |
 | `D:/dailies/{date}/{clean_name}.mov` | `D:/dailies/2026-09-30/sh010_comp_v003.mov` (a mov) |
 
 ## Movie input
@@ -251,6 +253,19 @@ Everything uses the resolved rate: the movie's frame rate, frame durations, the 
 
 **Timecode counting** uses the rounded rate: 23.976 counts as 24 and 29.97 as 30, non-drop-frame.
 
+### Output frame rate
+
+| Option | Default | Description |
+|---|---|---|
+| `-output_fps same\|RATE` | `same` | Play the output at another rate, without adding or dropping frames. |
+
+Every conversion goes through still frames, so the output can be told to play them at another rate: each frame is shown for 1/RATE s. 100 frames at 24 fps last 4.17 s; with `-output_fps 25` they last 4 s (4.2 % faster). This is a conform-style speed change, not a frame rate conversion: no frames are blended, added or dropped, and audio is not carried anyway.
+
+- The movie is tagged with RATE, and the timecode, the `{tc}` and `{fps}` burn-ins, the slate's FPS row and the metadata use it.
+- `{source_fps_float}`, `{source_fps_int}` and `{source_fps_frac}` keep the input's rate.
+- A start timecode read from the file (`-timecode_source metadata`) keeps its digits when its frame number exists at RATE. When it doesn't, the hours, minutes and seconds stay and the frame is scaled to RATE: `01:00:00:27` at 30 fps becomes `01:00:00:22` at 25. A `-timecode` you give is used as it is.
+- The log shows both, e.g. `Frame rate: source 24 (EXR header FramesPerSecond), played at 25 (-output_fps): faster`.
+
 ## Pixel aspect ratio
 
 VFX material is often anamorphic (pixel aspect 2.0, or 1.33 for 1.33x lenses), and the value in the file's header isn't always right.
@@ -363,12 +378,16 @@ Before converting any frame, the tool asks ffmpeg for its filter list (`ffmpeg -
 |---|---|---|
 | `-oiio_channel LIST` | *(automatic)* | Channels to show, comma separated: `R,G,B` or `diffuse.R,diffuse.G,diffuse.B`. If they aren't in the image, a warning is printed and the tool tries them anyway. |
 | `-oiio_channel_use_first 0\|1` | `0` | Skip the automatic search (`channel_preferences`, below) and use the first layer. |
+| `-channel_preferences NAME` | *(the file's list)* | The order the automatic search tries: a named set from `channel_preference_presets` in the presets file. |
+| `-channel_order SETS` | *(none)* | The order given here, sets separated by `;`: `"crypto.R,crypto.G,crypto.B; R,G,B"`. Wins over `-channel_preferences`. Channel names may hold wildcards `*`, `?` and `[abc]` (case counts), here and in `channel_preferences`: `"Actor*.R,Actor*.G,Actor*.B"` uses the first layer (in the EXR's channel order) whose name starts with `Actor` and that has R, G and B, e.g. `ActorHitProxyMask00`; patterns of different layers each take their first matching channel. The first set found ends the search. |
+| `-oiio_subimage N\|NAME` | *(all parts)* | Multi-part EXR: look for the channels only in this part, by number (`0` = the first) or name (`diffuse`, case ignored). `-oiio_channel`, `-oiio_channel_use_first` and the automatic search all keep to it, so parts that use the same channel names (`R,G,B` in both `beauty` and `diffuse`) can be told apart. A part that isn't there stops the run with the list of parts. |
 | `-width PIXELS` | `1920` | Output width. The height follows the aspect ratio and is rounded to an even number. `0` keeps the original size. EXRs are resized by oiiotool; other input is resized by ffmpeg. With an [OIIO transform](#oiio-transforms), ffmpeg scales the transform's output to this width. |
 | `-mezzanine EXT` | `png` | Format of the intermediate frames: `png`, `tif`, `jpg`, … `tif` is often faster than `png` because it skips PNG compression. |
 | `-mezzanine_16bit 0\|1` | `0` | Write 16-bit intermediates. The default 8-bit is faster and is all an 8-bit h264 needs. Turn this on for 10-bit presets (`h265`, `prores*`, `dnxhr-hqx`) if you want real 10-bit input. |
 | `-oiio_command ARGS` | *(none)* | Extra oiiotool arguments, added after the colour conversion and resize, e.g. `-oiio_command "--ociolook \"Film Look\""`. Quotes group words; backslashes are kept as typed. |
-| `-oiio_threads N` | `0` | Number of parallel oiiotool jobs, and oiiotool's `--threads`. `0` = number of CPU cores. |
+| `-oiio_threads N\|N%` | `50%` | Threads for oiiotool (`--threads`, also how many frames `--parallel-frames` runs at once), and how many oiiotool jobs or tiles run side by side. A number, or a share of the threads of the machine running vfx-transcode: `50%` is 8 on a 16-thread machine, 4 on an 8-thread one (at least 1). It is worked out on that machine, so the same super-preset or Deadline job fits each worker. `0` or `100%` = all. The default is half because all threads at once have been seen to give oiiotool random black frames. Super-presets saved before this option took a share stored the old default (all threads) as `0`; they now get `50%`. |
 | `-oiio_per_file 0\|1` | `0` | Run one oiiotool per frame instead of `--parallel-frames` batches. Mainly for troubleshooting. |
+| `-oiio_verify 0\|1` | `1` | Black frame guard. oiiotool converting many frames at once has been seen to write random black frames (different ones on each run, local or network). After the conversion, frames under 20% of the median frame size are converted again, one at a time with one thread; if the new file is clearly bigger it is kept and the log says *Fixed N black frame(s)*, else the frame is dark in the source and stays. Needs at least 3 frames. |
 | `-temp_location user\|source` | `user` | Where the intermediate files go; see below. |
 | `-temp NAME` | `.temp_png_sequence` | With `-temp_location source`: the folder created inside the input folder. It must be a relative name; absolute paths, drive letters and `..` are refused. An empty value (`-temp ""`) writes into the input folder itself, but only if that wouldn't overwrite existing files. Ignored with `-temp_location user`. |
 | `-temp_keep 0\|1` | `0` | Keep the intermediate files. The log prints where they are. |
@@ -508,7 +527,7 @@ Examples:
 **`-metadata_copy` SPEC:**
 
 - `all` copies everything that can be copied.
-- Otherwise, list comma-separated key patterns, where `*` matches anything. A leading `-` excludes: `all,-husk:*` means everything except the `husk:` keys. Patterns are case-sensitive.
+- Otherwise, list comma-separated key patterns, where `*` matches anything. A leading `-` excludes: `all,-husk:*` means everything except the `husk:` keys. Patterns are case-sensitive. Match the keys as the header names them: Karma writes `husk:...`, Unreal's Movie Render Queue `unreal/...` (so `unreal/*`, not `unreal:*`); the tuner's Info tab lists them. A pattern that matches nothing gets a warning in the log, with how the header's keys start (and the tuner shows it under the field).
 - Only single values of up to 1024 characters are copied. Matrices, vectors and huge blobs (such as Karma's `husk:render_stats`) are skipped.
 - Image-structure attributes are never copied: compression, windows, chromaticities, `oiio:*`, `openexr:*`, `smpte:*`.
 - Copying is off by default, because render headers often contain command lines, host names and job paths.
@@ -656,6 +675,7 @@ Keywords in the text:
 | `{preset}` | Name of the encode preset. |
 | `{meta:ATTR}` | An attribute of the source header, e.g. `{meta:owner}`, `{meta:cameraModel}`, `{meta:nuke/input/filename}`. See [Header values](#header-values-metaattr). |
 | `{version_string}`, `{version_number}`, `{namesplit1}` … `{namesplit-9}` | Parts of the sequence name; see [Name keywords](#name-keywords). |
+| `{sourcepath}`, `{sourcepath-1}` …, `{sourcefolder1}` …, `{sourcefolder-1}` …, `{base_folder}`, `{base_folder-1}` … | Where the input is; see [Path keywords](#name-keywords). |
 | `{shot}`, `{task}`, … | Your own [name tokens](#custom-name-tokens) and [smart tokens](#smart-tokens). |
 
 **New lines.** `\n` in a text starts a new line, e.g. `-burn_bc "{clean_name}\nTC {tc}"` or in `presets.json` `"tl": "{clean_name}\n{date}"`. A real line break in the JSON string (`"\n"` as JSON writes it) works too.
@@ -689,6 +709,52 @@ Both are empty if the name has no version, so a slate row `"Version": "{version_
 | `{namesplit-N}` | `DD` | `C` | `BBB` | `AA` | *(empty)* |
 
 For example, for `ICOI2_005_033_renderCompSecondary_v000`, `-burn_tl "{namesplit2}_{namesplit3}"` burns in `005_033` and `-reelid "{namesplit1}"` gives the reel `ICOI2`.
+
+**Path keywords.** These come from where the input is. They work wherever the name keywords do, including `-o` and `-ot`.
+
+| Keyword | What it is |
+|---|---|
+| `{sourcepath}` | The folder the input is in. |
+| `{sourcepath-1}`, `{sourcepath-2}` … `{sourcepath-20}` | The folder above it (`..`), the one above that, and so on. The top is `D:\`, `\\server\share` or `/`; past it they are empty. |
+| `{sourcefolder1}` … `{sourcefolder20}` | The input's folders from the top. On Windows the first is the drive (`D:`), or `\\server` for a UNC path (the share is then `{sourcefolder2}`). |
+| `{sourcefolder-1}` … `{sourcefolder-20}` | The same from the end: `{sourcefolder-1}` is the folder the input is in. |
+| `{base_folder}` | The folder a batch was found in: `-base_folder PATH`, which [vfx-transcode-process](PROCESS.md) sends for the inputs of a scanned folder. Without it, the input's folder. |
+| `{base_folder-1}`, `{base_folder-2}` … `{base_folder-20}` | The folders above `{base_folder}`. |
+| `{custom_destination_path}` | What `-custom_destination_path TEXT` says, else empty. [vfx-transcode-process](PROCESS.md) sends what its user typed, for super-preset destinations such as `{custom_destination_path}/{sourcefolder-3}/`. |
+| `{custom_destination_name}` | The same for `-custom_destination_name TEXT`, e.g. a name `{custom_destination_name}_{clean_name}`. |
+
+Paths use the system's separator (`\` on Windows), and keywords that don't exist are empty. For `D:\shows\abc\sh010\comp\v003\sh010_comp_v003.####.exr`, scanned from `D:\shows\abc`:
+
+| Keyword | Value |
+|---|---|
+| `{sourcepath}` | `D:\shows\abc\sh010\comp\v003` |
+| `{sourcepath-1}` / `{sourcepath-3}` / `{sourcepath-5}` | `D:\shows\abc\sh010\comp` / `D:\shows\abc` / `D:\` |
+| `{sourcefolder1}` / `{sourcefolder2}` / `{sourcefolder4}` | `D:` / `shows` / `sh010` |
+| `{sourcefolder-1}` / `{sourcefolder-2}` / `{sourcefolder-3}` | `v003` / `comp` / `sh010` |
+| `{base_folder}` / `{base_folder-1}` | `D:\shows\abc` / `D:\shows` |
+
+For example, `-o "{base_folder}/review/{sourcefolder-3}/"` puts the movies of a whole scanned show in one review folder, with a sub-folder per shot. `-burn_bl "{sourcepath}"` burns in the folder the frames came from.
+
+**Frame rate keywords.** The frame rate in use, as `-fps_source` settles it: `-r`, the EXR header or the movie's rate, else 24.
+
+| Keyword | 23.976 | 25 |
+|---|---|---|
+| `{source_fps_float}` | `23.976` | `25.000` (always 3 decimals) |
+| `{source_fps_int}` | `24` | `25` (the closest whole number: 29.97 gives `30`) |
+| `{source_fps_frac}` | `24000/1001` | `25/1` |
+
+They work in `-o`, `-ot`, `-of`, burn-ins, slate and metadata, e.g. `-o "./{clean_name}_{source_fps_int}fps"`. Smart tokens and OIIO transform conditions run before the frame rate is known, so there they are empty. The tuner's Info tab shows their values.
+
+**Layer keywords.** The input EXR's layers, from all its parts in the order they come (channels without a layer, like `A`, are `(no layer)`). Empty for movies and other inputs without an EXR header.
+
+| Keyword | Example |
+|---|---|
+| `{multi_layers_line}` | `beauty, diffuse, (no layer)` |
+| `{multi_layers_column}` | the same, one layer per line |
+| `{multi_layerschannels_line}` | `beauty[R,G,B], diffuse[R,G,B], (no layer)[A]` |
+| `{multi_layerschannels_column}` | the same, one layer per line |
+
+The column ones are for burn-ins and the slate, where a new line starts a new line of text, e.g. `-burn_tl "{multi_layers_column}"`.
 
 ### Custom name tokens
 
@@ -839,7 +905,7 @@ The `-slate_*` options without `-slate` make a plain slate: title `{clean_name}`
 | `{reel}` | The [reel name](#reel-name), empty if none. |
 | `{preset}`, `{date}`, `{user}`, `{input}` | Encode preset, today's date, login name, the `-i` file name. |
 | `{meta:ATTR}`, `{meta:ATTR\|fallback}` | Any [header value](#header-values-metaattr) of the first frame. |
-| `{version_string}`, `{version_number}`, `{namesplit1}` … `{namesplit-9}` | The [name keywords](#name-keywords). |
+| `{version_string}`, `{version_number}`, `{namesplit1}` … `{namesplit-9}`, `{sourcepath}`, `{sourcefolder-1}` … | The [name and path keywords](#name-keywords). |
 
 `\n` starts a new line. Long values wrap next to the thumbnail. **Rows whose value comes out empty are left out** (unless the preset sets `"hide_empty": false`). So `"Artist": "{meta:Artist|}"` shows the row only when the header has an Artist, and a `Notes` row appears once you give it text. If the rows don't fit the picture height, all text shrinks until they do.
 
@@ -921,6 +987,11 @@ A thumbnail is a still image (jpg or png) that goes with the movie, or is made o
 | `-ot [PATH]` | *(no thumbnail)* | Write a thumbnail. PATH works like [`-o`](#output-path): file or folder, `./` and `../` relative to the input folder, keywords, plus `{frame}` (the frame used). The extension (`.jpg` / `.png`) is added if missing. `-ot` without PATH puts `<name>.<ext>` next to the movie, or in the input folder when there is no movie. |
 | `-thumbnail_preset NAME` | the presets file's `default_thumbnail` (`middle1280`) | Thumbnail preset: frame, size, format and compression. `--help` lists them. |
 | `-thumbnail_frame middle\|first\|last\|largest\|FRAME` | the preset's | Which frame. `middle` (the frame nearest the middle of the range), `first`, `last`, a frame number (the nearest existing frame), or `largest`, described below. |
+| `-thumbnail_size WxH` | the preset's | Thumbnail size. `0` or empty follows the other side (`1920x0`, `x540`); `0x0` = the movie's size. |
+| `-thumbnail_format jpg\|png` | the preset's | Thumbnail file format. jpg is 8-bit; switching to jpg sets 8 bits. |
+| `-thumbnail_quality 1-100` | the preset's | jpg quality. |
+| `-thumbnail_compression 0-9` | the preset's | png compression: 0 none (fastest) to 9 smallest. |
+| `-thumbnail_bits 8\|16` | the preset's | png bit depth. |
 
 **`largest`.** After oiiotool has converted the movie's frames, the tool picks the frame whose converted image is the biggest file. File size roughly follows detail, so this is the busiest frame. It falls back to `middle` when all files are the same size, and when there is no movie (thumbnail only), because the converted frames are needed. The log says which.
 
@@ -952,7 +1023,7 @@ A filmstrip is one jpg showing the whole shot at a glance: evenly spaced frames,
   | `intermediates` | The frames oiiotool converted for the movie, before ffmpeg. No second colour conversion, so it's quicker than `source` for EXRs. | no | EXR input, with the movie (`-o`) or `-skipffmpeg`. For other input, the source frames *are* the intermediates. |
   | `movie` | The encoded movie, read back by ffmpeg (Rec.709 YUV to RGB). Exactly what the movie shows, codec included. | yes | the movie (`-o`, without `-skipffmpeg`) |
 
-  When a source isn't available in a run, the source frames are used, with a warning. EXR tiles are made in parallel (as many at a time as `-oiio_threads`, default all cores) in the intermediate folder, and one more oiiotool run puts them together with `--mosaic`.
+  When a source isn't available in a run, the source frames are used, with a warning. EXR tiles are made in parallel (as many at a time as `-oiio_threads`, default half the machine's threads) in the intermediate folder, and one more oiiotool run puts them together with `--mosaic`.
 - **Slate.** Left out by default. With `-filmstrip_slate 1` (or `"slate": true`) the slate is the first tile and the frames fill the other tiles; the grid keeps its size. It needs a run that makes the slate: the movie with a slate. Otherwise all tiles are frames, with a warning.
 - **Tiles.** Each frame is fitted into the tile with its aspect ratio kept; the rest of the tile is black (oiiotool `--fit:pad=1`, ffmpeg `scale` + `pad`). Mono EXR channels are shown as grey.
 - **Frames.** The tiles are spread evenly over the frames on disk, from the first frame to the last, both included, and no frame is used twice. A sequence with fewer frames than tiles uses every frame, and the rest of the cells stay black, as do the cells of a grid bigger than the tile count. A tile whose frame fails to convert stays black, with a warning.
@@ -993,6 +1064,7 @@ Shipped filmstrip presets:
   - `FILE_slate.png`: the slate, when there is one.
   - `FILE.json`: the input header, the keyword values, the output size, pixel aspect, pixel format, frame rate, timecode, reel name, colour, transform, letterbox and metadata tags.
 - `-o`, `-ot` and `-of` are ignored with `-preview`.
+- `-preview_alpha 1`: the picture keeps the input's alpha (an RGBA PNG) even when the output drops it (`-alpha drop`, or an output that cannot store alpha), so the tuner can show it. The colour still goes through the codec's pixel format; the alpha is taken before it and merged back. Only with `-mezzanine png`/`tif` (or EXR output). `FILE.json` then has `output.alpha` true and `output.alpha_output` false. The output itself is unchanged.
 
 ## Encoding (ffmpeg)
 
@@ -1061,6 +1133,21 @@ The tuner's **Save as preset...** buttons (Color, Transform, Transform Sequence,
 - Before the new file replaces the old one, it is loaded as vfx-transcode would load it; if that fails, nothing changes.
 - The file is rewritten with its own layout (two-space indents, short lists of small objects such as conditions on one line), so the only lines that change are the saved preset's. Everything else, `_notes` and the `tools` paths included, stays as it is.
 - If the presets file can't be written (no write access to the share), the tuner says so and nothing is saved. Ask whoever looks after the studio preferences, or point the Presets file field at a file you can write.
+
+### Destination presets
+
+`destination_paths` and `destination_names` name output folders and file names made of keywords. The tuner's Destination tab saves and deletes them, and vfx-transcode-process offers them in its Path and Name menus. A path and a name together make `-o` (and the thumbnail's `-ot` and the filmstrip's `-of`).
+
+```json
+"destination_paths": {
+  "Source and name subfolder": {"path": "{sourcepath}/{clean_name}/", "notes": "A folder named after the input, next to it."}
+},
+"destination_names": {
+  "Source _transcoded": {"name": "{clean_name}_transcoded"}
+}
+```
+
+A plain string works too (`"Same folder": "./"`). A path is a folder: `./` is the input's folder and `../` the one above it. A name has no extension (`""` means the input's name). Without these sections, the built-in ones are used: same folder, review folders, source and name subfolder, custom destination path; same name, `_transcoded`, `_review`, date, shot + version, custom destination name. vfx-transcode itself doesn't read them.
 
 ### Which presets file is used
 
@@ -1153,6 +1240,7 @@ studio_prefs = \\server\pipeline\vfx-transcode
 | `smart_tokens`, `default_smart_tokens` | [Smart tokens](#smart-tokens) presets, `{"name": {"notes": ..., "tokens": [...]}}`, and the one used without `-smart_tokens` (`none` = none). Optional. |
 | `name_tokens` | [Custom name tokens](#custom-name-tokens): `{"name": "regex"}` or `{"name": {"regex": ..., "source": ..., "default": ...}}`. Optional. |
 | `channel_preferences` | Ordered channel sets for the [automatic channel choice](#exr-conversion-oiiotool). Each set is a string `"R,G,B"` or a list `["R", "G", "B"]`. Put your studio's beauty-layer names first. Optional; if it's missing, the built-in list shown there is used. |
+| `channel_preference_presets` | Named orders for the automatic channel choice, picked with `-channel_preferences NAME` (the tuner's Multichannel tab saves and deletes them): `{"lighting": {"notes": "...", "channels": ["diffuse.R,diffuse.G,diffuse.B", "R,G,B"]}}`. A plain list works too. |
 
 Encode preset fields:
 
@@ -1267,7 +1355,7 @@ Shipped burn-in presets:
 
 | Option | Default | Description |
 |---|---|---|
-| `-v`, `--verbose [N]` | `0` | `1` (or plain `-v`): also print the configuration and every oiiotool/ffmpeg command. `2`: also print the tools' own output. |
+| `-v`, `--verbose [N]` | `0` | Every oiiotool / ffmpeg command that makes something (conversion, encode, preview, slate, thumbnail, filmstrip) is always in the log, as `Command (oiiotool): ...`, ready to copy and run again. `1` (or plain `-v`): also print the configuration and the commands that only ask (probing, reading headers). `2`: also print the tools' own output. |
 | `--version` | | Print the version. |
 | `-h`, `--help` | | Print all options and the available presets. |
 

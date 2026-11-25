@@ -21,6 +21,7 @@ from vfx_transcode.burnin import (BURN_PLACES, DEFAULT_MARGINS, DEFAULT_STYLE, M
                                   WATERMARK, WATERMARK_STYLE)
 from vfx_transcode.filmstrip import SOURCES as FILMSTRIP_SOURCES, FilmstripPreset
 from vfx_transcode.slate import SlateSpec
+from vfx_transcode.thumbnails import ThumbnailPreset
 from vfx_transcode.sequence import find_sequence, format_frames
 from vfx_transcode.timecode import (fps_display, fps_from_attribs, frame_to_tc, nominal_fps,
                                     offset_timecode, parse_fps)
@@ -73,13 +74,18 @@ class InputState:
     trim_in: Optional[int] = None     # -in
     trim_out: Optional[int] = None    # -out
     output_type: str = "movie"        # movie | exr | png | jpg | tif | dpx (an image sequence)
+    input_type: str = "exr"           # movie | exr | png | jpg | tif | dpx: set from input1 when
+                                      # there is one, chosen by hand without (super-presets)
     seq_preset: str = ""              # sequence preset; "" = the file's default for the format
     colour_preset: str = ""           # the colour preset last loaded / saved (display only)
     alpha: str = "drop"               # drop | auto: keep the input's alpha when the output can
     write_timecode: bool = True       # -output_timecode (movie output)
     write_reelid: bool = True         # -output_reelid (movie output)
+    output_fps: str = ""              # -output_fps: play the frames at this rate; "" = the input's
+    missing_frames: str = "hold"      # -missing_frames: hold | error
+    par_out: str = "same"             # -par_out: same | square | a pixel aspect
+    alpha_premult: bool = False       # -alpha_premult (with alpha kept)
     extra: str = ""                   # any other vfx-transcode options
-
     def args(self):
         out = ["-i", self.input1]
         if self.trim_in is not None:
@@ -92,9 +98,14 @@ class InputState:
             out += ["-par", self.par.strip()]
         if self.movie_first_frame != mv.DEFAULT_FIRST_FRAME and mv.is_movie(self.input1):
             out += ["-movie_first_frame", str(self.movie_first_frame)]
-        for option, value in (("-presets_file", self.presets_file), ("-preset", self.encode_preset)):
+        for option, value in (("-presets_file", self.presets_file), ("-preset", self.encode_preset),
+                              ("-output_fps", self.output_fps)):
             if value.strip():
                 out += [option, value.strip()]
+        if self.missing_frames == "error":
+            out += ["-missing_frames", "error"]
+        if (self.par_out or "same").strip().lower() != "same":
+            out += ["-par_out", self.par_out.strip()]
         return out + split_args(self.extra)
 
     def colour_args(self):
@@ -433,6 +444,242 @@ def filmstrip_args(state, presets=None):
             "-filmstrip_slate", "1" if state.slate else "0"]
 
 
+# EXR channels (Multichannel tab): which part and channels become the picture
+
+CHANNEL_MODES = OrderedDict([
+    ("auto", "Automatic: the first set of the presets file's channel_preferences found"),
+    ("first", "The first layer (-oiio_channel_use_first)"),
+    ("pick", "These channels (-oiio_channel)"),
+])
+
+
+@dataclass
+class ChannelsState:
+    mode: str = "auto"                # auto | first | pick
+    subimage: str = ""                # -oiio_subimage: a part's number or name; "" = all parts
+    channels: str = ""                # -oiio_channel with mode pick: "diffuse.R,diffuse.G,diffuse.B"
+    # the automatic search's order: sets like "rgba.R,rgba.G,rgba.B"; [] = the presets file's
+    order: List[str] = field(default_factory=list)
+    order_preset: str = ""            # the channel preference preset loaded / saved
+    order_loaded: List[str] = field(default_factory=list)    # ... as it was loaded
+    deep_zrange: str = ""             # -deep_zrange "near,far" for deep EXRs shown as depth
+
+    def order_text(self):
+        return "; ".join(s.strip() for s in self.order if s.strip())
+
+    def order_sets(self, presets=None):
+        """The sets the automatic search tries, in order."""
+        if self.order:
+            from vfx_transcode.presets import parse_channel_order
+            return parse_channel_order(self.order_text())
+        return (presets.channel_preferences if presets is not None else None) or []
+
+    def channel_list(self):
+        return [c.strip() for c in self.channels.split(",") if c.strip()]
+
+    def args(self):
+        out = []
+        if self.mode == "first":
+            out += ["-oiio_channel_use_first", "1"]
+        elif self.mode == "pick" and self.channel_list():
+            out += ["-oiio_channel", ",".join(self.channel_list())]
+        if self.subimage.strip():
+            out += ["-oiio_subimage", self.subimage.strip()]
+        if self.mode == "auto" and self.order:
+            if self.order_preset and list(self.order) == list(self.order_loaded):
+                out += ["-channel_preferences", self.order_preset]     # the preset, unchanged
+            else:
+                out += ["-channel_order", self.order_text()]
+        if self.deep_zrange.strip():
+            out += ["-deep_zrange", self.deep_zrange.strip()]
+        return out
+
+    def full_args(self):
+        """For a super-preset: written out, so it does not depend on what was set before, nor
+        on the presets file (the order too; "" = the presets file's channel_preferences)."""
+        return (["-oiio_channel", ",".join(self.channel_list()) if self.mode == "pick" else "",
+                 "-oiio_channel_use_first", "1" if self.mode == "first" else "0",
+                 "-oiio_subimage", self.subimage.strip(),
+                 "-channel_preferences", "",
+                 "-channel_order", self.order_text() if self.mode == "auto" else "",
+                 "-deep_zrange", self.deep_zrange.strip()])
+
+
+_CHANNEL_INFO_CACHE = {}
+
+
+def read_channels(path, presets=None):
+    """(the input's header per part, "") as vfx-transcode reads it, or ([], why). Cached by
+    path and modification time."""
+    from vfx_transcode.oiio_info import get_image_info
+    path = (path or "").strip()
+    if not path or not os.path.isfile(path):
+        return [], "no input"
+    if Path(path).suffix.lower() != ".exr":
+        return [], "only EXR files have channels to pick"
+    key = (path, os.path.getmtime(path))
+    if key in _CHANNEL_INFO_CACHE:
+        return _CHANNEL_INFO_CACHE[key], ""
+    oiiotool = tool_path(presets, "oiiotool")
+    if oiiotool is None:
+        return [], "oiiotool not found"
+    try:
+        info = get_image_info(oiiotool, path)
+    except Exception as exc:                      # unreadable: say why
+        return [], str(exc)
+    _CHANNEL_INFO_CACHE[key] = info
+    return info, ""
+
+
+def channel_tree(info):
+    """[(part index, part name, [(layer, [channels])])] for the channel browser."""
+    from vfx_transcode.channels import group_layers, parts
+    return [(i, name, list(group_layers(channels).items())) for i, name, channels in parts(info)]
+
+
+def describe_pick(info, state, presets=None):
+    """What vfx-transcode will use with these settings, e.g. "diffuse.R,diffuse.G,diffuse.B
+    (requested), part 2 diffuse"; or what is wrong."""
+    from vfx_transcode.channels import pick_channels, subimage_name
+    if not info:
+        return ""
+    prefs = state.order_sets(presets) or None
+    try:
+        pick = pick_channels(info, state.channel_list() if state.mode == "pick" else [],
+                             state.mode == "first", prefs, state.subimage)
+    except ValueError as exc:
+        return "Not usable: {}".format(exc)
+    name = subimage_name(info[pick.subimage], pick.subimage) if pick.subimage < len(info) else ""
+    mono = len(pick.without_alpha) == 1
+    return "{}  ({}{}){}".format(",".join(pick.without_alpha), pick.reason,
+                                 ", part {}{}".format(pick.subimage, " " + name if name else "")
+                                 if len(info) > 1 else "",
+                                 "  - one channel: shown as grey" if mono else "")
+
+
+# intermediate files (Intermediate tab): the frames handed from oiiotool / the movie unpack
+# to ffmpeg, and where they go
+
+MEZZANINE_FORMATS = OrderedDict([
+    ("png", "PNG: lossless, 8 or 16-bit (default)"),
+    ("tif", "TIF: lossless, 8 or 16-bit, larger, quick to write"),
+    ("jpg", "JPG: small and quick, lossy, 8-bit only"),
+    ("bmp", "BMP: uncompressed 8-bit, quickest, largest"),
+    ("exr", "EXR: float, keeps the full range (EXR input only; a movie unpacks to PNG)"),
+])
+SIXTEEN_BIT_FORMATS = ("png", "tif")
+
+
+@dataclass
+class IntermediateState:
+    mezzanine: str = "png"            # -mezzanine
+    sixteen_bit: bool = False         # -mezzanine_16bit: 16-bit PNG / TIF
+    location: str = "user"            # -temp_location user | source
+    temp: str = ".temp_png_sequence"  # -temp: the folder name with location "source"
+    keep: bool = False                # -temp_keep
+    oiio_threads: str = "50%"         # -oiio_threads: N, or a share of the running machine's threads
+    per_file: bool = False            # -oiio_per_file: one oiiotool per frame
+    verify: bool = True               # -oiio_verify: convert suspected black frames again
+
+    def args(self, full=False):
+        """The options; full: all of them (a super-preset), else only what is not the default."""
+        default = IntermediateState()
+        out = []
+        for option, value, base in (
+                ("-mezzanine", self.mezzanine, default.mezzanine),
+                ("-mezzanine_16bit", "1" if self.sixteen_bit else "0", "0"),
+                ("-temp_location", self.location, default.location),
+                ("-temp_keep", "1" if self.keep else "0", "0"),
+                ("-oiio_threads", str(self.oiio_threads).strip() or "50%", default.oiio_threads),
+                ("-oiio_per_file", "1" if self.per_file else "0", "0"),
+                ("-oiio_verify", "1" if self.verify else "0", "1")):
+            if full or value != base:
+                out += [option, value]
+        if self.location == "source":
+            out += ["-temp", self.temp]
+        return out
+
+    def note(self):
+        """What the choice means, for the line under the controls."""
+        lines = []
+        if self.sixteen_bit and self.mezzanine not in SIXTEEN_BIT_FORMATS:
+            lines.append("16-bit is used only with PNG or TIF; {} stays as it is.".format(self.mezzanine.upper()))
+        if self.mezzanine == "jpg":
+            lines.append("JPG loses a little quality on every frame: fine for quick reviews.")
+        if not self.sixteen_bit and self.mezzanine in SIXTEEN_BIT_FORMATS:
+            lines.append("8-bit: enough for H.264; a 10-bit preset (ProRes, DNxHR, H.265 10-bit) "
+                         "gets real 10-bit input only with 16-bit.")
+        if self.location == "source":
+            lines.append('Next to the source in "{}" ({} the input folder itself).'.format(
+                self.temp or ".", "empty =" if self.temp else "this is"))
+        return " ".join(lines)
+
+
+# thumbnail (Thumbnail tab): -ot next to the output, a thumbnail preset and its settings
+
+THUMB_FRAMES = ("middle", "first", "last", "largest")
+THUMB_FIELDS = ("frame", "width", "height", "format", "quality", "compression", "bits")
+
+
+@dataclass
+class ThumbState:
+    enabled: bool = False             # write a thumbnail (-ot)
+    preset: str = ""                  # thumbnail preset; "" = the presets file's default
+    custom: bool = False              # the settings below differ from the preset: written out
+    frame: str = "middle"
+    width: int = 0                    # 0 = follow the other side (both 0: the movie's size)
+    height: int = 0
+    format: str = "jpg"               # jpg | png
+    quality: int = 90                 # jpg
+    compression: int = 6              # png 0-9
+    bits: int = 8                     # png 8 | 16
+
+    def preset_object(self, name=""):
+        return ThumbnailPreset(name=name or self.preset or "tuned", frame=self.frame,
+                               width=self.width, height=self.height, format=self.format,
+                               quality=self.quality, compression=self.compression,
+                               bits=self.bits if self.format == "png" else 8)
+
+
+def thumb_preset(presets, name):
+    """The preset a thumbnail state name stands for: "" = the file's default, else built-in."""
+    name = name or (presets.default_thumbnail if presets else "")
+    found = presets.thumbnails.get(name) if presets and name else None
+    return found or ThumbnailPreset(name="")
+
+
+def thumb_from_preset(preset, name="", enabled=False):
+    """The Thumbnail tab loaded from a preset (name: what the tab shows; "" = the default)."""
+    return ThumbState(enabled=enabled, preset=name, custom=False,
+                      **{f: getattr(preset, f) for f in THUMB_FIELDS})
+
+
+def thumb_custom(state, presets):
+    """Whether the settings differ from the preset named in the state."""
+    preset = thumb_preset(presets, state.preset)
+    mine = state.preset_object()
+    return any(getattr(mine, f) != getattr(preset, f) for f in THUMB_FIELDS
+               if f != "bits" or mine.format == "png")
+
+
+def thumb_args(state):
+    """-ot (the thumbnail goes next to the output), -thumbnail_preset and, when the settings
+    were changed from the preset, the -thumbnail_* options for all of them; nothing when off."""
+    if not state.enabled:
+        return []
+    out = ["-ot"] + (["-thumbnail_preset", state.preset] if state.preset else [])
+    if state.custom:
+        out += ["-thumbnail_frame", str(state.frame),
+                "-thumbnail_size", "{}x{}".format(state.width, state.height),
+                "-thumbnail_format", state.format]
+        if state.format == "jpg":
+            out += ["-thumbnail_quality", str(state.quality)]
+        else:
+            out += ["-thumbnail_compression", str(state.compression),
+                    "-thumbnail_bits", str(state.bits)]
+    return out
+
+
 def filmstrip_json(state):
     data = OrderedDict([("notes", "tuned"), ("tiles", state.tiles)])
     if state.columns:
@@ -449,7 +696,13 @@ def filmstrip_json(state):
 PRESET_AREAS = OrderedDict([("colour", "Colour"), ("smart_tokens", "Smart tokens"),
                             ("transform", "ffmpeg transform"),
                             ("transform_sequence", "oiiotool transform"), ("burnin", "Burn-in"),
-                            ("slate", "Slate"), ("filmstrip", "Filmstrip")])
+                            ("slate", "Slate"), ("filmstrip", "Filmstrip"),
+                            ("thumbnail", "Thumbnail"),
+                            ("encode_preset", "Encode"), ("sequence_preset", "Sequence"),
+                            ("metadata", "Metadata"),
+                            ("destination_path", "Destination path"),
+                            ("channel_order", "Channel order"),
+                            ("destination_name", "Destination name")])
 COLOUR_STATE_FIELDS = OrderedDict([("ci", "colorin"), ("co", "colorout"), ("display", "display"),
                                    ("view", "view"), ("looks", "looks"), ("clf", "clf"),
                                    ("ocio", "ocio")])
@@ -492,7 +745,10 @@ def preset_names(presets, area):
     return list({"colour": presets.colours, "transform": presets.ff_transforms,
                  "transform_sequence": presets.transforms, "burnin": presets.burnins,
                  "slate": presets.slates, "filmstrip": presets.filmstrips,
-                 "smart_tokens": presets.smart_tokens}[area])
+                 "thumbnail": presets.thumbnails, "encode_preset": presets.presets,
+                 "sequence_preset": presets.sequences, "metadata": presets.metadata_presets,
+                 "smart_tokens": presets.smart_tokens, "destination_path": presets.dest_paths,
+                 "destination_name": presets.dest_names, "channel_order": presets.channel_orders}[area])
 
 
 def preset_notes(presets, area, name, sub=None):
@@ -505,7 +761,10 @@ def preset_notes(presets, area, name, sub=None):
         return found.description if found else (t.description if t else "")
     table = {"colour": presets.colours, "transform": presets.ff_transforms,
              "burnin": presets.burnins, "slate": presets.slates, "filmstrip": presets.filmstrips,
-             "smart_tokens": presets.smart_tokens}[area]
+             "thumbnail": presets.thumbnails, "smart_tokens": presets.smart_tokens,
+             "encode_preset": presets.presets, "sequence_preset": presets.sequences,
+             "metadata": presets.metadata_presets, "destination_path": presets.dest_paths,
+             "destination_name": presets.dest_names, "channel_order": presets.channel_orders}[area]
     found = table.get(name)
     return getattr(found, "notes", "") if found else ""
 
@@ -527,8 +786,23 @@ def preset_entry(state, area, presets=None, notes="", sub=None):
         data = slate_json(state.slate)
     elif area == "filmstrip":
         data = filmstrip_json(state.filmstrip)
+    elif area == "thumbnail":
+        from vfx_transcode import thumbnails
+        data = thumbnails.to_json(state.thumb.preset_object())
+    elif area == "encode_preset":
+        data = encode_json(state.encode_edit)
+    elif area == "sequence_preset":
+        data = sequence_json(state.sequence_edit)
+    elif area == "metadata":
+        data = metadata_json(state.metadata)
     elif area == "smart_tokens":
         data = tokens_json(state.tokens)
+    elif area == "channel_order":
+        data = OrderedDict([("channels", [",".join(x) for x in state.channels.order_sets(presets)])])
+    elif area in ("destination_path", "destination_name"):
+        from vfx_transcode import destinations
+        kind = "path" if area == "destination_path" else "name"
+        data = destinations.to_json(state.dest.path if kind == "path" else state.dest.name, kind)
     else:
         raise KeyError(area)
     data["notes"] = notes
@@ -553,9 +827,24 @@ def mark_saved(state, area, name, sub=None):
         state.slate.preset = name
     elif area == "filmstrip":
         state.filmstrip.preset = name
+    elif area == "thumbnail":
+        state.thumb.preset, state.thumb.custom = name, False
+    elif area == "encode_preset":
+        state.encode_edit.preset = name
+    elif area == "sequence_preset":
+        state.sequence_edit.preset = name
+    elif area == "metadata":
+        state.metadata.preset, state.metadata.loaded = name, metadata_snapshot(state.metadata)
     elif area == "smart_tokens":
         t = state.tokens
         t.preset, t.loaded = name, [OrderedDict(r) for r in t.rows]
+    elif area == "destination_path":
+        state.dest.path_preset = name
+    elif area == "destination_name":
+        state.dest.name_preset = name
+    elif area == "channel_order":
+        c = state.channels
+        c.order_preset, c.order_loaded = name, list(c.order)
 
 
 # letterbox
@@ -603,6 +892,64 @@ class MetadataState:
     timecode: str = ""
     reelid_source: str = ""           # "" = preset / default; auto | arg | metadata | off
     reelid: str = ""
+    copy: str = ""                    # -metadata_copy: "all", "Artist,capDate", "all,-husk:*"; "" = preset
+    reelid_attr: str = ""             # -reelid_attr: EXR attribute with the reel name; "" = preset / owner
+    reelid_pattern: str = ""          # -reelid_pattern: regex on it; "" = preset / default
+    # the tab as the preset loaded it (tags, copy, reelid_attr, reelid_pattern); None = no
+    # preset loaded (older states): the preset is named and the tags add to it
+    loaded: Optional[dict] = None
+
+
+def metadata_snapshot(m):
+    return {"tags": [[k, v] for k, v in m.tags], "copy": m.copy, "reelid_attr": m.reelid_attr,
+            "reelid_pattern": m.reelid_pattern}
+
+
+def metadata_from_preset(m, preset, name, sources=True):
+    """Load a metadata preset into the Metadata tab's state (None: no tags, nothing copied).
+    sources: its timecode / reel sources go to the Input tab's fields when it has them."""
+    m.preset = name
+    m.tags = list(preset.tags.items()) if preset else []
+    m.copy = (preset.copy or "") if preset else ""
+    m.reelid_attr = (preset.reelid_attr or "") if preset else ""
+    m.reelid_pattern = (preset.reelid_pattern or "") if preset else ""
+    if preset is not None and sources:
+        if preset.timecode_source:
+            m.timecode_source = _source(preset.timecode_source)
+        if preset.reelid_source:
+            m.reelid_source = _source(preset.reelid_source)
+        if preset.reelid:
+            m.reelid = preset.reelid
+    m.loaded = metadata_snapshot(m)
+
+
+def metadata_changed(m):
+    return m.loaded is not None and metadata_snapshot(m) != m.loaded
+
+
+def copy_note(report, spec):
+    """What -metadata_copy SPEC copies from the last preview's header: "copies 154
+    attributes", or why it copies nothing; "" with no spec or no header (movies)."""
+    from vfx_transcode import metadata as md
+    header = ((report or {}).get("input") or {}).get("header") or {}
+    if not (spec or "").strip() or not header:
+        return ""
+    available = md.header_metadata(header)
+    copied = md.select(available, spec)
+    hint = md.copy_hint(available, spec)
+    text = "copies {} attribute{} from the input header".format(len(copied), "" if len(copied) == 1 else "s")
+    return text + (". " + hint[0].upper() + hint[1:] + "." if hint else "")
+
+
+def metadata_json(m):
+    """The Metadata tab (and the Input tab's timecode / reel sources) as a metadata preset."""
+    data = OrderedDict([("tags", OrderedDict((k.strip(), v) for k, v in m.tags if k.strip() and v != ""))])
+    for key, value in (("copy", m.copy), ("timecode_source", _source(m.timecode_source)),
+                       ("reelid_source", _source(m.reelid_source)), ("reelid", m.reelid),
+                       ("reelid_attr", m.reelid_attr), ("reelid_pattern", m.reelid_pattern)):
+        if value.strip():
+            data[key] = value.strip()
+    return data
 
 
 TIMECODE_SOURCES = ("counter", "arg", "metadata")
@@ -628,16 +975,33 @@ def timecode_args(state):
         out += ["-reelid_source", reel_source]
     if state.reelid.strip():
         out += ["-reelid", state.reelid.strip()]
+    if state.reelid_attr.strip():
+        out += ["-reelid_attr", state.reelid_attr.strip()]
+    if state.reelid_pattern.strip():
+        out += ["-reelid_pattern", state.reelid_pattern.strip()]
     return out
 
 
 def metadata_args(state):
+    """The preset by name while the tab is as it loaded it; once edited, no preset
+    (-metadata_preset none) and the tab written out: the tags, -metadata_copy, the reel
+    attribute and pattern. Older states (nothing loaded): the preset and the tags over it."""
     out = []
+    if metadata_changed(state):
+        out += ["-metadata_preset", "none"]
+        for key, value in state.tags:
+            if key.strip() and value != "":
+                out += ["-metadata", "{}={}".format(key.strip(), value)]
+        out += ["-metadata_copy", state.copy.strip()]
+        return out + timecode_args(state)
     if state.preset:
         out += ["-metadata_preset", state.preset]
-    for key, value in state.tags:
-        if key.strip():
-            out += ["-metadata", "{}={}".format(key.strip(), value)]
+    if state.loaded is None:
+        for key, value in state.tags:
+            if key.strip():
+                out += ["-metadata", "{}={}".format(key.strip(), value)]
+        if state.copy.strip():
+            out += ["-metadata_copy", state.copy.strip()]
     return out + timecode_args(state)
 
 
@@ -662,7 +1026,10 @@ def _par_text(par):
 def overlay_lines(report, input_size=None):
     """[(label, text)] for the picture overlay, from the last preview:
     input  3840x2160 pa 1.3 @ 24fps / output 1920x1080 pa 1.0. The pixel aspect only when
-    the input's or the output's is not 1."""
+    the input's or the output's is not 1; the output's frame rate only when -output_fps plays
+    it at another rate than the input's: output 1920x1080 @ 25fps (4.2% faster). The
+    timecode the output gets for this frame, when it writes one: timecode 01:00:00:12
+    (starts 01:00:00:00)."""
     if not report:
         return []
     words, out = report.get("keywords") or {}, report.get("output") or {}
@@ -676,15 +1043,36 @@ def overlay_lines(report, input_size=None):
         text = "{}x{}".format(*size)
         if show_par:
             text += " pa " + _par_text(in_par)
-        if out.get("fps"):
-            text += " @ {}fps".format(out["fps"])
+        source_fps = out.get("source_fps") or out.get("fps")
+        if source_fps:
+            text += " @ {}fps".format(source_fps)
         lines.append(("input", text))
     if out.get("width") and out.get("height"):
         text = "{}x{}".format(out["width"], out["height"])
         if show_par:
             text += " pa " + _par_text(out_par)
+        text += retime_text(out.get("source_fps"), out.get("fps"))
         lines.append(("output", text))
+    if out.get("timecode_written") and out.get("frame_timecode"):
+        text = out["frame_timecode"]
+        if out.get("timecode") and out["timecode"] != out["frame_timecode"]:
+            text += " (starts {})".format(out["timecode"])
+        lines.append(("timecode", text))
     return lines
+
+
+def retime_text(source_fps, output_fps):
+    """" @ 25fps (4.2% faster)" when the output plays at another rate; "" when it is the same."""
+    if not source_fps or not output_fps or str(source_fps) == str(output_fps):
+        return ""
+    try:
+        source, out = parse_fps(str(source_fps)), parse_fps(str(output_fps))
+    except (ValueError, ZeroDivisionError):
+        return " @ {}fps".format(output_fps)
+    if source == out:
+        return ""
+    change = abs(float(out) / float(source) - 1) * 100
+    return " @ {}fps ({:.1f}% {})".format(output_fps, change, "faster" if out > source else "slower")
 
 
 def found_text(report, state):
@@ -762,9 +1150,103 @@ class TunerState:
     letterbox: LetterboxState = field(default_factory=LetterboxState)          # ffmpeg
     metadata: MetadataState = field(default_factory=MetadataState)
     filmstrip: FilmstripState = field(default_factory=FilmstripState)
+    thumb: ThumbState = field(default_factory=ThumbState)
+    intermediate: IntermediateState = field(default_factory=IntermediateState)
+    channels: ChannelsState = field(default_factory=ChannelsState)
+    dest: "DestinationState" = field(default_factory=lambda: DestinationState())
     ff_transform: FFTransformState = field(default_factory=FFTransformState)
     oiio_letterbox: LetterboxState = field(default_factory=LetterboxState)     # oiiotool
     tokens: "TokensState" = field(default_factory=lambda: TokensState())
+    encode_edit: "EncodeEditState" = field(default_factory=lambda: EncodeEditState())
+    sequence_edit: "SequenceEditState" = field(default_factory=lambda: SequenceEditState())
+
+
+# --- Encode tab: writing encode presets (ffmpeg) and sequence presets (oiiotool) ---
+
+ENCODE_EXTS = ("mov", "mp4", "mxf", "mkv", "avi", "webm")
+ALPHA_PIX_FMTS = ("", "yuva444p10le", "yuva444p12le", "yuva420p", "rgba", "gbrap10le", "gbrap12le")
+SEQUENCE_EXTS = ("exr", "png", "jpg", "tif", "dpx", "bmp")
+
+
+@dataclass
+class EncodeEditState:
+    """An encode preset being written on the Encode tab ("encode_presets" in the presets file)."""
+    preset: str = ""                  # the preset loaded / saved, "" = new
+    ext: str = "mov"
+    encode: str = "-pix_fmt yuv420p {videofilter} -c:v libx264 -crf 18"
+    ten_bit: bool = False
+    colour_tags: bool = True
+    alpha_pix_fmt: str = ""
+    metadata: List[Tuple[str, str]] = field(default_factory=list)   # codec-level tags
+    notes: str = ""                   # the loaded preset's notes (shown on the tab)
+
+
+@dataclass
+class SequenceEditState:
+    """A sequence preset being written on the Encode tab ("sequence_presets")."""
+    preset: str = ""
+    ext: str = "exr"
+    args: str = "-d half --compression zip"
+
+
+def encode_edit_from_preset(preset):
+    return EncodeEditState(preset=preset.name, ext=preset.ext,
+                           encode=" ".join(quote([a]) for a in preset.encode),
+                           ten_bit=preset.ten_bit, colour_tags=preset.colour_tags,
+                           alpha_pix_fmt=preset.alpha_pix_fmt,
+                           metadata=list(preset.metadata.items()), notes=preset.notes)
+
+
+def deep_pix_fmt(encode):
+    """True / False when the arguments' -pix_fmt has more / not more than 8 bits per channel,
+    None without -pix_fmt."""
+    match = re.search(r"-pix_fmt\s+(\S+)", encode or "")
+    if not match:
+        return None
+    return bool(re.search(r"(9|10|12|14|16)(le|be)?$", match.group(1)))
+
+
+def sequence_edit_from_preset(preset):
+    return SequenceEditState(preset=preset.name, ext=preset.ext,
+                             args=" ".join(quote([a]) for a in preset.args))
+
+
+def encode_json(e):
+    deep = deep_pix_fmt(e.encode)        # ten_bit follows the pixel format when there is one
+    data = OrderedDict([("ext", e.ext.strip().lstrip(".")), ("encode", e.encode.strip()),
+                        ("ten_bit", bool(e.ten_bit) if deep is None else deep),
+                        ("colour_tags", bool(e.colour_tags))])
+    if e.alpha_pix_fmt.strip():
+        data["alpha_pix_fmt"] = e.alpha_pix_fmt.strip()
+    tags = OrderedDict((k.strip(), v) for k, v in e.metadata if k.strip())
+    if tags:
+        data["metadata"] = tags
+    return data
+
+
+def sequence_json(q):
+    return OrderedDict([("ext", q.ext.strip().lstrip(".")), ("args", q.args.strip())])
+
+
+def encode_problem(e):
+    """Why the presets file would refuse this encode preset, or ""."""
+    from vfx_transcode.presets import _preset_from_json
+    if not e.ext.strip():
+        return "Choose the container (ext)."
+    try:
+        _preset_from_json("check", encode_json(e), "Encode tab")
+    except TranscodeError as exc:
+        return str(exc).replace('Encode tab: preset "check": ', "")
+    return ""
+
+
+def sequence_problem(q):
+    from vfx_transcode.outseq import sequence_presets_from_json
+    try:
+        sequence_presets_from_json({"check": sequence_json(q)}, {}, "Encode tab")
+    except TranscodeError as exc:
+        return str(exc).replace('Encode tab: sequence preset "check": ', "")
+    return ""
 
 
 # --- smart tokens (Tokens tab) ---
@@ -782,6 +1264,8 @@ class TokensState:
     preset: str = ""
     rows: List[dict] = field(default_factory=list)
     loaded: List[dict] = field(default_factory=list)
+    version_regex: str = ""           # -version_regex; "" = vfx-transcode's default _v(\d\d\d)
+    name_tokens: List[Tuple[str, str]] = field(default_factory=list)   # -name_token NAME=REGEX
 
 
 def token_row(token):
@@ -831,14 +1315,33 @@ def parse_conditions(text):
     return out
 
 
+DEFAULT_VERSION_REGEX = r"_v(\d\d\d)"
+
+
+def name_token_args(t):
+    """-version_regex (when not the default) and one -name_token NAME=REGEX per row (an empty
+    regex removes the presets file's token of that name)."""
+    out = []
+    regex = t.version_regex.strip()
+    if regex and regex != DEFAULT_VERSION_REGEX:
+        out += ["-version_regex", regex]
+    for name, regex in t.name_tokens:
+        if name.strip():
+            out += ["-name_token", "{}={}".format(name.strip(), regex)]
+    return out
+
+
 def tokens_args(t):
     """-smart_tokens NAME while the definitions are the loaded preset's; else the edited
-    definitions as -smart_tokens_def JSON ("none" when there are none)."""
+    definitions as -smart_tokens_def JSON ("none" when there are none). Then the name
+    tokens (-version_regex, -name_token)."""
     if [dict(r) for r in t.rows] == [dict(r) for r in t.loaded]:
-        return ["-smart_tokens", t.preset] if t.preset else []
-    if not t.rows:
-        return ["-smart_tokens", "none"]
-    return ["-smart_tokens_def", json.dumps(t.rows, separators=(",", ":"), ensure_ascii=False)]
+        out = ["-smart_tokens", t.preset] if t.preset else []
+    elif not t.rows:
+        out = ["-smart_tokens", "none"]
+    else:
+        out = ["-smart_tokens_def", json.dumps(t.rows, separators=(",", ":"), ensure_ascii=False)]
+    return out + name_token_args(t)
 
 
 def tokens_json(t, notes=""):
@@ -870,18 +1373,45 @@ class Pipeline:
         return " + ".join(tools) or "nothing"
 
 
-def input_kind(path):
-    """"exr", "movie", "image" (PNG, JPG ... sequences and stills), "" (none)."""
+INPUT_TYPES = OrderedDict([("movie", "Movie (mov, mp4, mxf ...)"), ("exr", "EXR sequence"),
+                           ("png", "PNG sequence"), ("jpg", "JPG sequence"),
+                           ("tif", "TIF sequence"), ("dpx", "DPX sequence")])
+_TYPE_ALIASES = {"jpeg": "jpg", "tiff": "tif"}
+
+
+def detect_input_type(path):
+    """The Input type an input file has: movie, exr, png, jpg, tif, dpx; "" for none or an
+    image format not in the list."""
     path = (path or "").strip()
     if not path:
         return ""
     if mv.is_movie(path):
         return "movie"
+    ext = Path(path).suffix.lower().lstrip(".")
+    ext = _TYPE_ALIASES.get(ext, ext)
+    return ext if ext in INPUT_TYPES else ""
+
+
+def effective_input_type(i):
+    """InputState -> its input type: detected from the input file, else the one chosen."""
+    return detect_input_type(i.input1) if i.input1.strip() else (i.input_type or "exr")
+
+
+def input_kind(path, input_type=""):
+    """"exr", "movie", "image" (PNG, JPG ... sequences and stills), "" (none). Without a path,
+    from the chosen input type."""
+    path = (path or "").strip()
+    if not path:
+        if not input_type:
+            return ""
+        return input_type if input_type in ("exr", "movie") else "image"
+    if mv.is_movie(path):
+        return "movie"
     return "exr" if Path(path).suffix.lower() == ".exr" else "image"
 
 
-def pipeline(input_path, output_type):
-    kind = input_kind(input_path)
+def pipeline(input_path, output_type, input_type=""):
+    kind = input_kind(input_path, input_type)
     if output_type == "movie":
         return Pipeline(oiio=kind in ("exr", ""), ffmpeg=True, movie=True)
     if kind == "movie" and output_type != "exr":
@@ -912,10 +1442,10 @@ def colour_use(state):
     Convert colour (vfx-transcode converts those only when -ci / -co is given); no OCIO where
     oiiotool does not run."""
     s = state.input
-    p = pipeline(s.input1, s.output_type)
+    p = pipeline(s.input1, s.output_type, s.input_type)
     if not p.oiio:
         return False, False
-    if input_kind(s.input1) in ("exr", "") and s.output_type != "exr":
+    if input_kind(s.input1, s.input_type) in ("exr", "") and s.output_type != "exr":
         return True, True
     return bool(s.convert_colour), False
 
@@ -926,11 +1456,13 @@ def pipeline_args(state, presets=None, active_sub=None, cli=False):
     runs, slate and metadata for a movie. The tuner sends -width 0: all scaling comes from the
     two transform tabs."""
     s = state
-    p = pipeline(s.input.input1, s.input.output_type)
+    p = pipeline(s.input.input1, s.input.output_type, s.input.input_type)
     out = ["-width", "0"] + tokens_args(s.tokens)
     if colour_use(s)[0]:
         out += s.input.colour_args()
     if p.oiio:
+        if input_kind(s.input.input1, s.input.input_type) in ("exr", ""):
+            out += s.channels.args()             # which EXR channels (preview too)
         out += (s.transform.cli_args(active_sub) if cli else s.transform.preview_args())
         out += oiio_letterbox_args(s.oiio_letterbox)
     if p.ffmpeg:
@@ -946,6 +1478,8 @@ def pipeline_args(state, presets=None, active_sub=None, cli=False):
         out += timecode_args(s.metadata)          # for the burn-ins' {timecode}
     if s.input.alpha != "drop":
         out += ["-alpha", s.input.alpha]
+        if s.input.alpha_premult:
+            out += ["-alpha_premult", "1"]
     if p.movie or p.oiio:
         out += movie_write_args(s.input, defaults=False)
     return out
@@ -957,7 +1491,7 @@ SEQ_REEL_TYPES = ("exr",)                 # ... and a reel name
 
 def write_support(state):
     """(timecode can be written, reel name can be written, note) for this input and output."""
-    p = pipeline(state.input.input1, state.input.output_type)
+    p = pipeline(state.input.input1, state.input.output_type, state.input.input_type)
     t = state.input.output_type
     if p.movie:
         return True, True, ""
@@ -983,27 +1517,48 @@ def movie_write_args(i, defaults=True):
 
 
 ALPHA_MODES = OrderedDict([("drop", "No alpha (-alpha drop)"),
-                           ("auto", "Keep alpha if the input has one (-alpha auto)")])
+                           ("auto", "Keep alpha if the input has one (-alpha auto)"),
+                           ("keep", "Keep alpha; stop if the output cannot store it (-alpha keep)")])
+MISSING_FRAMES = OrderedDict([("hold", "Hold the previous frame (-missing_frames hold)"),
+                              ("error", "Stop with an error (-missing_frames error)")])
+PAR_OUT_CHOICES = ("same", "square", "1", "2", "1.33", "1.5", "1.8", "0.9")
 ALPHA_SEQUENCE_TYPES = ("exr", "png", "tif")
 
 
+ALPHA_VIEWS = OrderedDict([("rgb", "RGB"), ("alpha", "Alpha"), ("checker", "Checkerboard")])
+
+
+def alpha_hint(state, report):
+    """A note next to the alpha view controls when the picture's alpha is for the view only:
+    the preview keeps the input's alpha (-preview_alpha), the output does not."""
+    out = (report or {}).get("output") or {}
+    if not out.get("alpha") or out.get("alpha_output", True):
+        return ""
+    if state.input.alpha == "drop":
+        return "view only: the output drops alpha (Output tab, Alpha: auto keeps it)"
+    return "view only: this output cannot store alpha (see the Output tab)"
+
+
 def alpha_note(state, presets=None):
-    """What -alpha auto does with this output: kept when the input has alpha, or why not."""
+    """What -alpha auto / keep does with this output: kept when the input has alpha, or why
+    not (auto: no alpha, keep: vfx-transcode stops with an error)."""
     i = state.input
     if i.alpha == "drop":
         return ""
+    fails = ("vfx-transcode will stop with an error (-alpha keep)." if i.alpha == "keep"
+             else "the output gets none.")
     if i.output_type != "movie":
         if i.output_type in ALPHA_SEQUENCE_TYPES:
             return "Kept when the input has alpha ({} can store it).".format(i.output_type.upper())
-        return "{} cannot store alpha: the output gets none.".format(i.output_type.upper())
+        return "{} cannot store alpha: {}".format(i.output_type.upper(), fails)
     if presets is None:
         return ""
     name = i.encode_preset or presets.default
     preset = presets.presets.get(name)
     if preset is not None and preset.alpha_pix_fmt:
         return "Kept when the input has alpha (encode preset {}: {}).".format(name, preset.alpha_pix_fmt)
-    return ("The encode preset {} cannot store alpha: the movie gets none. Presets that can "
-            "are marked [alpha] (e.g. prores4444).".format(name))
+    return ("The encode preset {} cannot store alpha: {} Presets that can are marked [alpha] "
+            "(e.g. prores4444).".format(name, fails))
 
 
 def builtin_sequence_args(output_type):
@@ -1030,7 +1585,9 @@ def preview_command(state, preview_path, tool=None):
     s = state
     return ((tool or vfx_transcode_command()) + s.input.args()
             + (["-thumbnail_frame", s.input.frame] if s.input.frame else [])
-            + pipeline_args(s) + _type_arg(s) + ["-preview", str(preview_path)])
+            + pipeline_args(s) + _type_arg(s)
+            + ["-preview_alpha", "1"]          # the input's alpha in the picture, for the view
+            + ["-preview", str(preview_path)])
 
 
 STILL_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
@@ -1079,20 +1636,162 @@ def filmstrip_command(state, filmstrip_path, movie_path, tool=None):
     return cmd
 
 
-def full_args(state, presets, active_sub=None, output="./"):
-    """vfx-transcode options for the whole conversion with these settings (no program)."""
+def full_args(state, presets, active_sub=None, output=None):
+    """vfx-transcode options for the whole conversion with these settings (no program). The
+    output, thumbnail and filmstrip paths come from the Destination (output: another -o)."""
     s = state
-    film = ["-of"] + filmstrip_args(s.filmstrip, presets) if s.filmstrip.enabled else []
-    return (s.input.args() + pipeline_args(s, presets, active_sub, cli=True)
-            + ["-o", output_arg(output, s.input.output_type)] + film)
+    d = s.dest
+    output = d.output() if output is None else output
+    film = ["-of", d.filmstrip()] + filmstrip_args(s.filmstrip, presets) if s.filmstrip.enabled else []
+    thumb = thumb_args(s.thumb)
+    if thumb:
+        thumb = ["-ot", d.thumbnail()] + thumb[1:]
+    return (s.input.args() + d.custom_args() + s.intermediate.args()
+            + pipeline_args(s, presets, active_sub, cli=True)
+            + ["-o", output_arg(output, s.input.output_type)] + film + thumb)
 
 
-def process_command(state, presets, output, active_sub=None, tool=None):
+def process_command(state, presets, output=None, active_sub=None, tool=None):
     """What the Process button runs: the whole conversion."""
     return (tool or vfx_transcode_command()) + full_args(state, presets, active_sub, output)
 
 
-def output_sections(state, presets, active_sub=None, output="./"):
+# --- tab marks: "Name *" = edited since its preset was loaded or saved, italics = not used ---
+
+def _colour_edited(i, presets):
+    preset = presets.colours.get(i.colour_preset) if presets and i.colour_preset else None
+    if preset is None:
+        return False
+    for key, attr in COLOUR_STATE_FIELDS.items():
+        value = getattr(preset, key)
+        if key == "ocio" and not value:
+            continue
+        if (value or "") != (getattr(i, attr) or ""):
+            return True
+    return False
+
+
+def _encode_edited(state, presets):
+    e, q = state.encode_edit, state.sequence_edit
+    if presets is None:
+        return False
+    if e.preset in presets.presets:
+        if encode_json(e) != encode_json(encode_edit_from_preset(presets.presets[e.preset])):
+            return True
+    elif encode_json(e) != encode_json(EncodeEditState()):
+        return True
+    if q.preset in presets.sequences:
+        return sequence_json(q) != sequence_json(sequence_edit_from_preset(presets.sequences[q.preset]))
+    return sequence_json(q) != sequence_json(SequenceEditState())
+
+
+def _dest_edited(d, presets):
+    if presets is None:
+        return False
+    path = presets.dest_paths.get(d.path_preset) if d.path_preset else None
+    name = presets.dest_names.get(d.name_preset) if d.name_preset else None
+    return bool((path is not None and path.template != d.path)
+                or (name is not None and name.template != d.name))
+
+
+def tab_marks(state, presets):
+    """{tab title: (edited, unused)}. edited: the tab differs from the preset it loaded or
+    saved last (only tabs with presets); unused: the tab is switched off or has nothing."""
+    s = state
+    marks = {}
+
+    def edited_from(table, name, make, current):
+        if presets is None or not name or name not in table:
+            return False
+        return make(table[name]) != current
+
+    t = s.tokens
+    marks["Color"] = (_colour_edited(s.input, presets), not colour_use(s)[0])
+    marks["Tokens"] = ([dict(r) for r in t.rows] != [dict(r) for r in t.loaded],
+                       not t.rows and not any(n.strip() for n, _r in t.name_tokens)
+                       and t.version_regex.strip() in ("", DEFAULT_VERSION_REGEX))
+    c = s.channels
+    marks["Multichannel"] = (bool(c.order_preset) and list(c.order) != list(c.order_loaded), False)
+    marks["Encode"] = (_encode_edited(s, presets), False)
+    marks["Destination"] = (_dest_edited(s.dest, presets), False)
+    m = s.metadata
+    marks["Metadata"] = (metadata_changed(m), m.preset == "none" and not m.tags and not m.copy.strip())
+    tr = s.transform
+    marks["Transform Sequence"] = (bool(tr.preset) and list(tr.args) != list(tr.loaded_args),
+                                   not tr.use and not s.oiio_letterbox.enabled)
+    marks["Transform"] = (
+        edited_from(presets.ff_transforms if presets else {}, s.ff_transform.preset,
+                    lambda p: ff_transform_from_preset(p).filters(), s.ff_transform.filters()),
+        not s.ff_transform.filters() and not s.letterbox.enabled)
+    b = s.burn
+    marks["Burn-in"] = (
+        edited_from(presets.burnins if presets else {}, b.preset,
+                    lambda p: replace(burn_from_preset(p), enabled=b.enabled), b),
+        not b.enabled or not b.any_text())
+    sl = s.slate
+    marks["Slate"] = (
+        edited_from(presets.slates if presets else {}, sl.preset,
+                    lambda p: replace(slate_from_spec(p, sl.preset), enabled=sl.enabled,
+                                      burnin=sl.burnin), sl),
+        not sl.enabled)
+    f = s.filmstrip
+    marks["Filmstrip"] = (
+        edited_from(presets.filmstrips if presets else {}, f.preset,
+                    lambda p: filmstrip_from_preset(p, f.preset, f.enabled), f),
+        not f.enabled)
+    marks["Thumbnail"] = (s.thumb.custom, not s.thumb.enabled)
+    return marks
+
+
+# --- the full command by tab (Presets tab colours) ---
+
+# option -> the tab it comes from; checked in order, an entry ending in * is a prefix
+OPTION_TABS = (
+    ("Input", ("-i", "-in", "-out", "-r", "-par", "-movie_first_frame", "-presets_file",
+               "-missing_frames", "-timecode_source", "-timecode", "-reelid_source", "-reelid")),
+    ("Color", ("-ci", "-co", "-display", "-view", "-looks", "-clf", "-ocio")),
+    ("Tokens", ("-smart_tokens", "-smart_tokens_def", "-version_regex", "-name_token")),
+    ("Intermediate", ("-mezzanine*", "-temp*", "-oiio_threads", "-oiio_per_file")),
+    ("Multichannel", ("-oiio_channel*", "-oiio_subimage", "-channel_preferences",
+                      "-channel_order", "-deep_zrange")),
+    ("Output", ("-preset", "-seq_preset", "-alpha*", "-par_out", "-output_fps",
+                "-output_timecode", "-output_reelid")),
+    ("Destination", ("-o", "-custom_destination*", "-base_folder")),
+    ("Metadata", ("-metadata*", "-reelid_attr", "-reelid_pattern")),
+    ("Transform Sequence", ("-oiio_transform*", "-oiio_letterbox*")),
+    ("Transform", ("-width", "-ff_transform*", "-letterbox*")),
+    ("Burn-in", ("-burn*",)),
+    ("Slate", ("-slate*",)),
+    ("Filmstrip", ("-of", "-filmstrip*")),
+    ("Thumbnail", ("-ot", "-thumbnail*")),
+)
+_OPTION_RE = re.compile(r"^-[A-Za-z][A-Za-z0-9_]*$")
+
+
+def option_tab(option):
+    """The tab an option belongs to, "" when none does."""
+    for tab, names in OPTION_TABS:
+        for name in names:
+            if option == name or (name.endswith("*") and option.startswith(name[:-1])):
+                return tab
+    return ""
+
+
+def command_parts(args):
+    """[(tab, [args])]: the command cut into runs of the same tab. An option starts a run;
+    its values (the words up to the next option) go with it."""
+    parts, tab = [], ""
+    for arg in args:
+        if _OPTION_RE.match(str(arg)):
+            tab = option_tab(arg)
+        if parts and parts[-1][0] == tab:
+            parts[-1][1].append(arg)
+        else:
+            parts.append((tab, [arg]))
+    return parts
+
+
+def output_sections(state, presets, active_sub=None, output=None):
     """{section: (command-line text, presets.json text or "")} for the copy boxes, plus the
     full command."""
     s = state
@@ -1109,6 +1808,7 @@ def output_sections(state, presets, active_sub=None, output="./"):
     sections["metadata"] = (quote(metadata_args(s.metadata)), "")
     film = ["-of"] + filmstrip_args(s.filmstrip, presets)
     sections["filmstrip"] = (quote(film), json.dumps(filmstrip_json(s.filmstrip), indent=2))
+    sections["thumbnail"] = (quote(thumb_args(s.thumb)), "")
     full = ["vfx-transcode"] + full_args(s, presets, active_sub, output)
     return quote(full), sections
 
@@ -1152,6 +1852,11 @@ def filter_rows(rows, text):
         return list(rows)
     return [r for r in rows if needle in r[0].lower() or needle in r[1].lower()
             or needle in r[2].lower()]
+
+
+def non_empty_rows(rows):
+    """Rows whose value is not empty (blank text counts as empty)."""
+    return [r for r in rows if str(r[2]).strip()]
 
 
 def _text(value):
@@ -1384,17 +2089,31 @@ def _plain(obj):
     return json.loads(json.dumps(asdict(obj)))
 
 
+INPUT_AREA_FIELDS = ("fps", "par", "movie_first_frame")
+COLOUR_AREA_FIELDS = ("colorin", "colorout", "display", "view", "looks", "clf", "ocio",
+                      "convert_colour", "colour_preset")
+
+
 def area_state(state, area):
     """The tuner's values of one area, as plain JSON data."""
+    if area == "input":
+        return {f: getattr(state.input, f) for f in INPUT_AREA_FIELDS}
+    if area == "colour":
+        return {f: getattr(state.input, f) for f in COLOUR_AREA_FIELDS}
+    if area == "tokens":
+        return _plain(state.tokens)
     if area == "encode":
-        return {"encode_preset": state.input.encode_preset, "seq_preset": state.input.seq_preset,
+        return {"output_type": state.input.output_type, "output_fps": state.input.output_fps,
+                "encode_preset": state.input.encode_preset, "seq_preset": state.input.seq_preset,
                 "alpha": state.input.alpha, "write_timecode": state.input.write_timecode,
-                "write_reelid": state.input.write_reelid}
+                "write_reelid": state.input.write_reelid, "alpha_premult": state.input.alpha_premult,
+                "par_out": state.input.par_out, "missing_frames": state.input.missing_frames}
     if area == "transform_sequence":
         return {"steps": _plain(state.transform), "letterbox": _plain(state.oiio_letterbox)}
     if area == "transform":
         return {"ffmpeg": _plain(state.ff_transform), "letterbox": _plain(state.letterbox)}
     obj = {"burnin": state.burn, "slate": state.slate, "filmstrip": state.filmstrip,
+           "thumbnail": state.thumb, "intermediate": state.intermediate, "channels": state.channels,
            "metadata": state.metadata}[area]
     return _plain(obj)
 
@@ -1404,10 +2123,28 @@ def area_args(state, area):
     on which presets file is loaded) except a transform preset left as loaded: its name, so
     vfx-transcode picks the sub-preset for each input by its conditions."""
     s = state
+    if area == "input":
+        i = s.input
+        return ((["-r", i.fps.strip()] if i.fps.strip() else [])
+                + (["-par", i.par.strip()] if i.par.strip() else [])
+                + ["-movie_first_frame", str(i.movie_first_frame)])
+    if area == "colour":
+        return s.input.colour_args() if colour_use(s)[0] else []
+    if area == "tokens":
+        t = s.tokens
+        out = (["-smart_tokens_def", json.dumps(t.rows, separators=(",", ":"), ensure_ascii=False)]
+               if t.rows else ["-smart_tokens", "none"])
+        return out + ["-version_regex", t.version_regex.strip() or DEFAULT_VERSION_REGEX] + [
+            a for name, regex in t.name_tokens if name.strip()
+            for a in ("-name_token", "{}={}".format(name.strip(), regex))]
     if area == "encode":
         return ((["-preset", s.input.encode_preset] if s.input.encode_preset else [])
                 + (["-seq_preset", s.input.seq_preset] if s.input.seq_preset else [])
-                + ["-alpha", s.input.alpha] + movie_write_args(s.input))
+                + ["-alpha", s.input.alpha] + movie_write_args(s.input)
+                + ["-alpha_premult", "1" if s.input.alpha_premult and s.input.alpha != "drop" else "0"]
+                + ["-par_out", (s.input.par_out or "same").strip() or "same"]
+                + ["-missing_frames", s.input.missing_frames or "hold"]
+                + ["-output_fps", s.input.output_fps or "same"])
     if area == "transform_sequence":
         t = s.transform
         if t.use and t.preset and list(t.args) == list(t.loaded_args):
@@ -1423,14 +2160,152 @@ def area_args(state, area):
         return slate_args(s.slate)
     if area == "filmstrip":
         return ["-of"] + filmstrip_args(s.filmstrip) if s.filmstrip.enabled else []
+    if area == "thumbnail":
+        return thumb_args(s.thumb)
+    if area == "intermediate":
+        return s.intermediate.args(full=True)
+    if area == "channels":
+        return s.channels.full_args()
     if area == "metadata":
         return metadata_args(s.metadata)
     raise KeyError(area)
 
 
-def super_preset_entry(state, areas, notes=""):
-    """A super-preset of these areas of the state."""
-    out = OrderedDict([("notes", notes), ("areas", OrderedDict())])
+def input_type_kind(input_type):
+    """movie / exr / png ... -> the process app's input kind: movie, exr or image."""
+    return input_type if input_type in ("movie", "exr") else "image"
+
+
+# --- destination: where the output goes (-o), saved with a super-preset -------------------
+
+DESTINATION = "destination"           # not an area: no vfx-transcode options, only the -o
+ONE_FOLDER = "One folder for all..."  # menu entries that are no preset: pick a folder / type
+CUSTOM = "Custom"
+SAME_AS_OUTPUT = "(as the output)"    # thumbnail / filmstrip: the output's path or name
+
+
+def path_menu(presets):
+    """{menu text: path template} for the Path menu: the presets file's destination paths, then
+    "One folder for all..." ("" - asks for the folder) and "Custom" (None - typed)."""
+    from vfx_transcode import destinations
+    table = presets.dest_paths if presets is not None else destinations.builtin("path")
+    menu = OrderedDict((name, p.template) for name, p in table.items())
+    menu[ONE_FOLDER] = ""
+    menu[CUSTOM] = None
+    return menu
+
+
+def name_menu(presets):
+    """{menu text: name template} for the Name menu, then "Custom" (None - typed)."""
+    from vfx_transcode import destinations
+    table = presets.dest_names if presets is not None else destinations.builtin("name")
+    menu = OrderedDict((name, p.template) for name, p in table.items())
+    menu[CUSTOM] = None
+    return menu
+
+
+@dataclass
+class DestinationState:
+    """Destination tab: where the output goes, and the thumbnail and filmstrip ("" = as the
+    output). Paths and names are keyword templates; -o / -ot / -of are made of them."""
+    path: str = "./"
+    name: str = ""
+    path_preset: str = ""             # the preset last picked (display only)
+    name_preset: str = ""
+    thumb_path: str = ""
+    thumb_name: str = ""
+    film_path: str = ""
+    film_name: str = ""
+    custom_path: str = ""             # test values for {custom_destination_path} / _name
+    custom_name: str = ""
+
+    def output(self):
+        return destination_template(self.path, self.name)
+
+    def thumbnail(self):
+        return destination_template(self.thumb_path or self.path, self.thumb_name or self.name)
+
+    def filmstrip(self):
+        """The output's name + _filmstrip unless set, so it never takes the thumbnail's name."""
+        name = self.film_name or (self.name.strip() + "_filmstrip" if self.name.strip() else "")
+        return destination_template(self.film_path or self.path, name)
+
+    def custom_args(self):
+        uses_path, uses_name = uses_custom(self.output(), self.thumbnail(), self.filmstrip())
+        return custom_args(self.custom_path if uses_path else "", self.custom_name if uses_name else "")
+
+    def to_json(self):
+        """The super-preset's "destination"."""
+        out = OrderedDict([("path", self.path or "./"), ("name", self.name or "")])
+        for key, path, name in (("thumbnail", self.thumb_path, self.thumb_name),
+                                ("filmstrip", self.film_path, self.film_name)):
+            if path or name:
+                out[key] = OrderedDict([("path", path), ("name", name)])
+        return out
+
+
+def destination_of(entry):
+    """DestinationState from a super-preset's "destination", or None."""
+    dest = (entry or {}).get(DESTINATION)
+    if not isinstance(dest, dict):
+        return None
+    text = lambda d, k: str((d or {}).get(k, "") or "")
+    thumb, film = dest.get("thumbnail") or {}, dest.get("filmstrip") or {}
+    return DestinationState(path=text(dest, "path") or "./", name=text(dest, "name"),
+                            thumb_path=text(thumb, "path"), thumb_name=text(thumb, "name"),
+                            film_path=text(film, "path"), film_name=text(film, "name"))
+
+
+def preset_index(menu, value, folder_menu=False):
+    """The menu entry showing this value, else Custom (the last). In the Path menu "" is "One
+    folder for all...", which needs a folder: it never matches."""
+    for index, (label, template) in enumerate(menu.items()):
+        if template is not None and template == value and not (folder_menu and label == ONE_FOLDER):
+            return index
+    return len(menu) - 1
+
+
+CUSTOM_PATH = "{custom_destination_path}"
+CUSTOM_NAME = "{custom_destination_name}"
+
+
+def uses_custom(*texts):
+    """(uses {custom_destination_path}, uses {custom_destination_name}) in these texts."""
+    joined = " ".join(t or "" for t in texts)
+    return CUSTOM_PATH in joined, CUSTOM_NAME in joined
+
+
+def custom_args(path, name):
+    """-custom_destination_path / _name for the values given ("" leaves one out)."""
+    out = []
+    for option, value in (("-custom_destination_path", path), ("-custom_destination_name", name)):
+        if (value or "").strip():
+            out += [option, value.strip()]
+    return out
+
+
+def destination_template(path, name):
+    """-o from the Destination's Path and Name: an empty path is the source's folder."""
+    path = (path or "").strip()
+    if path and not path.endswith(("/", "\\")):
+        path += "/"
+    return (path or "./") + (name or "").strip()
+
+
+def super_preset_entry(state, areas, notes="", previous=None, destination=None):
+    """A super-preset of these areas of the state. It records the input type it was made for:
+    "input_type" (for the tuner) and "inputs" (the kind, for the process app, which offers it
+    only for those inputs). inputs widened by hand in the file are kept while they include
+    this kind. destination: a DestinationState to save with it, or None."""
+    input_type = effective_input_type(state.input)
+    kind = input_type_kind(input_type)
+    inputs = list((previous or {}).get("inputs") or [])
+    if kind not in inputs:
+        inputs = [kind]
+    out = OrderedDict([("notes", notes), ("input_type", input_type), ("inputs", inputs)])
+    if destination is not None:
+        out[DESTINATION] = destination.to_json()
+    out["areas"] = OrderedDict()
     for area in SUPER_AREAS:
         if area in areas:
             out["areas"][area] = OrderedDict([("state", area_state(state, area)),
@@ -1443,6 +2318,8 @@ def apply_super_preset(state, entry, areas=None):
     areas loaded. Older files: a "letterbox" area loads into Transform, a "transform" area with
     oiiotool steps into Transform Sequence."""
     loaded = []
+    if entry.get("input_type") in INPUT_TYPES and not state.input.input1.strip():
+        state.input.input_type = entry["input_type"]     # with an input, the file decides
     for area, value in (entry.get("areas") or {}).items():
         data = value.get("state") or {}
         if area == "letterbox":
@@ -1451,12 +2328,29 @@ def apply_super_preset(state, entry, areas=None):
             area, data = "transform_sequence", {"steps": data}
         if areas is not None and area not in areas:
             continue
-        if area == "encode":
+        if area == "input":
+            for f in INPUT_AREA_FIELDS:
+                if f in data:
+                    setattr(state.input, f, int(data[f]) if f == "movie_first_frame" else str(data[f] or ""))
+        elif area == "colour":
+            for f in COLOUR_AREA_FIELDS:
+                if f in data:
+                    setattr(state.input, f, bool(data[f]) if f == "convert_colour" else str(data[f] or ""))
+        elif area == "tokens":
+            state.tokens = _flat(TokensState, data, name_tokens=_pairs)
+        elif area == "encode":
+            if data.get("output_type") in OUTPUT_TYPES:     # older super-presets have none
+                state.input.output_type = data["output_type"]
             state.input.encode_preset = data.get("encode_preset", "")
+            state.input.output_fps = str(data.get("output_fps", "") or "")
             state.input.seq_preset = data.get("seq_preset", "")
             state.input.alpha = data.get("alpha", "drop") if data.get("alpha") in ALPHA_MODES else "drop"
             state.input.write_timecode = bool(data.get("write_timecode", True))
             state.input.write_reelid = bool(data.get("write_reelid", True))
+            state.input.alpha_premult = bool(data.get("alpha_premult", False))
+            state.input.par_out = str(data.get("par_out") or "same")
+            state.input.missing_frames = (data.get("missing_frames") if data.get("missing_frames")
+                                          in MISSING_FRAMES else "hold")
         elif area == "transform_sequence":
             if "steps" in data:
                 state.transform = _flat(TransformState, data["steps"])
@@ -1474,6 +2368,12 @@ def apply_super_preset(state, entry, areas=None):
             state.slate = _flat(SlateState, data, fields=_pairs)
         elif area == "filmstrip":
             state.filmstrip = _flat(FilmstripState, data)
+        elif area == "thumbnail":
+            state.thumb = _flat(ThumbState, data)
+        elif area == "intermediate":
+            state.intermediate = _flat(IntermediateState, data)
+        elif area == "channels":
+            state.channels = _flat(ChannelsState, data)
         elif area == "metadata":
             state.metadata = _flat(MetadataState, data, tags=_pairs)
         else:

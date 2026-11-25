@@ -18,7 +18,12 @@ from .errors import TranscodeError
 SECTIONS = OrderedDict([("colour", "colour_presets"), ("transform", "ff_transforms"),
                         ("transform_sequence", "oiio_transforms"), ("burnin", "burnin_presets"),
                         ("slate", "slate_presets"), ("filmstrip", "filmstrip_presets"),
-                        ("smart_tokens", "smart_tokens")])
+                        ("thumbnail", "thumbnail_presets"),
+                        ("encode_preset", "encode_presets"), ("sequence_preset", "sequence_presets"),
+                        ("metadata", "metadata_presets"),
+                        ("smart_tokens", "smart_tokens"), ("destination_path", "destination_paths"),
+                        ("channel_order", "channel_preference_presets"),
+                        ("destination_name", "destination_names")])
 RESERVED = {"none", "plain", ""}
 INLINE_WIDTH = 100
 UPDATE_ATTEMPTS = 5
@@ -99,6 +104,8 @@ def put(data, area, name, entry, sub=None):
         else:
             subs.append(entry)
         return
+    if section == "encode_presets" and section not in data and "presets" in data:
+        section = "presets"                  # the older name of the section
     presets = data.setdefault(section, OrderedDict())
     if not isinstance(presets, dict):
         raise TranscodeError('"{}" must be an object.'.format(section))
@@ -112,12 +119,46 @@ def exists(presets, area, name, sub=None):
     table = {"colour": presets.colours, "transform": presets.ff_transforms,
              "transform_sequence": presets.transforms, "burnin": presets.burnins,
              "slate": presets.slates, "filmstrip": presets.filmstrips,
-             "smart_tokens": presets.smart_tokens}[area]
+             "thumbnail": presets.thumbnails, "encode_preset": presets.presets,
+             "sequence_preset": presets.sequences, "metadata": presets.metadata_presets,
+             "smart_tokens": presets.smart_tokens, "destination_path": presets.dest_paths,
+             "destination_name": presets.dest_names, "channel_order": presets.channel_orders}[area]
     if name not in table:
         return False
     if area == "transform_sequence":
         return any(s.name == sub for s in table[name].subs)
     return True
+
+
+def delete_preset(path, area, name):
+    """Take one preset out of the presets file at `path` (destination paths and names),
+    multi-user safe. A file without the section has the built-in ones: they are written into
+    it first, so deleting one keeps the others. Returns safe_save.SaveResult."""
+    from .presets import load_presets
+    from . import destinations
+    section = SECTIONS[area]
+    path = Path(path)
+
+    def validate(tmp):
+        load_presets(str(tmp))
+
+    for attempt in range(UPDATE_ATTEMPTS):
+        stamp = safe_save.file_stamp(path)
+        data, newline = read_raw(path) if path.is_file() else (OrderedDict(), "\n")
+        if section not in data and area in ("destination_path", "destination_name"):
+            kind = "path" if area == "destination_path" else "name"
+            data[section] = OrderedDict((p.name, destinations.to_json(p.template, kind, p.notes))
+                                        for p in destinations.builtin(kind).values())
+        table = data.get(section)
+        if not isinstance(table, dict) or name not in table:
+            raise TranscodeError('No {} preset "{}" in {}.'.format(section, name, path))
+        del table[name]
+        try:
+            return safe_save.safe_write_text(path, dumps(data, newline), expect_stamp=True,
+                                             stamp=stamp, validate=validate)
+        except safe_save.SaveConflict:
+            if attempt == UPDATE_ATTEMPTS - 1:
+                raise
 
 
 def check_name(name):

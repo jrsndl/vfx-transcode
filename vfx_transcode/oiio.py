@@ -8,6 +8,7 @@ one file per oiiotool call on a thread pool.
 
 import concurrent.futures
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -134,7 +135,7 @@ def batch_command(cfg, seq, work_dir, first, last, mid, target=None):
     src, dst = batch_patterns(seq, _target(cfg, seq, work_dir, target))
     cmd = [cfg.oiiotool, "--frames", "{}-{}".format(first, last), "--parallel-frames"]
     if cfg.oiio_threads > 0:
-        cmd += ["--threads", str(cfg.oiio_threads)]
+        cmd += ["--threads", str(cfg.oiio_threads)]   # also how many frames run at once
     return cmd + ["-i", src] + mid + ["-o", dst]
 
 
@@ -178,7 +179,8 @@ def convert_sequence(cfg, seq, pick, work_dir, depth=None, target=None, mid=None
                 pending.append(first)
                 continue
             cmd = batch_command(cfg, seq, work_dir, first, last, mid, out_target)
-            log.info("Converting frames %d-%d with oiiotool --parallel-frames", first, last)
+            log.info("Converting frames %d-%d with oiiotool --parallel-frames, %d threads (of %d)",
+                     first, last, cfg.workers, os.cpu_count() or 0)
             try:
                 run_tool(cmd, "oiiotool", cfg.verbose)
             except ToolError as exc:
@@ -194,9 +196,71 @@ def convert_sequence(cfg, seq, pick, work_dir, depth=None, target=None, mid=None
 
     if pending:
         _convert_per_file(cfg, seq, pending, target, mid, result, per_frame)
+    if getattr(cfg, "oiio_verify", True):
+        redo_suspects(cfg, seq, target, mid, result, per_frame)
 
     log.info("Conversion to %s took %.2f seconds", ext[1:], perf_counter() - start)
     return result
+
+
+# --- black frame guard ---
+# oiiotool run on many frames at once (--parallel-frames, or several oiiotools side by side)
+# has been seen to write random black frames: different ones on every run, local or network.
+# A black frame compresses to a fraction of its neighbours' size, so frames much smaller than
+# the run's typical frame are converted again, one at a time, and the new file kept.
+
+SUSPECT_RATIO = 0.2        # smaller than this share of the median frame size: suspect
+MIN_FRAMES_TO_JUDGE = 3    # fewer frames: no median worth trusting
+
+
+def suspect_frames(sizes, ratio=SUSPECT_RATIO):
+    """{frame: bytes} -> frames far smaller than the median (possibly black)."""
+    if len(sizes) < MIN_FRAMES_TO_JUDGE:
+        return []
+    ordered = sorted(sizes.values())
+    median = ordered[len(ordered) // 2]
+    return sorted(f for f, size in sizes.items() if size < median * ratio)
+
+
+def redo_suspects(cfg, seq, target, mid, result, per_frame=None):
+    """Convert the suspect frames again, one at a time with one thread each; a frame that is
+    still as small was dark to begin with (a fade, a black slug) and is kept as it is."""
+    sizes = {f: p.stat().st_size for f, p in result.outputs.items() if p.is_file()}
+    suspects = suspect_frames(sizes)
+    if not suspects:
+        return []
+    log.warning("%d frame(s) came out much smaller than the others (possibly black): %s. "
+                "Converting them again, one at a time.", len(suspects), _frame_list(suspects))
+    fixed = []
+    for frame in suspects:
+        steps = list(mid) + (per_frame(frame) if per_frame else [])
+        cmd = per_file_command(cfg, seq.path(frame), target[frame], steps)
+        cmd = cmd[:1] + ["--threads", "1"] + cmd[1:]
+        before = sizes[frame]
+        try:
+            target[frame].unlink()
+            run_tool(cmd, "oiiotool", cfg.verbose)
+        except (OSError, ToolError) as exc:
+            log.warning("Frame %d could not be converted again: %s", frame, exc)
+            if not target[frame].is_file():
+                result.outputs.pop(frame, None)
+                result.failed.append(frame)
+            continue
+        after = target[frame].stat().st_size if target[frame].is_file() else 0
+        if after > before * 1.5:
+            fixed.append(frame)
+    if fixed:
+        log.warning("Fixed %d black frame(s): %s. If it keeps happening, try -oiio_per_file 1 "
+                    "or -oiio_threads 1.", len(fixed), _frame_list(fixed))
+    else:
+        log.info("Converted again, the same: those frames are dark in the source.")
+    result.failed.sort()
+    return fixed
+
+
+def _frame_list(frames, most=20):
+    text = ", ".join(str(f) for f in frames[:most])
+    return text + (" ..." if len(frames) > most else "")
 
 
 def _convert_per_file(cfg, seq, frames, target, mid, result, per_frame=None):

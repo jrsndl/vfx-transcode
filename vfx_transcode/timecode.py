@@ -32,6 +32,20 @@ def fps_display(fps):
     return "{:.3f}".format(float(fps)).rstrip("0").rstrip(".")
 
 
+FPS_KEYWORDS = ("source_fps_float", "source_fps_int", "source_fps_frac")
+
+
+def fps_tokens(fps):
+    """{source_fps_float} "23.976" (3 decimals), {source_fps_int} "24" (the closest whole
+    number), {source_fps_frac} "24000/1001" ("25/1"); all "" when the rate is not known yet."""
+    if fps is None:
+        return {key: "" for key in FPS_KEYWORDS}
+    fps = Fraction(fps)
+    return {"source_fps_float": "{:.3f}".format(float(fps)),
+            "source_fps_int": str(int(fps + Fraction(1, 2))),
+            "source_fps_frac": "{}/{}".format(fps.numerator, fps.denominator)}
+
+
 def nominal_fps(fps):
     """Integer frame rate used for timecode counting (23.976 -> 24, 29.97 -> 30)."""
     return max(1, int(fps + Fraction(1, 2)))

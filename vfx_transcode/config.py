@@ -15,6 +15,8 @@ class Config:
     output: str = ""
     fps: Fraction = Fraction(24)       # resolved rate; set from the sources below at run time
     fps_arg: Optional[Fraction] = None # -r, if given
+    output_fps: Optional[Fraction] = None   # -output_fps: play the output at this rate
+    source_fps: Optional[Fraction] = None   # the input's rate, once resolved
     fps_source: str = "arg"            # arg | exr | arg_only
     par_arg: Optional[Fraction] = None # -par, if given
     par_source: str = "arg"            # arg | exr | arg_only
@@ -41,6 +43,7 @@ class Config:
     oiio_threads: int = 0
     oiio_channel: List[str] = field(default_factory=list)
     oiio_channel_use_first: bool = False
+    oiio_subimage: str = ""           # -oiio_subimage: a part's number or name; "" = all
     channel_preferences: List[List[str]] = field(default_factory=list)   # from presets.json
     oiio_command: List[str] = field(default_factory=list)
     oiio_transform: Any = None          # transforms.TransformPreset, None = -width resize
@@ -50,6 +53,7 @@ class Config:
     preview: str = ""                   # -preview FILE.png: one frame as the movie shows it
     preview_frame: str = "middle"       # which frame for -preview
     oiio_per_file: bool = False
+    oiio_verify: bool = True           # convert again frames that came out far smaller (black)
     mezzanine: str = "png"
     mezzanine_16bit: bool = False
     width: int = 1920
@@ -94,6 +98,7 @@ class Config:
     alpha_auto: bool = False           # -alpha auto: no alpha in the input is not a warning
     alpha_strip: str = ""              # oiiotool --ch for non-EXR input with alpha and drop
     alpha_premult: bool = False        # with keep: write premultiplied colour (else straight)
+    alpha_view_only: bool = False      # -preview_alpha: alpha kept for the preview picture only
     alpha_active: bool = False         # set at run time: the movie really gets an alpha channel
 
     # thumbnail / what to make
@@ -111,6 +116,8 @@ class Config:
     version_regex: str = r"_v(\d\d\d)"
     name_rules: Dict[str, Any] = field(default_factory=dict)    # names.NameRule by keyword
     smart_tokens: Any = None                                    # smart_tokens.SmartTokenPreset
+    base_folder: str = ""             # -base_folder: {base_folder}; "" = the input's folder
+    custom_tokens: Dict[str, str] = field(default_factory=dict)   # {custom_destination_path} ...
     name_tokens: Dict[str, str] = field(default_factory=dict)   # set at run time
 
     # set at run time

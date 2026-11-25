@@ -99,7 +99,7 @@ class TunerCoreTests(unittest.TestCase):
         full, sections = core.output_sections(state, PRESETS)
         self.assertIn("-burn_tl {clean_name}", full)
         self.assertEqual(set(sections), {"transform", "transform_sequence", "burnin", "slate",
-                                         "metadata", "filmstrip"})
+                                         "metadata", "filmstrip", "thumbnail"})
         self.assertIn("-width 0", full)
 
     def test_metadata_rows(self):
@@ -162,7 +162,7 @@ class TunerFilmstripTests(unittest.TestCase):
         self.assertIn("-of", sections["filmstrip"][0])
         state.filmstrip.enabled = True
         full, _sections = core.output_sections(state, PRESETS)
-        self.assertIn("-of -filmstrip_tiles 24", full)
+        self.assertIn("-of ./ -filmstrip_tiles 24", full)
 
 
 class TunerInputTests(unittest.TestCase):
@@ -780,6 +780,17 @@ class OverlayTests(unittest.TestCase):
         report["output"]["par"] = 1.3333333
         self.assertEqual(core.overlay_lines(report)[1], ("output", "1920x1080 pa 1.33"))
 
+    def test_overlay_timecode(self):
+        report = {"keywords": {"input_width": "1920", "input_height": "1080"},
+                  "output": {"width": 1920, "height": 1080, "par": 1.0, "fps": "24",
+                             "timecode": "01:00:00:00", "frame_timecode": "01:00:00:12",
+                             "timecode_written": True}}
+        self.assertEqual(core.overlay_lines(report)[-1], ("timecode", "01:00:00:12 (starts 01:00:00:00)"))
+        report["output"]["frame_timecode"] = "01:00:00:00"
+        self.assertEqual(core.overlay_lines(report)[-1], ("timecode", "01:00:00:00"))
+        report["output"]["timecode_written"] = False          # -output_timecode 0, PNG, JPG ...
+        self.assertEqual(len(core.overlay_lines(report)), 2)
+
     def test_overlay_input_size_fallback(self):
         report = {"keywords": {"input_width": ""}, "input": {"par": "1.3"},
                   "output": {"width": 1920, "height": 1080, "par": 1.3, "fps": "25"}}
@@ -839,3 +850,303 @@ class TokensTests(unittest.TestCase):
         values = dict(core.token_values({"keywords": {"shot": "ICOI2_005_033"}}, t))
         self.assertEqual(values["shot"], "ICOI2_005_033")
         self.assertIsNone(values["task"])
+
+
+class InputTypeTests(unittest.TestCase):
+    def test_detect_and_pipeline(self):
+        D = core.detect_input_type
+        self.assertEqual([D("a.mov"), D("s.1001.exr"), D("s.1001.jpeg"), D("s.1001.TIFF"), D(""), D("x.bmp")],
+                         ["movie", "exr", "jpg", "tif", "", ""])
+        # no input: the chosen type decides which tools run
+        p = core.pipeline("", "png", "movie")
+        self.assertEqual((p.oiio, p.ffmpeg), (False, True))                 # movie -> png: ffmpeg
+        p = core.pipeline("", "png", "exr")
+        self.assertEqual((p.oiio, p.ffmpeg), (True, False))                 # exr -> png: oiiotool
+        p = core.pipeline("", "movie", "png")
+        self.assertEqual((p.oiio, p.ffmpeg), (False, True))                 # png -> movie
+        p = core.pipeline("clip.mov", "png", "exr")                         # a file wins
+        self.assertEqual((p.oiio, p.ffmpeg), (False, True))
+
+    def test_super_preset_records_input_type(self):
+        state = core.TunerState()
+        state.input.input_type = "movie"
+        entry = core.super_preset_entry(state, ["encode"])
+        self.assertEqual(entry["input_type"], "movie")
+        state.input.input1 = "shot.1001.exr"
+        self.assertEqual(core.super_preset_entry(state, ["encode"])["input_type"], "exr")
+        other = core.TunerState()                                           # no input: set
+        core.apply_super_preset(other, json.loads(json.dumps(entry)))
+        self.assertEqual(other.input.input_type, "movie")
+        busy = core.TunerState()                                            # an input: kept
+        busy.input.input1 = "plate.1001.png"
+        busy.input.input_type = "png"
+        core.apply_super_preset(busy, entry)
+        self.assertEqual(busy.input.input_type, "png")
+
+    def test_file_keeps_input_type(self):
+        import tempfile
+        from vfx_transcode import super_presets as sp
+        path = Path(tempfile.mkdtemp()) / "super_presets.json"
+        state = core.TunerState()
+        state.input.input_type = "jpg"
+        sp.save(path, {"x": core.super_preset_entry(state, ["encode"])})
+        self.assertEqual(sp.load(path)["x"]["input_type"], "jpg")
+        self.assertIn("-preset", sp.args_for(sp.load(path), "x", path) + ["-preset"])   # CLI unaffected
+
+    def test_inputs_kind_for_the_process_app(self):
+        state = core.TunerState()
+        state.input.input_type = "png"
+        entry = core.super_preset_entry(state, ["encode"])
+        self.assertEqual((entry["input_type"], entry["inputs"]), ("png", ["image"]))
+        widened = core.super_preset_entry(state, ["encode"], previous={"inputs": ["exr", "image"]})
+        self.assertEqual(widened["inputs"], ["exr", "image"])            # kept: it includes image
+        state.input.input_type = "movie"
+        moved = core.super_preset_entry(state, ["encode"], previous={"inputs": ["exr", "image"]})
+        self.assertEqual(moved["inputs"], ["movie"])
+
+
+def test_alpha_hint():
+    state = core.TunerState()
+    assert core.alpha_hint(state, None) == ""
+    kept = {"output": {"alpha": True, "alpha_output": True}}
+    view = {"output": {"alpha": True, "alpha_output": False}}
+    assert core.alpha_hint(state, kept) == ""
+    state.input.alpha = "drop"
+    assert "drops" in core.alpha_hint(state, view)
+    state.input.alpha = "auto"
+    assert "cannot store" in core.alpha_hint(state, view)
+    assert list(core.ALPHA_VIEWS) == ["rgb", "alpha", "checker"]
+
+
+def test_preview_command_asks_for_alpha():
+    state = core.TunerState()
+    state.input.input1 = "/x/a.0001.exr"
+    cmd = core.preview_command(state, "/tmp/p.png", tool=["vt"])
+    assert cmd[-4:-2] == ["-preview_alpha", "1"]
+
+
+def test_preview_alpha_option():
+    def cfg_for(*extra):
+        ns = cli.build_parser(PRESETS).parse_args(["-i", "/x/a.0001.exr"] + list(extra))
+        return cli.config_from_args(ns, PRESETS)
+    c = cfg_for("-preview", "/tmp/p.png", "-preview_alpha", "1")
+    assert c.alpha == "keep" and c.alpha_view_only and not c.alpha_premult
+    c = cfg_for("-preview_alpha", "1")                       # no preview: the output as asked
+    assert c.alpha == "drop" and not c.alpha_view_only
+    c = cfg_for("-preview", "/tmp/p.png", "-preview_alpha", "1", "-mezzanine", "jpg")
+    assert c.alpha == "drop"
+    c = cfg_for("-preview", "/tmp/p.png", "-preview_alpha", "1", "-o", "/x/o.####.png",
+                "-alpha", "auto")
+    assert c.alpha == "keep" and not c.alpha_view_only       # the output keeps it anyway
+
+
+def test_thumbnail_options_and_preset_save(tmp_path):
+    import pytest
+    from vfx_transcode.errors import TranscodeError
+    import shutil
+    from vfx_transcode import presets_store, thumbnails
+    from vfx_transcode.presets import load_presets
+    # the tab's settings, written as options, give the same thumbnail preset
+    state = core.ThumbState(enabled=True, frame="first", width=640, height=0, format="png",
+                            compression=9, bits=16)
+    state.custom = core.thumb_custom(state, PRESETS)
+    assert state.custom
+    args = core.thumb_args(state)
+    ns = cli.build_parser(PRESETS).parse_args(["-i", "/x/a.0001.exr"] + args)
+    cfg = cli.config_from_args(ns, PRESETS)
+    t = cfg.thumbnail
+    assert (t.frame, t.width, t.height, t.format, t.compression, t.bits) == ("first", 640, 0, "png", 9, 16)
+    # loaded from a preset and unchanged: the name alone
+    name = next(iter(PRESETS.thumbnails))
+    loaded = core.thumb_from_preset(PRESETS.thumbnails[name], name, True)
+    assert not core.thumb_custom(loaded, PRESETS)
+    assert core.thumb_args(loaded) == ["-ot", "-thumbnail_preset", name]
+    # jpg after png: 8-bit
+    assert thumbnails.apply_options(PRESETS.thumbnails[name], fmt="jpg").bits == 8
+    with pytest.raises(TranscodeError):
+        thumbnails.apply_options(PRESETS.thumbnails[name], size="big")
+    # saved into a presets file and read back
+    path = tmp_path / "presets.json"
+    shutil.copy(str(REPO / "presets.json"), str(path))
+    entry = core.preset_entry(core.TunerState(thumb=state), "thumbnail", PRESETS, "small png")
+    presets_store.save_preset(path, "thumbnail", "small_png", entry)
+    saved = load_presets(path).thumbnails["small_png"]
+    assert (saved.frame, saved.width, saved.format, saved.bits, saved.notes) == ("first", 640, "png", 16, "small png")
+
+
+def test_encode_and_sequence_presets_save(tmp_path):
+    import shutil
+    from vfx_transcode import presets_store
+    from vfx_transcode.presets import load_presets
+    path = tmp_path / "presets.json"
+    shutil.copy(str(REPO / "presets.json"), str(path))
+    state = core.TunerState()
+    state.encode_edit = core.encode_edit_from_preset(PRESETS.presets["prores4444"])
+    assert core.encode_problem(state.encode_edit) == ""
+    state.encode_edit.encode = "-c:v prores_ks"
+    assert "videofilter" in core.encode_problem(state.encode_edit)
+    state.encode_edit.encode = "-pix_fmt yuv422p10le {videofilter} -c:v prores_ks -profile:v 3"
+    state.encode_edit.metadata = [("vendor_id", "apl0")]
+    entry = core.preset_entry(state, "encode_preset", PRESETS, "my prores")
+    presets_store.save_preset(path, "encode_preset", "my_prores", entry)
+    state.sequence_edit = core.SequenceEditState(ext="exr", args="-d half --compression dwaa:45")
+    assert core.sequence_problem(state.sequence_edit) == ""
+    assert core.sequence_problem(core.SequenceEditState(ext="mov", args="")) != ""
+    entry = core.preset_entry(state, "sequence_preset", PRESETS, "dwaa")
+    presets_store.save_preset(path, "sequence_preset", "exr_dwaa", entry)
+    saved = load_presets(path)
+    p = saved.presets["my_prores"]
+    assert p.ext == "mov" and p.ten_bit and p.metadata == {"vendor_id": "apl0"} and p.notes == "my prores"
+    assert "prores4444" in saved.presets                      # the others are kept
+    q = saved.sequences["exr_dwaa"]
+    assert q.ext == "exr" and q.args == ("-d", "half", "--compression", "dwaa:45")
+    # round trip through the tab state
+    again = core.encode_edit_from_preset(p)
+    assert core.encode_json(again)["encode"] == state.encode_edit.encode
+
+
+def test_new_tuner_options_args():
+    state = core.TunerState()
+    i = state.input
+    i.input1 = "/x/a.0001.exr"
+    i.missing_frames, i.par_out = "error", "square"
+    assert i.args()[-4:] == ["-missing_frames", "error", "-par_out", "square"]
+    i.alpha, i.alpha_premult = "keep", True
+    args = core.pipeline_args(state)
+    assert args[args.index("-alpha"):args.index("-alpha") + 4] == ["-alpha", "keep", "-alpha_premult", "1"]
+    state.channels.deep_zrange = "0.1,500"
+    assert state.channels.args()[-2:] == ["-deep_zrange", "0.1,500"]
+    assert state.channels.full_args()[-2:] == ["-deep_zrange", "0.1,500"]
+    m = state.metadata
+    m.copy, m.reelid_attr, m.reelid_pattern = "all,-husk:*", "reel", "^(\\w+)"
+    margs = core.metadata_args(m)
+    for option, value in (("-metadata_copy", "all,-husk:*"), ("-reelid_attr", "reel"),
+                          ("-reelid_pattern", "^(\\w+)")):
+        assert margs[margs.index(option) + 1] == value
+    t = state.tokens
+    t.version_regex = core.DEFAULT_VERSION_REGEX
+    t.name_tokens = [("shot", "^([A-Z]+_\\d+)"), ("", "x"), ("old", "")]
+    assert core.name_token_args(t) == ["-name_token", "shot=^([A-Z]+_\\d+)", "-name_token", "old="]
+    # the encode area keeps them in a super-preset, and the CLI takes them all
+    enc = core.area_args(state, "encode")
+    full = ["-i", "/x/a.0001.exr"] + enc + core.metadata_args(m) + core.tokens_args(t) + state.channels.full_args()
+    ns = cli.build_parser(PRESETS).parse_args(full)
+    assert (ns.par_out, ns.missing_frames, ns.alpha, ns.deep_zrange) == ("square", "error", "keep", "0.1,500")
+    data = core.area_state(state, "encode")
+    loaded = core.TunerState()
+    core.apply_super_preset(loaded, {"areas": {"encode": {"state": data}}})
+    li = loaded.input
+    assert (li.par_out, li.missing_frames, li.alpha, li.alpha_premult) == ("square", "error", "keep", True)
+
+
+def test_super_preset_holds_input_colour_tokens():
+    from vfx_transcode import super_presets as sp
+    assert {"input", "colour", "tokens"} <= set(sp.AREAS)
+    state = core.TunerState()
+    i = state.input
+    i.input_type, i.fps, i.par, i.movie_first_frame = "exr", "25", "2", 1
+    i.colorin, i.colorout, i.view = "ACEScg", "Output - Rec.709", "Film"
+    t = state.tokens
+    t.rows = [{"name": "shot", "source": "{clean_name}", "regex": "^([a-z]+)"}]
+    t.version_regex, t.name_tokens = "_v(\\d+)", [("seq", "^([A-Z]+)")]
+    entry = json.loads(json.dumps(core.super_preset_entry(state, sp.AREAS)))
+    args = [a for area in entry["areas"].values() for a in area["args"]]
+    ns = cli.build_parser(PRESETS).parse_args(["-i", "/x/a.0001.exr"] + args)
+    assert (ns.fps, ns.par, ns.colorin, ns.view, ns.version_regex) == ("25", "2", "ACEScg", "Film", "_v(\\d+)")
+    assert ns.name_token == ["seq=^([A-Z]+)"] and json.loads(ns.smart_tokens_def)[0]["name"] == "shot"
+    loaded = core.TunerState()
+    core.apply_super_preset(loaded, entry)
+    assert (loaded.input.fps, loaded.input.par, loaded.input.colorin, loaded.input.view) == ("25", "2", "ACEScg", "Film")
+    assert loaded.tokens.rows == t.rows and loaded.tokens.name_tokens == [("seq", "^([A-Z]+)")]
+    assert loaded.tokens.version_regex == "_v(\\d+)"
+
+
+def test_metadata_preset_load_edit_save(tmp_path):
+    import shutil
+    from vfx_transcode import presets_store
+    m = core.MetadataState()
+    assert core.metadata_args(m) == []                      # older state: nothing loaded
+    core.metadata_from_preset(m, PRESETS.metadata_presets["conform"], "conform")
+    assert ("title", "{clean_name}") in m.tags and m.reelid_attr == "owner"
+    assert m.timecode_source == "metadata" and m.reelid_source == "metadata"
+    args = core.metadata_args(m)
+    assert args[:2] == ["-metadata_preset", "conform"] and "-metadata" not in args
+    m.tags = [t for t in m.tags if t[0] != "title"] + [("comment", "hi")]
+    args = core.metadata_args(m)
+    assert args[:2] == ["-metadata_preset", "none"] and "comment=hi" in args and "title={clean_name}" not in args
+    ns = cli.build_parser(PRESETS).parse_args(["-i", "/x/a.0001.exr"] + args)
+    assert ns.metadata_preset == "none" and ns.reelid_attr == "owner"
+    path = tmp_path / "presets.json"
+    shutil.copy(str(REPO / "presets.json"), str(path))
+    state = core.TunerState(metadata=m)
+    presets_store.save_preset(path, "metadata", "conform2",
+                              core.preset_entry(state, "metadata", PRESETS, "edited"))
+    saved = load_presets(path).metadata_presets["conform2"]
+    assert saved.tags.get("comment") == "hi" and saved.reelid_attr == "owner" and saved.notes == "edited"
+    core.mark_saved(state, "metadata", "conform2")
+    assert core.metadata_args(m)[:2] == ["-metadata_preset", "conform2"]
+    # "none": nothing
+    core.metadata_from_preset(m, None, "none")
+    assert m.tags == [] and core.metadata_args(m)[:2] == ["-metadata_preset", "none"]
+
+
+def test_encode_ten_bit_follows_pix_fmt():
+    assert core.deep_pix_fmt("-pix_fmt yuv422p10le {videofilter}") is True
+    assert core.deep_pix_fmt("-pix_fmt yuv420p {videofilter}") is False
+    assert core.deep_pix_fmt("{videofilter} -c:v libx264") is None
+    e = core.EncodeEditState(encode="-pix_fmt yuv420p {videofilter}", ten_bit=True)
+    assert core.encode_json(e)["ten_bit"] is False
+    e = core.EncodeEditState(encode="{videofilter} -c:v dnxhd -profile:v dnxhr_hqx", ten_bit=True)
+    assert core.encode_json(e)["ten_bit"] is True                    # kept from the preset
+    loaded = core.encode_edit_from_preset(PRESETS.presets["prores4444"])
+    assert loaded.notes == PRESETS.presets["prores4444"].notes
+    assert core.encode_json(loaded)["colour_tags"] == PRESETS.presets["prores4444"].colour_tags
+
+
+def test_full_command_parts_by_tab():
+    state = core.TunerState()
+    state.input.input1 = "/x/a 1.0001.exr"
+    state.thumb.enabled = state.filmstrip.enabled = True
+    state.metadata.copy = "all"
+    state.metadata.loaded = {}
+    args = ["vfx-transcode"] + core.full_args(state, PRESETS)
+    parts = core.command_parts(args)
+    assert [a for _t, words in parts for a in words] == args       # nothing lost or reordered
+    assert " ".join(core.quote(w) for _t, w in parts) == core.quote(args)
+    tabs = {t for t, _w in parts}
+    assert {"Input", "Destination", "Thumbnail", "Filmstrip", "Metadata"} <= tabs
+    assert core.option_tab("-burn_tl") == "Burn-in" and core.option_tab("-slate_title") == "Slate"
+    assert core.option_tab("-oiio_letterbox_ratio") == "Transform Sequence"
+    assert core.option_tab("-letterbox_ratio") == "Transform" and core.option_tab("-o") == "Destination"
+
+
+def test_tab_marks():
+    state = core.TunerState()
+    state.input.input1 = "/x/a.0001.exr"
+    name = next(iter(PRESETS.burnins))
+    state.burn = core.burn_from_preset(PRESETS.burnins[name])
+    marks = core.tab_marks(state, PRESETS)
+    assert marks["Burn-in"] == (False, not state.burn.any_text())
+    state.burn.color = "red"
+    assert core.tab_marks(state, PRESETS)["Burn-in"][0]
+    state.burn.enabled = False
+    assert core.tab_marks(state, PRESETS)["Burn-in"][1]                  # off: italics
+    state.encode_edit = core.encode_edit_from_preset(PRESETS.presets["h264"])
+    assert core.tab_marks(state, PRESETS)["Encode"] == (False, False)
+    state.encode_edit.encode += " -tune film"
+    assert core.tab_marks(state, PRESETS)["Encode"][0]                  # "Encode *"
+    assert core.tab_marks(state, PRESETS)["Slate"][1] and core.tab_marks(state, PRESETS)["Thumbnail"][1]
+    state.thumb.enabled, state.thumb.custom = True, True
+    assert core.tab_marks(state, PRESETS)["Thumbnail"] == (True, False)
+
+
+def test_metadata_copy_hint():
+    from vfx_transcode import metadata as md
+    header = {"unreal/aa/spatialSampleCount": "2", "unreal/camera/fov": "56.99", "Software": "UE",
+              "oiio:ColorSpace": "lin"}
+    assert "try unreal/*" in md.copy_hint(md.header_metadata(header), "unreal:*")
+    assert md.copy_hint(md.header_metadata(header), "unreal/*,all") == ""
+    report = {"input": {"header": header}}
+    assert core.copy_note(report, "unreal/*") == "copies 2 attributes from the input header"
+    assert "matches nothing" in core.copy_note(report, "unreal:*")
+    assert core.copy_note(report, "") == "" and core.copy_note({}, "unreal/*") == ""

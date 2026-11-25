@@ -64,6 +64,44 @@ def select(metadata, spec):
         and not any(fnmatch.fnmatchcase(k, p) for p in exclude))
 
 
+def unmatched_patterns(metadata, spec):
+    """The include patterns of a copy spec that match none of the keys ("all" never counts)."""
+    tokens = [t.strip() for t in (spec or "").split(",") if t.strip()]
+    return [t for t in tokens if not t.startswith("-") and t != "all"
+            and not any(fnmatch.fnmatchcase(k, t) for k in metadata)]
+
+
+def key_prefixes(metadata, most=8):
+    """How the keys start, for a hint: "unreal/", "arnold/", "Software" ..."""
+    seen = []
+    for key in metadata:
+        cut = min([i for i in (key.find("/"), key.find(":")) if i > 0] or [len(key)])
+        prefix = key[:cut + 1] if cut < len(key) else key
+        if prefix not in seen:
+            seen.append(prefix)
+    return seen[:most]
+
+
+def copy_hint(metadata, spec):
+    """"" when every pattern of the spec matches; else why, e.g. 'unreal:* matches nothing;
+    the keys start with: unreal/, arnold/ (try unreal/*)'."""
+    missing = unmatched_patterns(metadata, spec)
+    if not missing:
+        return ""
+    prefixes = key_prefixes(metadata)
+    text = "{} match{} nothing in the header".format(", ".join(missing), "" if len(missing) > 1 else "es")
+    if prefixes:
+        text += "; its keys start with: {}".format(", ".join(prefixes))
+        tries = []
+        for pattern in missing:
+            stem = re.split(r"[/:*?]", pattern, maxsplit=1)[0]
+            tries += [p + "*" for p in prefixes if stem and p.lower().startswith(stem.lower())
+                      and p.endswith(("/", ":"))]
+        if tries:
+            text += " (try {})".format(", ".join(dict.fromkeys(tries)))
+    return text
+
+
 def parse_pairs(pairs):
     """['title=Shot 010', 'comment=x'] -> OrderedDict. Validated early by the CLI."""
     out = OrderedDict()

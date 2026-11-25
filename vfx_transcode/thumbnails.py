@@ -103,6 +103,53 @@ def presets_from_json(data, path):
     return OrderedDict((name, preset_from_json(name, value, path)) for name, value in data.items())
 
 
+def to_json(preset):
+    """The preset as its presets-file entry: only the fields the format uses."""
+    data = OrderedDict()
+    if preset.notes:
+        data["notes"] = preset.notes
+    data["frame"] = preset.frame
+    data["width"], data["height"] = preset.width, preset.height
+    data["format"] = preset.format
+    if preset.format == "jpg":
+        data["quality"] = preset.quality
+    else:
+        data["compression"], data["bits"] = preset.compression, preset.bits
+    return data
+
+
+def parse_size(value, where="-thumbnail_size"):
+    """(width, height) from WxH; 0 or empty = follow the other side: 1920x0, 1920x, x540."""
+    match = re.fullmatch(r"\s*(\d*)\s*[xX*]\s*(\d*)\s*", str(value))
+    if not match:
+        raise TranscodeError('{}: use WIDTHxHEIGHT, 0 or empty for auto (e.g. 1920x0, x540), '
+                             'got "{}".'.format(where, value))
+    width, height = (int(v) if v else 0 for v in match.groups())
+    if width > 65536 or height > 65536:
+        raise TranscodeError("{}: at most 65536 pixels per side.".format(where))
+    return width, height
+
+
+def apply_options(preset, size=None, fmt=None, quality=None, compression=None, bits=None):
+    """The command line over the preset, checked like a preset from the presets file.
+    -thumbnail_format png without -thumbnail_bits keeps the preset's bits; jpg sets 8."""
+    data = to_json(preset)
+    data.update(quality=preset.quality, compression=preset.compression, bits=preset.bits)
+    if size is not None:
+        data["width"], data["height"] = parse_size(size)
+    if fmt is not None:
+        data["format"] = fmt
+        if FORMATS.get(str(fmt).strip().lower().lstrip(".")) == "jpg" and bits is None:
+            data["bits"] = 8
+    for key, value in (("quality", quality), ("compression", compression), ("bits", bits)):
+        if value is not None:
+            try:
+                data[key] = int(value)
+            except (TypeError, ValueError):
+                raise TranscodeError("-thumbnail_{}: a whole number, got {!r}.".format(key, value))
+    return preset_from_json(preset.name, data, "command line")
+
+
 # --- which frame ---
 
 def choose_frame(choice, frames, sizes=None):

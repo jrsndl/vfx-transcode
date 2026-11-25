@@ -2,6 +2,7 @@
 JSON file (presets.json)."""
 
 import json
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,7 @@ from .tools import split_args
 from .transforms import NO_TRANSFORM, TransformPreset, parse_transform_presets
 from .thumbnails import ThumbnailPreset, presets_from_json
 from .filmstrip import FilmstripPreset, presets_from_json as filmstrips_from_json
+from . import destinations
 from .tools import TOOLS
 
 DEFAULT_PRESETS_FILE = "./presets.json"
@@ -105,6 +107,12 @@ class PresetFile:
     tools: "OrderedDict[str, str]" = field(default_factory=OrderedDict)   # name -> path
     colours: "OrderedDict[str, ColourPreset]" = field(default_factory=OrderedDict)
     ff_transforms: "OrderedDict[str, FFTransformPreset]" = field(default_factory=OrderedDict)
+    # destination_paths / destination_names: named -o folders and file names (destinations.py)
+    dest_paths: "OrderedDict[str, Any]" = field(default_factory=lambda: destinations.builtin("path"))
+    dest_names: "OrderedDict[str, Any]" = field(default_factory=lambda: destinations.builtin("name"))
+    # named orders for the automatic channel search ("channel_preference_presets"):
+    # name -> ChannelOrderPreset; -channel_preferences NAME picks one
+    channel_orders: "OrderedDict[str, Any]" = field(default_factory=OrderedDict)
 
     def get_filmstrip(self, name):
         """Filmstrip preset by name; the built-in defaults (24 tiles of 480x270 in one row)
@@ -477,6 +485,47 @@ def _channel_preferences_from_json(data, path):
     return out
 
 
+@dataclass(frozen=True)
+class ChannelOrderPreset:
+    """A named order for the automatic channel search: the sets tried, first found wins."""
+    name: str
+    sets: Tuple[Tuple[str, ...], ...]
+    notes: str = ""
+
+    def as_lists(self):
+        return [list(s) for s in self.sets]
+
+
+def channel_orders_from_json(data, path):
+    """"channel_preference_presets": {"name": {"notes": "...", "channels": ["R,G,B", ...]}};
+    a plain list works too."""
+    out = OrderedDict()
+    if data is None:
+        return out
+    if not isinstance(data, dict):
+        raise TranscodeError('{}: "channel_preference_presets" must be an object.'.format(path))
+    for name, value in data.items():
+        where = '{}: channel preference preset "{}"'.format(path, name)
+        if isinstance(value, list):
+            value = {"channels": value}
+        if not isinstance(value, dict) or "channels" not in value:
+            raise TranscodeError('{} needs "channels": ["R,G,B", ...].'.format(where))
+        sets = _channel_preferences_from_json(value["channels"], where)
+        out[name] = ChannelOrderPreset(name, tuple(tuple(s) for s in sets), str(value.get("notes", "")))
+    return out
+
+
+def parse_channel_order(text):
+    """-channel_order "R,G,B,A; beauty.R,beauty.G,beauty.B" -> [[...], [...]]; sets are
+    separated by ; or |, channels by commas."""
+    sets = []
+    for part in re.split(r"[;|\n]", text or ""):
+        chans = [c.strip() for c in part.split(",") if c.strip()]
+        if chans:
+            sets.append(chans)
+    return sets
+
+
 def parse_tools(data, path):
     """The "tools" section: {"ffmpeg": PATH, "ffprobe": PATH, "oiiotool": PATH}, all optional.
     An empty path means "not set" (the built-in default)."""
@@ -532,6 +581,7 @@ def load_presets(path):
     else:
         from .channels import PREFERRED_CHANNELS          # older files: built-in list
         channel_preferences = [list(c) for c in PREFERRED_CHANNELS]
+    channel_orders = channel_orders_from_json(data.get("channel_preference_presets"), path)
     metadata_presets = OrderedDict((name, _metadata_preset_from_json(name, m, path))
                                    for name, m in (data.get("metadata_presets") or {}).items())
     default_metadata = data.get("default_metadata") or ""
@@ -579,7 +629,10 @@ def load_presets(path):
                       tools=parse_tools(data.get("tools"), path),
                       sequences=sequences, default_sequences=default_sequences,
                       colours=colour_presets_from_json(data.get("colour_presets"), path),
-                      ff_transforms=ff_transforms_from_json(data.get("ff_transforms"), path))
+                      ff_transforms=ff_transforms_from_json(data.get("ff_transforms"), path),
+                      channel_orders=channel_orders,
+                      dest_paths=destinations.from_json(data.get(destinations.PATHS_SECTION), path, "path"),
+                      dest_names=destinations.from_json(data.get(destinations.NAMES_SECTION), path, "name"))
 
 
 # --- colour presets ---
