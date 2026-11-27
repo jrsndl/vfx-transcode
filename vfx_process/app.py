@@ -18,14 +18,16 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication
+from PySide6.QtCore import (QItemSelectionModel, QModelIndex, QObject, QProcess, QProcessEnvironment, QSettings, QSize, QStandardPaths, Qt,
+                            QThread, QTimer, QUrl, Signal)
+from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPainter,
+                           QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame,
                                QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QProgressDialog, QPushButton, QRadioButton, QSizePolicy, QSpinBox, QSplitter, QStyle, QToolButton,
-                               QTabWidget, QVBoxLayout, QWidget)
+                               QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
+                               QProgressDialog, QPushButton, QRadioButton, QSizePolicy, QSlider, QSpinBox, QSplitter, QStyle, QToolButton,
+                               QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from vfx_transcode import movie as mv
 from vfx_transcode import studio
@@ -92,6 +94,7 @@ class Scanner(QThread):
     """Lists a folder and all its sub-folders once (core.walk_media); the app keeps the listing,
     so a new filter is applied without scanning again."""
     progressed = Signal(str, int, int)        # folder, files scanned, media found
+    found_more = Signal(str, list)            # folder, the listing so far (while scanning)
     listed = Signal(str, list)                # folder, listing
 
     def __init__(self, folder, patterns, parent=None):
@@ -100,6 +103,14 @@ class Scanner(QThread):
         self.stop = False
         self.error = ""
         self._last = 0.0
+        self._last_partial = 0.0
+        self.partial_every = 0.8              # seconds; the app stretches it when a refill is slow
+
+    def _partial(self, listing):
+        now = time.time()
+        if now - self._last_partial > self.partial_every:   # the Files tab fills meanwhile
+            self._last_partial = now
+            self.found_more.emit(self.folder, core.sort_listing(listing))
 
     def _progress(self, scanned, found):
         now = time.time()
@@ -109,7 +120,8 @@ class Scanner(QThread):
 
     def run(self):
         try:
-            listing = core.walk_media(self.folder, self.patterns, lambda: self.stop, self._progress)
+            listing = core.walk_media(self.folder, self.patterns, lambda: self.stop, self._progress,
+                                      self._partial)
         except Exception as exc:              # an unreadable share etc.: say so
             self.error = str(exc)
             listing = []
@@ -335,6 +347,312 @@ def _split(path):
     return (folder + os.sep if folder else ""), name
 
 
+# --- thumbnails -------------------------------------------------------------------------------
+
+THUMB_WIDTH = 256                     # made at this width, shown smaller
+# Files tab columns
+FILE_COLUMNS = ("Name", "Thumbnail", "Size", "PAR", "FPS", "Frames", "Output", "Folder", "Open", "#")
+(COL_NAME, COL_THUMB, COL_SIZE, COL_PAR, COL_FPS, COL_FRAMES, COL_OUTPUT, COL_FOLDER,
+ COL_OPEN, COL_ROW) = range(len(FILE_COLUMNS))
+FILTER_GRACE = 600                    # ms after the last key in a filter field before it filters
+THUMB_GRACE = 250                     # ms after a scroll before the rows on screen get pictures
+THUMB_GRACE_NEW = 1500                # ... after the filter changed what is listed
+THUMB_SIZES = (32, 384, 64)            # the Files tab's thumbnail width: min, max, default
+PROBED_COLUMNS = ("Thumbnail", "Size", "PAR", "FPS")      # filled from the thumbnail run
+
+
+def probe_info(report):
+    """What the files list shows from a preview report: size, pixel aspect and frame rate of
+    the input as vfx-transcode reads it."""
+    words = report.get("keywords") or {}
+    out = report.get("output") or {}
+    width, height = words.get("input_width", ""), words.get("input_height", "")
+    fps = words.get("source_fps_frac") or out.get("source_fps") or ""
+    fps_text = words.get("source_fps_float", "")
+    if fps_text.endswith(".000"):
+        fps_text = fps_text[:-4]
+    first, last = (report.get("input") or {}).get("first_frame"), (report.get("input") or {}).get("last_frame")
+    frames = last - first + 1 if isinstance(first, int) and isinstance(last, int) else 0
+    return {"size": "{}x{}".format(width, height) if width and height else "",
+            "frames": frames,
+            "par": str(words.get("input_par") or (report.get("input") or {}).get("par") or ""),
+            "fps": fps_text or str(fps), "fps_frac": str(fps)}
+
+
+ICON_COLOUR = "#b4b4b4"                # the line icons: grey, like the interface's text
+_LINE_ICONS = {}
+
+
+def _folder_path():
+    path = QPainterPath()                     # the back with its tab, on a 16 x 16 grid
+    path.moveTo(1.5, 12.5)
+    path.lineTo(1.5, 4.0)
+    path.quadTo(1.5, 3.0, 2.5, 3.0)
+    path.lineTo(6.0, 3.0)
+    path.lineTo(7.5, 4.5)
+    path.lineTo(13.5, 4.5)
+    path.quadTo(14.5, 4.5, 14.5, 5.5)
+    path.lineTo(14.5, 12.5)
+    path.quadTo(14.5, 13.5, 13.5, 13.5)
+    path.lineTo(2.5, 13.5)
+    path.quadTo(1.5, 13.5, 1.5, 12.5)
+    path.closeSubpath()
+    path.moveTo(2.0, 7.0)                     # the top of the front flap
+    path.lineTo(14.0, 7.0)
+    return path
+
+
+def _play_path():
+    path = QPainterPath()                     # a triangle pointing right, its corners rounded
+    path.moveTo(4.5, 3.0)                     # by the pen's round joins
+    path.lineTo(13.0, 8.0)
+    path.lineTo(4.5, 13.0)
+    path.closeSubpath()
+    return path
+
+
+def line_icon(kind):
+    """A plain one-colour outline icon, "folder" (Explore) or "play" (Play): grey strokes, no
+    fill (the style's own icons are coloured pictures that sit badly in the rows). Drawn once,
+    at 1x and 2x."""
+    if kind in _LINE_ICONS:
+        return _LINE_ICONS[kind]
+    icon = QIcon()
+    for scale in (1, 2):
+        size = 16 * scale
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.scale(scale, scale)
+        pen = QPen(QColor(ICON_COLOUR))
+        pen.setWidthF(1.3)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(_folder_path() if kind == "folder" else _play_path())
+        painter.end()
+        icon.addPixmap(pixmap)
+    _LINE_ICONS[kind] = icon
+    return icon
+
+
+def folder_icon():
+    return line_icon("folder")
+
+
+def row_icon(style, pixmap):
+    """The icon of a row button: the outline Play / Explore, else the style's own."""
+    if pixmap == QStyle.StandardPixmap.SP_DirOpenIcon:
+        return line_icon("folder")
+    if pixmap == QStyle.StandardPixmap.SP_MediaPlay:
+        return line_icon("play")
+    return style.standardIcon(pixmap)
+
+
+def files_frames(items, thumbs, colour=()):
+    """(frames of the inputs, how many movies have no frame count yet): sequences by their
+    files on disk, movies by what their thumbnail run read."""
+    frames, unknown = 0, 0
+    for media in items:
+        if media.kind != "movie":
+            frames += media.count or 1
+            continue
+        info = thumbs.info(media.path, colour) or {}
+        if info.get("frames"):
+            frames += int(info["frames"])
+        else:
+            unknown += 1
+    return frames, unknown
+
+
+THUMB_SHOW = QSize(96, 54)
+
+
+class Thumbnails(QObject):
+    """Small pictures of the inputs, made lazily by vfx-transcode -preview (no burn-ins, no
+    slate, 256 pixels wide) with the colour options of the super-preset (-ci, -co, -display,
+    -view ...; none = the presets file's default), and kept on disk, keyed by the input's path,
+    modification time and those options. Only what is asked for is made, the newest request
+    first, two at a time; ready(path) when one is done."""
+
+    ready = Signal(str)
+
+    def __init__(self, parent=None, parallel=2):
+        super().__init__(parent)
+        folder = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
+        self.folder = Path(folder or tempfile.gettempdir()) / "thumbnails"
+        self.parallel = parallel
+        self.presets_file = ""
+        self.pixmaps = {}             # (source path, colour) -> QPixmap
+        self.waiting = []             # (source, colour options), the newest last
+        self.running = {}             # (source, colour) -> QProcess
+        self.failed = set()
+        self.stamps = {}              # source -> modification time, read once (a share is slow)
+        self.infos = {}               # (source, colour) -> probe_info read from disk
+
+    def forget_stamps(self):
+        """Read the files' times again (a new scan: they may have changed)."""
+        self.stamps = {}
+        self.infos = {}
+
+    @staticmethod
+    def key(source, colour=()):
+        return source, " ".join(colour or ())
+
+    def file_for(self, source, colour=()):
+        import hashlib
+        stamp = self.stamps.get(source)
+        if stamp is None:
+            try:
+                stamp = os.stat(source).st_mtime_ns
+            except OSError:
+                stamp = 0
+            self.stamps[source] = stamp
+        key = hashlib.sha1("{}|{}|{}|{}".format(os.path.normcase(source), stamp, THUMB_WIDTH,
+                                                "\x1f".join(colour or ())).encode("utf-8")).hexdigest()[:20]
+        return self.folder / (key + ".png")
+
+    def get(self, source, colour=()):
+        """The thumbnail with these colour options if it is made (memory or disk), else None."""
+        key = self.key(source, colour)
+        if key in self.pixmaps:
+            return self.pixmaps[key]
+        path = self.file_for(source, colour)
+        if path.is_file():
+            pixmap = QPixmap(str(path))
+            if not pixmap.isNull():
+                pixmap = pixmap.scaled(THUMB_SHOW, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+                self.pixmaps[key] = pixmap
+                return pixmap
+        return None
+
+    def original(self, source, colour=()):
+        """The thumbnail as made (256 pixels wide), for showing at any size; None if not made."""
+        if self.get(source, colour) is None:
+            return None
+        key = ("full",) + self.key(source, colour)
+        if key not in self.pixmaps:
+            self.pixmaps[key] = QPixmap(str(self.file_for(source, colour)))
+        return self.pixmaps[key]
+
+    def info(self, source, colour=()):
+        """{"size", "par", "fps"} read when its thumbnail was made, or None."""
+        key = self.key(source, colour)
+        if key in self.infos:
+            return self.infos[key]
+        path = self.file_for(source, colour).with_suffix(".info.json")
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        self.infos[key] = info
+        return info
+
+    def request(self, source, colour=()):
+        """Make it, if it isn't made, asked for, being made or failed before."""
+        colour = tuple(colour or ())
+        key = self.key(source, colour)
+        if not source or key in self.running or key in self.failed:
+            return
+        info = self.info(source, colour) if self.get(source, colour) is not None else None
+        if info is not None and ("frames" in info or core.kind_of(source) != "movie"):
+            return                                # made, with its size / pixel aspect / fps
+            # (a movie's frame count too: older thumbnails of movies are made again)
+        self.waiting = [w for w in self.waiting if self.key(*w) != key]
+        self.waiting.append((source, colour))     # the newest first: what is on screen now
+        self._next()
+
+    def _next(self):
+        while self.waiting and len(self.running) < self.parallel:
+            source, colour = self.waiting.pop()
+            key = self.key(source, colour)
+            out = self.file_for(source, colour)
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.failed.add(key)
+                continue
+            cmd = core.vfx_transcode_command() + ["-i", source]
+            if self.presets_file:
+                cmd += ["-presets_file", self.presets_file]
+            cmd += list(colour) + ["-preview", str(out), "-width", str(THUMB_WIDTH),
+                                   "-burn_preset", "none", "-slate", "none", "-oiio_threads", "2"]
+            process = QProcess(self)
+            process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            process.finished.connect(lambda _code, _status, s=source, c=colour: self._finished(s, c))
+            process.errorOccurred.connect(lambda _err, s=source, c=colour: self._finished(s, c))
+            self.running[key] = process
+            process.start(cmd[0], cmd[1:])
+
+    def _finished(self, source, colour):
+        key = self.key(source, colour)
+        process = self.running.pop(key, None)
+        if process is None:
+            return
+        process.deleteLater()
+        if self.get(source, colour) is None:
+            self.failed.add(key)                  # not again this session
+        else:
+            # what vfx-transcode read of the input (its middle frame): kept small for the list
+            out = self.file_for(source, colour)
+            try:
+                report = json.loads(out.with_suffix(".json").read_text(encoding="utf-8"))
+                info = probe_info(report)
+                self.infos[key] = info
+                out.with_suffix(".info.json").write_text(json.dumps(info), encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+            self.ready.emit(source)
+            # the preview's side files are not needed
+            for extra in (out.with_suffix(".json"), out.with_name(out.stem + "_slate.png")):
+                try:
+                    extra.unlink()
+                except OSError:
+                    pass
+        self._next()
+
+    def forget_waiting(self):
+        """Drop what was asked for but not started (the list changed)."""
+        self.waiting = []
+
+    def stop(self):
+        self.waiting = []
+        for process in list(self.running.values()):
+            process.kill()
+
+
+def visible_items(view, items):
+    """The tree / list items (in order) whose rows are on screen."""
+    area = view.viewport().rect()
+    out = []
+    for item in items:
+        if item is None or item.isHidden():
+            continue
+        rect = view.visualItemRect(item)
+        if rect.isValid() and rect.intersects(area):
+            out.append(item)
+    return out
+
+
+class FilesView(QTreeWidget):
+    """The Files tab's list: several rows can be selected (Ctrl / Shift), and a click on the
+    only selected row selects nothing again."""
+
+    def mousePressEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        plain = event.modifiers() == Qt.KeyboardModifier.NoModifier
+        if (plain and event.button() == Qt.MouseButton.LeftButton and item is not None
+                and item.isSelected() and len(self.selectedItems()) == 1):
+            self.clearSelection()
+            self.setCurrentItem(None)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class JobWidget(QFrame):
     """A job in the queue:
         preset                                    added date and time
@@ -384,6 +702,12 @@ class JobWidget(QFrame):
                 grid.addWidget(widget, row, col)
         grid.setColumnStretch(1, 2)            # the path
         grid.setColumnStretch(2, 3)            # the file name gets more room
+        self.thumb = QLabel()
+        self.thumb.setFixedSize(THUMB_SHOW)
+        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb.setStyleSheet("background: #1e1e20; border: 1px solid #3a3a3e;")
+        self.thumb.setToolTip("The source (made in the background by vfx-transcode)")
+        grid.addWidget(self.thumb, 0, 5, 4, 1)
 
         self.status = QLabel()
         self.status.setMinimumWidth(90)
@@ -403,7 +727,7 @@ class JobWidget(QFrame):
 
     def _button(self, style, pixmap, tip):
         button = QToolButton()
-        button.setIcon(style.standardIcon(pixmap))
+        button.setIcon(row_icon(style, pixmap))
         button.setToolTip(tip)
         button.setAutoRaise(True)
         return button
@@ -557,12 +881,24 @@ class ProcessWindow(QMainWindow):
         self.paused = True
         self.queue_dirty = False
         self.rows = {}                        # job id -> JobWidget
+        self.thumbs = Thumbnails(self)        # pictures of the inputs, made on demand
+        self.thumbs.presets_file = presets_file
+        self.thumbs.ready.connect(self._thumbnail_ready)
+        self.thumb_timer = QTimer(self)       # ask for the rows on screen, once things settle
+        self.thumb_timer.setSingleShot(True)
+        self.thumb_timer.setInterval(THUMB_GRACE)
+        self.rows_timer = QTimer(self)        # the Play / Explore buttons of the rows on screen
+        self.rows_timer.setSingleShot(True)
+        self.rows_timer.setInterval(30)
+        self.rows_timer.timeout.connect(self._fill_open_buttons)
+        self.thumb_timer.timeout.connect(self._request_thumbnails)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         process_page, queue_page = QWidget(), QWidget()
         self.tabs.addTab(process_page, "Process")
         self.tabs.addTab(queue_page, "Queue")
+        self.tabs.currentChanged.connect(lambda _i: self.thumb_timer.start())
         self._build_process(process_page)
         self._build_queue(queue_page)
         self._load_presets()
@@ -621,25 +957,15 @@ class ProcessWindow(QMainWindow):
         add_folder = QPushButton("Add Folder")
         add_folder.setToolTip('Pick a folder: it is searched (with its subfolders) for media matching the filter')
         add_folder.clicked.connect(self.pick_folder)
-        self.patterns = QLineEdit(core.DEFAULT_PATTERNS)
-        self.patterns.setMaximumWidth(170)
-        self.patterns.setToolTip("What Add Folder looks for, in the folder and all sub-folders: file "
-                                 "name wildcards, e.g. *.exr  *.mov *.mp4  *beauty*.exr\n"
-                                 "! leaves files out: *.exr !*tech*\n"
-                                 "Image sequences count as one input. Picking a preset sets it to the "
-                                 "preset's input type.\nA folder is scanned once: changing this "
-                                 "filters again without scanning.")
-        for widget in (add_file, add_folder, self.patterns):
+        for widget in (add_file, add_folder):
             row.addWidget(widget)
-        self.filter_timer = QTimer(self)
-        self.filter_timer.setSingleShot(True)
-        self.filter_timer.setInterval(400)
-        self.filter_timer.timeout.connect(self._refilter)
-        self.patterns.textChanged.connect(lambda _t: self.filter_timer.start())
         layout.addWidget(box)
 
-        box = QGroupBox("Preset")
-        row = QHBoxLayout(box)
+        # Presets and Files, as two tabs
+        self.middle_tabs = QTabWidget()
+        presets_page = QWidget()
+        row = QHBoxLayout(presets_page)
+        row.setContentsMargins(4, 4, 4, 4)
         self.preset_list = QListWidget()
         self.preset_list.setToolTip('The super-presets made in the tuner; the panel beside it says what the selected one makes and whether it fits the source')
         # picked by the user (click or keys); refills block the signal and keep the fields
@@ -652,7 +978,10 @@ class ProcessWindow(QMainWindow):
         self.preset_info.setMargin(8)
         self.preset_info.setStyleSheet("background: #2a2a2d; border: 1px solid #4a4a4e;")
         row.addWidget(self.preset_info, 1)
-        layout.addWidget(box, 1)
+        self.middle_tabs.addTab(presets_page, "Presets")
+        self.middle_tabs.addTab(self._build_files(), "Files")
+        self.middle_tabs.currentChanged.connect(lambda _i: self.thumb_timer.start())
+        layout.addWidget(self.middle_tabs, 1)
 
         self._build_interpretation(layout)
 
@@ -1005,6 +1334,7 @@ class ProcessWindow(QMainWindow):
         if not hasattr(self, "preset_list"):
             return                            # still building the window
         self._show_custom_fields()
+        self._fill_file_outputs()
         spec = self.output_spec()
         entry = self.super_presets.get(self._preset_name())
         if not self.items or entry is None:
@@ -1051,6 +1381,8 @@ class ProcessWindow(QMainWindow):
         """Files: their sequences or movies. Folders: scanned (in the background, once; Add
         Folder again scans again) and filtered with the pattern field."""
         self._stop_scan()
+        self.thumbs.forget_stamps()                   # the files may have changed since
+        self.files_selected = set()                   # nothing selected: all are processed
         self.files, self.folders, problems = [], [], []
         for path in paths:
             if os.path.isdir(path):
@@ -1073,6 +1405,475 @@ class ProcessWindow(QMainWindow):
         self._scan_next()
         self._refilter()
 
+    # Files tab: what the folder scan found, filtered
+
+    def _build_files(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(4, 4, 4, 4)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Names:"))
+        self.patterns = QLineEdit(core.DEFAULT_PATTERNS)
+        self.patterns.setToolTip("Which files of the scanned folders to process: words separated by "
+                                 "spaces, matched against the file name (any case), ALL of them: "
+                                 "*.exr beauty v003 = EXR files with beauty and v003 in the name. "
+                                 "File types (*.exr *.mov *.mp4) are alternatives: any of them. "
+                                 "With wildcards a word matches the whole name (*beauty*.exr); a "
+                                 "plain word matches anywhere in it. ! leaves names out: *.exr !tech\n"
+                                 "Picking a preset sets it to the preset's input type. A folder is "
+                                 "scanned once: changing this filters again without scanning.")
+        row.addWidget(self.patterns, 2)
+        row.addWidget(QLabel("Leave out:"))
+        self.leave_out = QLineEdit()
+        self.leave_out.setPlaceholderText("words matched against the whole path")
+        self.leave_out.setToolTip("Leaves out files whose whole path matches one of these words "
+                                  "(separated by spaces, any case): a plain word anywhere in the "
+                                  "path (old, _tmp), or wildcards over the whole path "
+                                  "(*/old/*, */wip_*)")
+        row.addWidget(self.leave_out, 2)
+        row.addWidget(QLabel("Thumbnails:"))
+        self.thumb_size = QSlider(Qt.Orientation.Horizontal)
+        self.thumb_size.setRange(THUMB_SIZES[0], THUMB_SIZES[1])
+        self.thumb_size.setValue(THUMB_SIZES[2])
+        self.thumb_size.setFixedWidth(110)
+        self.thumb_size.setToolTip("How big the thumbnails are shown (they are made 256 pixels wide; "
+                                   "bigger is scaled up)")
+        self.thumb_size.valueChanged.connect(self._thumb_size_changed)
+        row.addWidget(self.thumb_size)
+        self.files_tree = QCheckBox("Tree")
+        self.files_tree.setChecked(True)
+        self.files_tree.setToolTip("On: the files in their folders (below the scanned folder). Off: "
+                                   "one flat list, with each file's folder")
+        self.files_tree.toggled.connect(lambda _on: self._fill_files())
+        row.addWidget(self.files_tree)
+        self.files_expand = QPushButton("Unfold")
+        self.files_expand.setToolTip("Open every folder of the tree")
+        self.files_expand.clicked.connect(self._unfold_all)
+        self.files_collapse = QPushButton("Fold")
+        self.files_collapse.setToolTip("Close every folder of the tree")
+        self.files_collapse.clicked.connect(self._fold_all)
+        row.addWidget(self.files_expand)
+        row.addWidget(self.files_collapse)
+        col.addLayout(row)
+        self.files_view = FilesView()
+        self.files_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.files_selected = set()                # normcase paths of the selected inputs
+        self._files_filling = False
+        self.files_view.itemSelectionChanged.connect(self._files_selection_changed)
+        self.files_view.setColumnCount(len(self.FILE_COLUMNS))
+        self.files_view.setHeaderLabels(list(self.FILE_COLUMNS))
+        # the thumbnail shown first (left), the tree's folders and arrows stay in Name; the
+        # Play / Explore buttons right after the name
+        header = self.files_view.header()
+        header.moveSection(header.visualIndex(COL_THUMB), 0)
+        header.moveSection(header.visualIndex(COL_OPEN), header.visualIndex(COL_NAME) + 1)
+        header.moveSection(header.visualIndex(COL_ROW), 0)          # the row number before all
+        self.files_view.setTreePosition(COL_NAME)
+        self.files_view.setToolTip("The media the jobs are made for: picked files, and what the scan of "
+                              "the folders found with these filters (image sequences as one item)")
+        self.files_view.setUniformRowHeights(True)
+        self.files_view.setIconSize(QSize(THUMB_SIZES[2], THUMB_SIZES[2] * 9 // 16))
+        self.files_view.verticalScrollBar().valueChanged.connect(self._files_scrolled)
+        self.files_folded = set()                  # folder rows the user folded (kept on refill)
+        self.files_view.itemExpanded.connect(self._folder_unfolded)
+        self.files_view.itemCollapsed.connect(self._folder_folded)
+        self.files_hidden = set()                  # columns the user hid (right-click the header)
+        header = self.files_view.header()
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._files_columns_menu)
+        header.setToolTip("Right-click to show or hide columns")
+        self.files_view.setAlternatingRowColors(True)
+        col.addWidget(self.files_view, 1)
+        self.files_count = QLabel("")
+        self.files_count.setStyleSheet("color: #8a8a8a;")
+        col.addWidget(self.files_count)
+        self.filter_timer = QTimer(self)
+        self.filter_timer.setSingleShot(True)
+        self.filter_timer.setInterval(FILTER_GRACE)   # once the typing stops
+        self.filter_timer.timeout.connect(self._filter_typed)
+        self.patterns.textChanged.connect(lambda _t: self.filter_timer.start())
+        self.leave_out.textChanged.connect(lambda _t: self.filter_timer.start())
+        return page
+
+    def _fill_files(self, thumb_grace=THUMB_GRACE):
+        """The Files tab from self.items: a tree below each scanned folder (picked files on
+        their own), or a flat list. thumb_grace: ms before the rows on screen get their
+        pictures (longer after a filter change: the filter may still be changing)."""
+        if not hasattr(self, "files"):
+            return
+        tree = self.files_tree.isChecked()
+        scroll = self.files_view.verticalScrollBar().value()   # kept while a scan refills
+        self._files_filling = True                 # the selection is put back below
+        self.files_view.clear()
+        self.files_view.setRootIsDecorated(tree)
+        self._apply_file_columns()
+        self.file_leaves = []
+        self.files_expand.setEnabled(tree)
+        self.files_collapse.setEnabled(tree)
+        nodes = {}
+
+        def node(key, text, parent):
+            if key not in nodes:
+                item = QTreeWidgetItem([text] + [""] * (len(self.FILE_COLUMNS) - 1))
+                item.setData(COL_NAME, Qt.ItemDataRole.UserRole, repr(key))
+                item.setToolTip(0, key[-1] if isinstance(key, tuple) else text)
+                font = item.font(0)
+                font.setBold(True)
+                item.setFont(0, font)
+                if parent is None:
+                    self.files_view.addTopLevelItem(item)
+                else:
+                    parent.addChild(item)
+                nodes[key] = item
+            return nodes[key]
+
+        colour = self._files_colour()
+        right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        for number, media in enumerate(self.items, 1):
+            texts = [""] * len(self.FILE_COLUMNS)
+            texts[COL_NAME], texts[COL_FRAMES], texts[COL_FOLDER] = media.pattern, media.describe(), media.folder
+            texts[COL_ROW] = str(number)
+            leaf = QTreeWidgetItem(texts)
+            leaf.setTextAlignment(COL_ROW, right)
+            leaf.setForeground(COL_ROW, _brush("#8a8a8a"))
+            self._set_probed(leaf, self.thumbs.info(media.path, colour), media)
+            leaf.setToolTip(0, media.path)
+            leaf.setToolTip(COL_FOLDER, media.folder)
+            self._set_thumb(leaf, media.path, colour)
+            self.file_leaves.append(leaf)
+            if not tree:
+                self.files_view.addTopLevelItem(leaf)
+                continue
+            if media.base_folder:
+                top = node(("base", media.base_folder), media.base_folder, None)
+                rel = os.path.relpath(media.folder, media.base_folder)
+                parent, path = top, media.base_folder
+                for part in ([] if rel in (".", "") else rel.replace("\\", "/").split("/")):
+                    path = os.path.join(path, part)
+                    parent = node(("dir", path), part, parent)
+            else:
+                parent = node(("picked",), "Picked files", None)
+            parent.addChild(leaf)
+        self.open_buttons = set()                  # leaves with their buttons (made when shown)
+        self._fill_file_outputs()
+        self.thumbs.forget_waiting()
+        self.thumb_timer.start(thumb_grace)
+        self.rows_timer.start()
+        if tree:
+            self.files_view.blockSignals(True)
+            self.files_view.expandAll()
+            for key, item in nodes.items():       # folders the user folded stay folded
+                if repr(key) in self.files_folded:
+                    item.setExpanded(False)
+            self.files_view.blockSignals(False)
+        keep = self.files_selected                 # what the user selected, if still listed
+        self.files_selected = set()
+        for leaf, media in zip(self.file_leaves, self.items):
+            if os.path.normcase(media.path) in keep:
+                leaf.setSelected(True)
+                self.files_selected.add(os.path.normcase(media.path))
+        # no current row either: Qt would otherwise select it at the first key press or focus
+        self.files_view.selectionModel().setCurrentIndex(
+            QModelIndex(), QItemSelectionModel.SelectionFlag.NoUpdate)
+        self._files_filling = False
+        self._show_selected_count()
+        for column in range(len(self.FILE_COLUMNS)):
+            self.files_view.resizeColumnToContents(column)
+        self.files_view.header().resizeSection(COL_OPEN, 62)     # the two buttons
+        QTimer.singleShot(0, lambda v=scroll: self.files_view.verticalScrollBar().setValue(v))
+        self._show_files_count()
+
+    def _leaves_below(self, item):
+        out, todo = [], [item]
+        while todo:
+            node = todo.pop()
+            if node.childCount() == 0:
+                out.append(node)
+            todo.extend(node.child(i) for i in range(node.childCount()))
+        return out
+
+    def selected_inputs(self):
+        """The inputs of the selected rows (a selected folder row: all inputs below it), in
+        list order; [] when nothing is selected."""
+        if not hasattr(self, "files_view"):
+            return []
+        chosen = set()
+        for item in self.files_view.selectedItems():
+            chosen.update(id(leaf) for leaf in self._leaves_below(item))
+        return [media for leaf, media in zip(getattr(self, "file_leaves", []), self.items)
+                if id(leaf) in chosen]
+
+    def inputs_to_submit(self):
+        """What Process / Add to Queue send: the selected rows, or all when none are."""
+        return self.selected_inputs() or list(self.items)
+
+    def _files_selection_changed(self):
+        if self._files_filling:
+            return
+        self.files_selected = {os.path.normcase(m.path) for m in self.selected_inputs()}
+        self._show_selected_count()
+
+    def _show_selected_count(self):
+        """ "Add to Queue [3]" while 3 inputs are selected; the plain names when none are."""
+        n = len(self.files_selected)
+        for button, text, what in ((getattr(self, "go_button", None), "Process", "process"),
+                                   (getattr(self, "queue_button", None), "Add to Queue", "queue")):
+            if button is None:
+                continue
+            button.setText("{} [{}]".format(text, n) if n else text)
+            button.setToolTip(
+                ("Only the {} input{} selected on the Files tab ({} all: select nothing - click the "
+                 "selected row again, or Ctrl+click)").format(n, "" if n == 1 else "s", what)
+                if n else ("Add the jobs to the queue and start it now" if what == "process" else
+                           "Add the jobs to the queue without starting it (Queue tab: Start, or "
+                           "Send to Deadline)") + ": every input listed, or only the rows "
+                           "selected on the Files tab")
+
+    def _show_files_count(self):
+        """ "28 inputs - 1,234 frames  (from 1,000 media files ...)"; movies not probed yet
+        add a + (their frame count comes with their thumbnail)."""
+        n = len(self.items)
+        frames, unknown = files_frames(self.items, self.thumbs, self._files_colour())
+        scanned = sum(len(names) for f in self.folders for _d, names in self.listings.get(f, []))
+        text = "{:,} input{}".format(n, "" if n == 1 else "s")
+        if n:
+            text += " - {:,}{} frame{}".format(frames, "+" if unknown else "", "" if frames == 1 else "s")
+        if self.folders:
+            text += "  (from {:,} media files in the scanned folders)".format(scanned)
+        self.files_count.setText(text)
+        self.files_count.setToolTip(
+            "{} movie{} not read yet: their frames are counted once their thumbnails are made".format(
+                unknown, "" if unknown == 1 else "s") if unknown else "")
+
+    FILE_COLUMNS = FILE_COLUMNS
+
+    def _apply_file_columns(self):
+        """Hide the columns the user hid; Folder also in the tree (the tree shows it)."""
+        tree = self.files_tree.isChecked()
+        for column, title in enumerate(self.FILE_COLUMNS):
+            hidden = title in self.files_hidden or (title == "Folder" and tree)
+            self.files_view.setColumnHidden(column, hidden and column > 0)
+
+    def _files_columns_menu(self, pos):
+        menu = QMenu(self)
+        for title in self.FILE_COLUMNS[1:]:          # Name always stays
+            action = menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(title not in self.files_hidden)
+            if title == "Folder" and self.files_tree.isChecked():
+                action.setEnabled(False)
+                action.setText("Folder (in the flat list)")
+            action.toggled.connect(lambda on, t=title: self._toggle_file_column(t, on))
+        menu.exec(self.files_view.header().mapToGlobal(pos))
+
+    def _toggle_file_column(self, title, shown):
+        if shown:
+            self.files_hidden.discard(title)
+        else:
+            self.files_hidden.add(title)
+        self._apply_file_columns()
+        for column in range(len(self.FILE_COLUMNS)):
+            self.files_view.resizeColumnToContents(column)
+        self.files_view.header().resizeSection(COL_OPEN, 62)
+        self.thumb_timer.start()
+
+    def _fold_all(self):
+        """Fold every folder (and keep them folded while a scan adds files)."""
+        stack = [self.files_view.topLevelItem(i) for i in range(self.files_view.topLevelItemCount())]
+        while stack:
+            item = stack.pop()
+            key = item.data(COL_NAME, Qt.ItemDataRole.UserRole)
+            if key:
+                self.files_folded.add(key)
+            stack += [item.child(i) for i in range(item.childCount())]
+        self.files_view.collapseAll()
+
+    def _unfold_all(self):
+        self.files_folded.clear()
+        self.files_view.expandAll()
+
+    def _folder_unfolded(self, item):
+        self.files_folded.discard(item.data(COL_NAME, Qt.ItemDataRole.UserRole))
+        self.thumb_timer.start()
+
+    def _folder_folded(self, item):
+        key = item.data(COL_NAME, Qt.ItemDataRole.UserRole)
+        if key:
+            self.files_folded.add(key)
+
+    def _fill_file_outputs(self):
+        """The Output column: the file each input makes with the selected super-preset and
+        the destination (keywords known before the run filled in). Red: two inputs make the
+        same file, or the output would write over its input."""
+        leaves = getattr(self, "file_leaves", [])
+        if not leaves or len(leaves) != len(self.items):
+            return
+        entry = self.super_presets.get(self._preset_name()) if hasattr(self, "preset_list") else None
+        if entry is None:
+            for leaf in leaves:
+                leaf.setText(COL_OUTPUT, "")
+                leaf.setToolTip(COL_OUTPUT, "Pick a super-preset on the Presets tab")
+            return
+        spec = self.output_spec()
+        output_type, ext, _issues = core.output_of(entry, self.presets)
+        custom = self._custom()
+        outputs = []
+        for media in self.items:
+            try:
+                outputs.append(core.predict_output(media, spec, output_type, ext, custom))
+            except Exception as exc:              # a keyword that can't be filled yet
+                outputs.append("? " + str(exc))
+        seen = {}
+        for out in outputs:
+            key = os.path.normcase(out)
+            seen[key] = seen.get(key, 0) + 1
+        clash = QBrush(QColor("#e07070"))
+        for leaf, media, out in zip(leaves, self.items, outputs):
+            leaf.setText(COL_OUTPUT, os.path.basename(out) or out)
+            tip = out
+            if seen[os.path.normcase(out)] > 1:
+                tip += "\nThe same output as another input: one would overwrite the other."
+            elif core.overwrites_input(media, out):
+                tip += "\nThis would write over the input."
+            else:
+                leaf.setData(COL_OUTPUT, Qt.ItemDataRole.ForegroundRole, None)
+                leaf.setToolTip(COL_OUTPUT, tip)
+                continue
+            leaf.setForeground(COL_OUTPUT, clash)
+            leaf.setToolTip(COL_OUTPUT, tip)
+        self.files_view.resizeColumnToContents(COL_OUTPUT)
+
+    # thumbnails, made for what is on screen
+
+    def _files_scrolled(self, _value=0):
+        self.rows_timer.start()
+        self.thumb_timer.start()
+
+    def _fill_open_buttons(self):
+        """The Play / Explore buttons, made only for the rows on screen (thousands of rows
+        would take long to make all at once)."""
+        leaves = getattr(self, "file_leaves", [])
+        if not leaves or len(leaves) != len(self.items):
+            return
+        index = {id(leaf): media for leaf, media in zip(leaves, self.items)}
+        for leaf in visible_items(self.files_view, leaves):
+            if id(leaf) not in self.open_buttons:
+                self.open_buttons.add(id(leaf))
+                self.files_view.setItemWidget(leaf, COL_OPEN, self._open_buttons(index[id(leaf)].path))
+
+    def _filter_typed(self):
+        """A filter field changed and the typing stopped: filter again; the new rows get their
+        pictures a little later (the filter may change again)."""
+        self._refilter(thumb_grace=THUMB_GRACE_NEW)
+
+    def _request_thumbnails(self):
+        self.thumb_timer.setInterval(THUMB_GRACE)
+        if hasattr(self, "open_buttons"):
+            self._fill_open_buttons()                 # rows shown by unfolding, resizing ...
+        page = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+        if page is None:
+            return
+        if self.tabs.currentIndex() == 0 and self.middle_tabs.currentIndex() == 1:
+            if all(title in self.files_hidden for title in PROBED_COLUMNS):
+                return                            # nothing shown needs the thumbnail run
+            leaves = visible_items(self.files_view, getattr(self, "file_leaves", []))
+            index = {id(leaf): media for leaf, media in zip(self.file_leaves, self.items)}
+            colour = self._files_colour()
+            for leaf in reversed(leaves):         # the top of the view first (newest first)
+                media = index.get(id(leaf))
+                if media is not None:
+                    self.thumbs.request(media.path, colour)
+        elif self.tabs.currentIndex() == 1:
+            items = [self.queue_list.item(i) for i in range(self.queue_list.count())]
+            for item in reversed(visible_items(self.queue_list, items)):
+                job = self._job(item.data(Qt.ItemDataRole.UserRole))
+                if job is not None:
+                    self.thumbs.request(job.input, core.colour_args(job.super_args))
+
+    def _set_thumb(self, leaf, source, colour):
+        """The input's thumbnail at the slider's size (scaled from the 256-pixel one)."""
+        pixmap = self.thumbs.original(source, colour)
+        if pixmap is None or pixmap.isNull():
+            leaf.setIcon(COL_THUMB, QIcon())
+            return
+        size = self.files_view.iconSize()
+        leaf.setIcon(COL_THUMB, QIcon(pixmap.scaled(size, Qt.AspectRatioMode.KeepAspectRatio,
+                                                    Qt.TransformationMode.SmoothTransformation)))
+
+    def _thumb_size_changed(self, width):
+        self.files_view.setIconSize(QSize(width, width * 9 // 16))
+        colour = self._files_colour()
+        for leaf, media in zip(getattr(self, "file_leaves", []), self.items):
+            self._set_thumb(leaf, media.path, colour)
+        self.files_view.resizeColumnToContents(COL_THUMB)
+        self.thumb_timer.start()                  # more rows may fit on screen, or fewer
+
+    def _open_buttons(self, path):
+        """Play and Explore for a row of the Files tab, as in the queue."""
+        box = QWidget()
+        box.setStyleSheet("background: transparent;")
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(2)
+        style = self.style()
+        for icon, tip, slot in ((QStyle.StandardPixmap.SP_MediaPlay, "Open the source", lambda: _open(path)),
+                                (QStyle.StandardPixmap.SP_DirOpenIcon, "Show the source in the file browser",
+                                 lambda: core.reveal(path))):
+            button = QToolButton()
+            button.setIcon(row_icon(style, icon))
+            button.setToolTip(tip)
+            button.setAutoRaise(True)
+            button.clicked.connect(slot)
+            lay.addWidget(button)
+        lay.addStretch(1)
+        return box
+
+    @staticmethod
+    def _set_probed(leaf, info, media=None):
+        """Size, pixel aspect and frame rate of an input, from its thumbnail run (and a
+        movie's frame count)."""
+        info = info or {}
+        if media is not None and media.kind == "movie" and info.get("frames"):
+            leaf.setText(COL_FRAMES, "movie, {:,} frames".format(info["frames"]))
+        leaf.setText(COL_SIZE, info.get("size", ""))
+        leaf.setText(COL_PAR, info.get("par", ""))
+        leaf.setText(COL_FPS, info.get("fps", ""))
+        if info.get("fps_frac"):
+            leaf.setToolTip(COL_FPS, info["fps_frac"])
+
+    def _files_colour(self):
+        """The selected super-preset's colour options, for the Files tab's pictures."""
+        entry = self.super_presets.get(self._preset_name()) if hasattr(self, "preset_list") else None
+        return tuple(core.preset_colour_args(entry))
+
+    def _refresh_file_thumbs(self):
+        """Another super-preset: the Files tab's pictures in its colour (made if needed)."""
+        colour = self._files_colour()
+        for leaf, media in zip(getattr(self, "file_leaves", []), self.items):
+            pixmap = self.thumbs.get(media.path, colour)
+            self._set_thumb(leaf, media.path, colour)
+            self._set_probed(leaf, self.thumbs.info(media.path, colour), media)
+        self.thumbs.forget_waiting()
+        self.thumb_timer.start()
+
+    def _thumbnail_ready(self, source):
+        colour = self._files_colour()
+        pixmap = self.thumbs.get(source, colour)
+        if pixmap is not None:
+            for leaf, media in zip(getattr(self, "file_leaves", []), self.items):
+                if media.path == source:
+                    self._set_thumb(leaf, source, colour)
+                    self._set_probed(leaf, self.thumbs.info(source, colour), media)
+                    if media.kind == "movie":
+                        self._show_files_count()      # its frames are known now
+            for column in (COL_SIZE, COL_PAR, COL_FPS):
+                self.files_view.resizeColumnToContents(column)
+        for job in self.jobs:
+            if job.input == source and job.id in self.rows:
+                pixmap = self.thumbs.get(source, core.colour_args(job.super_args))
+                if pixmap is not None:
+                    self.rows[job.id].thumb.setPixmap(pixmap)
+
     def _stop_scan(self):
         self.to_scan = []
         if self.scanner is not None:
@@ -1086,6 +1887,7 @@ class ProcessWindow(QMainWindow):
         folder = self.to_scan.pop(0)
         self.scanner = Scanner(folder, self.patterns.text(), self)
         self.scanner.progressed.connect(self._scan_progress)
+        self.scanner.found_more.connect(self._scan_partial)
         self.scanner.listed.connect(self._scan_done)
         self.statusBar().showMessage("Scanning {} ...".format(folder))
         self.scanner.start()
@@ -1093,6 +1895,16 @@ class ProcessWindow(QMainWindow):
     def _scan_progress(self, folder, scanned, found):
         self.statusBar().showMessage("Scanning {}:  {:,} files scanned, {:,} media found".format(
             folder, scanned, found))
+
+    def _scan_partial(self, folder, listing):
+        """What the running scan found so far: shown (and filtered) at once."""
+        if self.scanner is None or self.scanner.stop:
+            return
+        self.listings[folder] = listing
+        start = time.time()
+        self._refilter()
+        # a big listing takes a while to show: refill less often, so the scan isn't held up
+        self.scanner.partial_every = max(0.8, 5 * (time.time() - start))
 
     def _scan_done(self, folder, listing):
         scanner = self.scanner
@@ -1106,17 +1918,19 @@ class ProcessWindow(QMainWindow):
         self._refilter()
         self._scan_next()
 
-    def _refilter(self):
+    def _refilter(self, thumb_grace=THUMB_GRACE):
         """The inputs: the picked files, and what the pattern field finds in the folders'
         listings (no new scan)."""
         items = list(self.files)
         known = {os.path.normcase(i.path) for i in items}
         for folder in self.folders:
-            for item in core.filter_listing(self.listings.get(folder, []), self.patterns.text(), folder):
+            for item in core.filter_listing(self.listings.get(folder, []), self.patterns.text(), folder,
+                                            self.leave_out.text()):
                 if os.path.normcase(item.path) not in known:
                     known.add(os.path.normcase(item.path))
                     items.append(item)
         self.items = items
+        self._fill_files(thumb_grace)
         self._inputs_changed()
 
     def _inputs_changed(self):
@@ -1193,6 +2007,7 @@ class ProcessWindow(QMainWindow):
                 self.patterns.setText(patterns)          # filters again, no new scan
         self._apply_preset_destination(force=True)
         self._super_changed()
+        self._refresh_file_thumbs()            # the pictures in this preset's colour
 
     def _super_changed(self, *_args):
         name = self._preset_name()
@@ -1238,6 +2053,7 @@ class ProcessWindow(QMainWindow):
         if not self.items:
             QMessageBox.information(self, "Process", "Add a file or a folder first.")
             return
+        inputs = self.inputs_to_submit()          # the selected rows, or all of them
         name = self._preset_name()
         entry = self.super_presets.get(name)
         if entry is None:
@@ -1254,7 +2070,7 @@ class ProcessWindow(QMainWindow):
             self.interp_toggle.setChecked(True)
             QMessageBox.information(self, "Process", "Tweaks:\n" + "\n".join(bad))
             return
-        jobs, problems = core.make_jobs(self.items, name, entry, self.output_spec(), self.presets,
+        jobs, problems = core.make_jobs(inputs, name, entry, self.output_spec(), self.presets,
                                         custom=self._custom(), dest=self._destination(),
                                         interpret=interpret,
                                         presets_file=self.presets_file,
@@ -1352,6 +2168,7 @@ class ProcessWindow(QMainWindow):
         self.queue_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.queue_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.queue_list.setSpacing(1)
+        self.queue_list.verticalScrollBar().valueChanged.connect(lambda _v: self.thumb_timer.start())
         self.queue_list.itemSelectionChanged.connect(self._show_job_log)
         split.addWidget(self.queue_list)
 
@@ -1392,7 +2209,11 @@ class ProcessWindow(QMainWindow):
             item.setSelected(job.id in selected)
             self.rows[job.id] = widget
             self._update_row(job)
+            pixmap = self.thumbs.get(job.input, core.colour_args(job.super_args))
+            if pixmap is not None:
+                widget.thumb.setPixmap(pixmap)
         self._apply_hide_done()
+        self.thumb_timer.start()
         self._update_summary()
 
     def _apply_hide_done(self):
@@ -1838,6 +2659,11 @@ class ProcessWindow(QMainWindow):
     def _restore_settings(self):
         state = _json_setting("process", {})
         self.patterns.setText(state.get("patterns", core.DEFAULT_PATTERNS))
+        self.leave_out.setText(state.get("leave_out", ""))
+        self.files_tree.setChecked(bool(state.get("files_tree", True)))
+        self.files_hidden = set(state.get("files_hidden", []))
+        self.thumb_size.setValue(int(state.get("thumb_size", THUMB_SIZES[2])))
+        self._apply_file_columns()
         # the selected super-preset's destination is in the fields already; last session's
         # path and name come back only when they were the user's own (for this same preset)
         preset_dest = core.destination_of(self.super_presets.get(self._preset_name()))
@@ -1869,7 +2695,10 @@ class ProcessWindow(QMainWindow):
 
     def _save_settings(self):
         _set_json_setting("process", {
-            "patterns": self.patterns.text(), "path": self.out_path.text(), "name": self.out_name.text(),
+            "patterns": self.patterns.text(), "leave_out": self.leave_out.text(),
+            "files_tree": self.files_tree.isChecked(), "files_hidden": sorted(self.files_hidden),
+            "thumb_size": self.thumb_size.value(),
+            "path": self.out_path.text(), "name": self.out_name.text(),
             "path_preset": self.path_preset.currentText(), "name_preset": self.name_preset.currentText(),
             "play": self.play_after.isChecked(), "explore": self.explore_after.isChecked(),
             "custom_path": self.custom_path.text(), "custom_name": self.custom_name.text(),
@@ -1888,6 +2717,7 @@ class ProcessWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_scan()
+        self.thumbs.stop()
         if self.running:
             answer = QMessageBox.question(
                 self, "Quit", "{} job(s) are running. Stop them and quit? They run again next "

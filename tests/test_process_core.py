@@ -811,3 +811,110 @@ class FarmCheckTests(unittest.TestCase):
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         s = core.DeadlineSettings(command=str(script))
         self.assertEqual(core.deadline_job_status(s, "abc"), "completed")
+
+
+class FilesFilterTests(unittest.TestCase):
+    LISTING = [("/proj/shots/sh010/comp", ["sh010_beauty.0001.exr", "sh010_beauty.0002.exr",
+                                           "sh010_tech.0001.exr"]),
+               ("/proj/shots/old", ["sh005_beauty.0001.exr"]),
+               ("/proj/shots/sh020", ["sh020.mov"])]
+
+    def names(self, patterns, leave_out=""):
+        return sorted(i.pattern for i in core.filter_listing(self.LISTING, patterns, "/proj/shots", leave_out))
+
+    def test_plain_word_matches_in_name(self):
+        self.assertEqual(self.names("beauty"), ["sh005_beauty.####.exr", "sh010_beauty.####.exr"])
+        self.assertEqual(self.names("*.exr !tech"), ["sh005_beauty.####.exr", "sh010_beauty.####.exr"])
+
+    def test_leave_out_whole_path(self):
+        self.assertEqual(self.names("*.exr *.mov", "*/old/*"),
+                         ["sh010_beauty.####.exr", "sh010_tech.####.exr", "sh020.mov"])
+        self.assertEqual(self.names("*.exr *.mov", "OLD sh020"),
+                         ["sh010_beauty.####.exr", "sh010_tech.####.exr"])
+        self.assertTrue(core.path_excluded("D:\\\\proj\\\\old\\\\a.exr", ["*/old/*"]))
+
+
+class ThumbnailColourTests(unittest.TestCase):
+    def test_colour_args(self):
+        args = ["-preset", "h264", "-ci", "ACEScg", "-co", "Output - Rec.709", "-view", "Film",
+                "-burn_preset", "none", "-looks", ""]
+        self.assertEqual(core.colour_args(args), ["-ci", "ACEScg", "-co", "Output - Rec.709",
+                                                  "-view", "Film", "-looks", ""])
+        self.assertEqual(core.colour_args([]), [])
+        entry = {"areas": {"colour": {"state": {}, "args": ["-ci", "ACEScg", "-co", "sRGB"]},
+                           "encode": {"state": {}, "args": ["-preset", "h264"]}}}
+        self.assertEqual(core.preset_colour_args(entry), ["-ci", "ACEScg", "-co", "sRGB"])
+        self.assertEqual(core.preset_colour_args(None), [])
+
+
+class PartialScanTests(unittest.TestCase):
+    def test_partial_listing_grows(self):
+        import tempfile
+        root = Path(tempfile.mkdtemp())
+        for sub in ("a", "b", "c"):
+            (root / sub).mkdir()
+            (root / sub / "x.0001.exr").write_bytes(b"")
+        seen = []
+        listing = core.walk_media(root, "*.exr", partial=lambda l: seen.append(len(l)))
+        self.assertEqual(seen, [1, 2, 3])
+        self.assertEqual(len(listing), 3)
+
+
+class ParallelScanTests(unittest.TestCase):
+    def tree(self):
+        import tempfile
+        root = Path(tempfile.mkdtemp())
+        for rel in ("B/sh020", "a/sh010", "a/sh010/render", ".git/objects", "_old"):
+            (root / rel).mkdir(parents=True, exist_ok=True)
+        for rel in ("B/sh020/x.0001.exr", "B/sh020/x.0002.exr", "a/sh010/clip.MOV",
+                    "a/sh010/render/b.0001.exr", "a/sh010/notes.txt", ".git/objects/y.exr",
+                    "_old/z.png", "top.exr"):
+            (root / rel).write_bytes(b"")
+        return root
+
+    def test_same_as_os_walk_in_folder_order(self):
+        root = self.tree()
+        expected = []
+        for folder, dirs, files in os.walk(str(root)):
+            dirs[:] = sorted((d for d in dirs if not d.startswith(".")), key=str.lower)
+            names = sorted(f for f in files if core.kind_of(f))
+            if names:
+                expected.append((folder, names))
+        for workers in (1, 4):
+            self.assertEqual(core.walk_media(root, workers=workers), expected)
+        rels = [os.path.relpath(f, str(root)) for f, _ in expected]
+        self.assertEqual(rels[0], ".")
+        self.assertNotIn(".git", " ".join(rels))
+        self.assertIn("_old", rels)
+
+    def test_progress_counts_files_and_found(self):
+        seen = []
+        core.walk_media(self.tree(), "*.exr", progress=lambda s, f: seen.append((s, f)))
+        self.assertEqual(seen[-1], (7, 3))     # 7 files outside .git; x.####, b.#### and top
+
+    def test_cancel_and_missing_root(self):
+        self.assertEqual(core.walk_media(self.tree(), cancelled=lambda: True), [])
+        with self.assertRaises(OSError):
+            core.walk_media("/no/such/folder/here")
+
+    def test_kind_of(self):
+        self.assertEqual([core.kind_of(n) for n in ("a.EXR", "b.mov", "c.dpx", "d.nk", "e")],
+                         ["exr", "movie", "image", "", ""])
+
+
+class NamesAndTests(unittest.TestCase):
+    LISTING = [("/p/a", ["sh010_beauty_v003.0001.exr", "sh010_beauty_v002.0001.exr",
+                         "sh010_depth_v003.0001.exr", "sh020_beauty_v003.mov", "notes_v003.txt"])]
+
+    def names(self, patterns):
+        return sorted(i.pattern for i in core.filter_listing(self.LISTING, patterns, "/p"))
+
+    def test_words_and_together(self):
+        self.assertEqual(self.names("*.exr beauty v003"), ["sh010_beauty_v003.####.exr"])
+        self.assertEqual(self.names("beauty v003"), ["sh010_beauty_v003.####.exr", "sh020_beauty_v003.mov"])
+
+    def test_file_types_are_alternatives(self):
+        self.assertEqual(self.names("*.exr *.mov v003"),
+                         ["sh010_beauty_v003.####.exr", "sh010_depth_v003.####.exr", "sh020_beauty_v003.mov"])
+        self.assertEqual(self.names("*.exr *.mov sh020"), ["sh020_beauty_v003.mov"])
+        self.assertEqual(self.names("*.exr !depth v003"), ["sh010_beauty_v003.####.exr"])

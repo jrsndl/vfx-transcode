@@ -16,8 +16,11 @@ the presets file and next to the application.
 ## Process tab
 
 ```
-Source       [ path ......................... ] [Add File] [Add Folder] [*.exr *.mov *.mp4]
-Preset       [ super-preset list ]   [ what it makes, notes, how it fits the source ]
+Source       [ path ......................................... ] [Add File] [Add Folder]
+[Presets] [Files]
+  Presets:   [ super-preset list ]   [ what it makes, notes, how it fits the source ]
+  Files:     Names [*.exr *.mov *.mp4]  Leave out [*/old/*]  [x] Tree  [Unfold] [Fold]
+             [ the inputs found: a tree of folders, or a flat list ]
 Destination  [Path preset v]                    [File name preset v]
              Path: [ ./review/ ......... ][...]  Name: [ {clean_name}_review ]
              Output: D:/shots/sh010/review/sh010_comp_v003_review.mp4
@@ -28,9 +31,55 @@ Destination  [Path preset v]                    [File name preset v]
 - **Source**: **Add File** (or drop a file, or type a path) uses any frame of a sequence, which
   brings in the whole sequence. Movies work too. **Add Folder** (or drop a folder) scans the
   folder and all its sub-folders in the background. The status bar shows the progress (files
-  scanned, media found). The pattern field beside it then picks what to use from the scan:
-  - The patterns are file-name wildcards: `*.exr`, `*.mov *.mp4`, `*beauty*.exr`. `!` leaves
-    files out (`*.exr !*tech*`).
+  scanned, media found). The **Files** tab (beside **Presets**) then picks what to use from the
+  scan:
+  - **Names**: words separated by spaces, matched against the file name (any case), and a
+    file must match **all** of them: `*.exr beauty v003` = EXR files with `beauty` and `v003`
+    in the name. File types (`*.exr *.mov *.mp4`, a `*.` and an extension) are the exception:
+    they are alternatives, any of them will do (`*.exr *.mov v003` = EXR or MOV, with `v003`).
+    With wildcards a word matches the whole name (`*beauty*.exr`); a plain word matches
+    anywhere in it (`beauty`). `!` leaves names out (`*.exr !tech`).
+  - **Leave out**: words matched against the whole path, to leave files out: a plain word
+    anywhere in the path (`old`, `_tmp`), or wildcards over the whole path (`*/old/*`).
+  - Both filter as you type: the list follows once you stop typing for a moment (0.6 s), from
+    what the scan found (no new scan), also while the scan is still running. The new rows get
+    their thumbnails after a longer pause (1.5 s), so a filter still being typed doesn't start
+    thumbnails nobody wants.
+  - The list shows the inputs found, as a **Tree** below each scanned folder (picked files
+    under *Picked files*; **Unfold** / **Fold** open and close it) or, with Tree off, as a flat
+    list with each file's folder. **#** (the first column) numbers the rows. Under the list:
+    how many inputs and frames, out of how many media files the scan found, e.g.
+    `28 inputs - 1,234 frames  (from 1,000 media files in the scanned folders)`. Sequences
+    count their frames on disk; a movie's frames are known once its thumbnail is made (until
+    then the count shows a `+`, and its Frames column says just *movie*).
+  - **Selecting rows**: with nothing selected, **Process** and **Add to Queue** send every
+    input listed. Select rows (click, Ctrl+click, Shift+click; a folder row stands for all
+    the inputs below it) and they send only those; the buttons then show how many, e.g.
+    **Add to Queue [3]**. Click the only selected row again (or Ctrl+click the selected rows)
+    to select nothing. A new scan starts with nothing selected and selects nothing when it
+    ends; a selection survives changing the filters, as long as its rows are still listed.
+  - **Output**: the file each input will make with the selected super-preset and the
+    Destination (hover for the full path; keywords that need the files, like `{timecode}`,
+    stay as they are). It follows every change of preset, path or name. Red: two inputs would
+    make the same file, or an output would write over its input.
+  - **Size**, **PAR** and **FPS**: the input's width x height, pixel aspect and frame rate as
+    vfx-transcode reads them (EXR header or movie, from the middle frame), filled in by the same
+    background run that makes the thumbnail (hover FPS for the exact fraction, e.g. 24000/1001).
+  - **Thumbnails** slider: how big the thumbnails are shown, 32 to 384 pixels wide (they are
+    made 256 wide, bigger is scaled up). Remembered.
+  - **Open** (beside the name): Play opens the input in its default program, Explore shows it
+    in the file browser, as in the queue. The buttons are made as the rows come on screen, so
+    a list of thousands still shows quickly.
+  - Right-click the column headers to show or hide #, Thumbnail, Open, Size, PAR, FPS, Frames, Output and Folder (Name always
+    stays; Folder only shows in the flat list). The choice is remembered.
+  - The **Thumbnail** column (the first one): a small picture of each input (with Thumbnail, Size, PAR and FPS all hidden, none are made). They are made lazily, only for the rows
+    on screen (scroll, unfold or switch tabs and the new rows get theirs), two at a time, by
+    `vfx-transcode -preview` with no burn-ins and no slate, 256 pixels wide, with the colour
+    of the selected super-preset (its `-ci`, `-co`, `-display`, `-view`, `-looks`, `-clf`,
+    `-ocio`; a super-preset without colour settings: the presets file's default). Picking
+    another preset shows the pictures in its colour, made if needed. They are kept in the app's
+    cache folder, so they come back at once next time (a changed file, or other colour
+    settings, get a new one). A file vfx-transcode can't read gets none.
   - An image sequence counts as one input.
   - Only hidden folders (starting with `.`) are skipped; `_wip` and the like are searched.
   - Inputs found this way know the folder they were found in, which vfx-transcode gets as
@@ -38,14 +87,23 @@ Destination  [Path preset v]                    [File name preset v]
     `{base_folder-1}` …, besides `{sourcepath-1}` … and `{sourcefolder-1}` … (see
     [Path keywords](OPTIONS.md#name-keywords)). For example, the path
     `{base_folder}/review/{sourcefolder-2}/` collects a whole scan into one review folder.
-  - The scan keeps the list of every media file it found. Changing the patterns, or picking
+  - The Files tab fills while the scan is still running (about every second), so the filters
+    can be worked out before it ends; the list keeps its scroll position and the folders you
+    folded. With a very large list, it refills less often, so the scan isn't held up.
+  - The scan reads 16 folders at once. A network share answers each folder slowly, however few
+    files it holds, so these waits overlap: a deep tree on a share scans many times faster.
+    Only names and types are read (no per-file size or date), and files are told apart by
+    extension. Hidden folders (`.git`, `.cache` ...) are skipped, as are junctions and links
+    to folders, so a link can't make the scan loop. A folder that can't be read is passed over;
+    an unreachable scan folder is reported.
+  - The scan keeps the list of every media file it found. Changing the filters, or picking
     another preset, filters that list again without a new scan. Adding the folder again scans
     it again (to see new files).
-- **Preset**: the super-presets.
+- **Presets** (tab): the super-presets.
   - Each one is marked for the source: ✔ fits, ⚠ works with notes, ✖ can't be used.
   - The panel beside the list shows what the selected one makes (a `.mp4` / `.mov` movie, or
     EXR / JPG ... frames), its input type, its destination, its notes, and what doesn't fit.
-  - Picking a preset sets the pattern field to the preset's input type, as recorded by the
+  - Picking a preset sets the Files tab's **Names** to the preset's input type, as recorded by the
     tuner (`input_type`: EXR gives `*.exr`, JPG `*.jpg *.jpeg`, movie `*.mov *.mp4 *.mxf ...`;
     without one, its `inputs` kinds). Your `!` exclusions stay. A preset that records neither
     leaves the field as it is.
@@ -164,6 +222,8 @@ Running  [=========== 63%   Converting (oiiotool)   0:41 ...............]
   the background; the status bar sums it up.
 - The log of the selected job is shown under the list. **Copy command** copies the
   vfx-transcode command lines.
+- Each job shows a picture of its source at the right, made the same lazy way, in the colour
+  of the job's super-preset.
 - **Hide done** (off at start) leaves the jobs that are done out of the list.
 - **Save Queue...** writes all the jobs to a `.vtq` file: their settings, status, progress
   message, times, Deadline job id and log (its last 5000 lines). The file also notes when, by

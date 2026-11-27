@@ -67,15 +67,14 @@ class MediaItem:
         return text + (", missing " + self.missing if self.missing else "")
 
 
+_KINDS = dict([(e, "image") for e in IMAGE_EXTS] + [(".exr", "exr")]
+              + [(e, "movie") for e in mv.MOVIE_EXTS])
+
+
 def kind_of(path):
-    ext = Path(str(path)).suffix.lower()
-    if mv.is_movie(path):
-        return "movie"
-    if ext == ".exr":
-        return "exr"
-    if ext in IMAGE_EXTS:
-        return "image"
-    return ""
+    """"movie", "exr", "image" or "" by the extension (a plain dict lookup: the scan asks it
+    for every file of every folder)."""
+    return _KINDS.get(os.path.splitext(str(path))[1].lower(), "")
 
 
 def describe_file(path):
@@ -140,7 +139,7 @@ def group_files(folder, names):
     groups = OrderedDict()
     for name in sorted(names):
         stem, ext = os.path.splitext(name)
-        if mv.is_movie(name):
+        if _KINDS.get(ext.lower()) == "movie":
             key = ("movie", name, ext.lower())
         else:
             match = _NUMBERED.match(stem)
@@ -240,43 +239,164 @@ def split_patterns(text):
     return include or split_patterns(DEFAULT_PATTERNS)[0], exclude
 
 
-def _filter_names(names, include, exclude):
-    return [f for f in names
-            if any(fnmatch.fnmatchcase(f.lower(), p) for p in include)
-            and not any(fnmatch.fnmatchcase(f.lower(), p) for p in exclude)]
+def _word_matches(text, word):
+    """A word with wildcards (* ? [) matches the whole text; a plain word matches anywhere in
+    it ("beauty" finds sh010_beauty_v003.exr). Both ignore case."""
+    text, word = text.lower(), word.lower()
+    if any(c in word for c in "*?["):
+        return fnmatch.fnmatchcase(text, word)
+    return word in text
+
+
+_EXTENSION = re.compile(r"^\*\.[^*?\[\]/\\]+$")      # *.exr, *.mov: a file type
+
+
+def _name_matches(name, include):
+    """The Names words combined: the file types among them (*.exr *.mov) are alternatives,
+    every other word must match as well: "*.exr *.mov beauty v003" = (exr or mov) and beauty
+    and v003."""
+    types = [p for p in include if _EXTENSION.match(p)]
+    words = [p for p in include if not _EXTENSION.match(p)]
+    return ((not types or any(_word_matches(name, p) for p in types))
+            and all(_word_matches(name, p) for p in words))
+
+
+def _word_test(word):
+    """_word_matches(text, word) as a function of the (lower case) text, compiled once."""
+    word = word.lower()
+    if _EXTENSION.match(word):
+        ext = word[1:]
+        return lambda text: text.endswith(ext)
+    if any(c in word for c in "*?["):
+        return re.compile(fnmatch.translate(word)).match
+    return lambda text: word in text
+
+
+def name_filter(include, exclude):
+    """A test of a file name for the Names words (as _name_matches, then no exclude word),
+    compiled once for a whole listing."""
+    types = [_word_test(p) for p in include if _EXTENSION.match(p)]
+    words = [_word_test(p) for p in include if not _EXTENSION.match(p)]
+    leave = [_word_test(p) for p in exclude]
+
+    def test(name):
+        name = name.lower()
+        return ((not types or any(t(name) for t in types))
+                and all(t(name) for t in words)
+                and not any(t(name) for t in leave))
+    return test
+
+
+def _filter_names(names, include, exclude, test=None):
+    test = test or name_filter(include, exclude)
+    return [f for f in names if test(f)]
+
+
+def split_words(text):
+    """Space (or comma) separated words of a filter field."""
+    return [w for w in re.split(r"[\s,;]+", text or "") if w]
+
+
+def path_excluded(path, words):
+    """Whether a path is left out by the negative filter: each word is matched against the
+    whole path (/ separators, any case): "*/old/*" or plainly "old" (anywhere in it)."""
+    whole = str(path).replace("\\", "/")
+    return any(_word_matches(whole, w) for w in words)
+
+
+SCAN_WORKERS = 16                     # folders listed at once: a share answers each one slowly
+
+
+def _list_folder(folder):
+    """(sub-folders, media file names) of one folder; ([], []) when it can't be read."""
+    dirs, names, count = [], [], 0
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        junction = getattr(entry, "is_junction", None)
+                        if not (junction and junction()):
+                            dirs.append(entry.name)
+                        continue
+                except OSError:
+                    continue
+                count += 1
+                if _KINDS.get(os.path.splitext(entry.name)[1].lower()):
+                    names.append(entry.name)
+    except OSError:
+        return [], [], 0
+    return dirs, names, count
+
+
+def sort_listing(listing):
+    """A listing in folder order (a folder before its sub-folders, A to Z), as os.walk."""
+    return sorted(listing, key=lambda pair: [p.lower() for p in re.split(r"[\\/]+", pair[0])])
 
 
 def walk_media(root, patterns="", cancelled: Callable[[], bool] = lambda: False,
-               progress: Callable[[int, int], None] = lambda scanned, found: None):
+               progress: Callable[[int, int], None] = lambda scanned, found: None,
+               partial: Callable[[list], None] = lambda listing: None,
+               workers: int = 0):
     """The listing of a folder and all its sub-folders: [(folder, [media file names])], every
     file vfx-transcode could read, whatever the patterns. Kept by the app, so a new filter
-    needs no new scan. patterns only count what progress() reports as found. Hidden folders
-    (starting with .) are skipped."""
+    needs no new scan. patterns only count what progress() reports as found. partial(listing)
+    gets the listing so far after each folder with media (the same list, growing, in the order
+    the folders were read: sort_listing for folder order). Hidden folders (starting with .) are
+    skipped.
+
+    The folders are read by several threads at once (os.scandir: names and types in one call
+    per folder, no stat per file), as a network share takes about as long to answer for one
+    folder as for a thousand files in it: SCAN_WORKERS folders wait together."""
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    root = str(root)
+    if not os.path.isdir(root):
+        raise OSError("not a folder (or not reachable): " + root)
     include, exclude = split_patterns(patterns)
     include, exclude = [p.lower() for p in include], [p.lower() for p in exclude]
+    test = name_filter(include, exclude)
     listing, scanned, found = [], 0, 0
-    for folder, dirs, files in os.walk(str(root)):
-        if cancelled():
-            break
-        dirs[:] = sorted(d for d in dirs if not any(fnmatch.fnmatchcase(d, p) for p in SKIP_DIRS))
-        scanned += len(files)
-        names = sorted(f for f in files if kind_of(f))
-        if names:
-            listing.append((folder, names))
-            found += len(group_files(folder, _filter_names(names, include, exclude)))
-        progress(scanned, found)
-    return listing
+    pool = ThreadPoolExecutor(max_workers=workers or SCAN_WORKERS)
+    try:
+        pending = {pool.submit(_list_folder, root): root}
+        while pending:
+            done, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            if cancelled():
+                break
+            for future in done:
+                folder = pending.pop(future)
+                dirs, names, count = future.result()
+                for d in sorted(dirs):
+                    if not any(fnmatch.fnmatchcase(d, p) for p in SKIP_DIRS):
+                        sub = os.path.join(folder, d)
+                        pending[pool.submit(_list_folder, sub)] = sub
+                scanned += count
+                if names:
+                    names.sort()
+                    listing.append((folder, names))
+                    found += len(group_files(folder, [n for n in names if test(n)]))
+                    partial(listing)
+            progress(scanned, found)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return sort_listing(listing)
 
 
-def filter_listing(listing, patterns, base_folder=""):
-    """MediaItems of a listing (walk_media) whose file names match the patterns; base_folder:
-    the folder that was scanned, for {base_folder}."""
+def filter_listing(listing, patterns, base_folder="", leave_out=""):
+    """MediaItems of a listing (walk_media) whose file names match the patterns (wildcards,
+    or plain words found anywhere in the name; ! leaves names out), without those whose whole
+    path matches a word of leave_out. base_folder: the folder that was scanned, for
+    {base_folder}."""
     include, exclude = split_patterns(patterns)
     include, exclude = [p.lower() for p in include], [p.lower() for p in exclude]
+    out_words = split_words(leave_out)
+    test = name_filter(include, exclude)
     items = []
     for folder, names in listing:
-        for key, group in group_files(folder, _filter_names(names, include, exclude)).items():
+        for key, group in group_files(folder, [n for n in names if test(n)]).items():
             item = item_from_group(folder, key, group)
+            if out_words and path_excluded(item.path, out_words):
+                continue
             item.base_folder = base_folder
             items.append(item)
     return items
@@ -459,6 +579,30 @@ def predict_output(item, spec, output_type, ext, custom=("", ""), context=None):
     elif output_type == "movie" and not re.search(r"\.[A-Za-z0-9]{2,4}$", text):
         text += "." + ext
     return text
+
+
+COLOUR_OPTIONS = ("-colour_preset", "-ci", "-co", "-display", "-view", "-looks", "-clf", "-ocio")
+
+
+def colour_args(args):
+    """The colour options (-ci, -co, -display, -view, -looks, -clf, -ocio, -colour_preset)
+    out of a list of vfx-transcode options, with their values, in order."""
+    out, args = [], list(args or [])
+    for index, arg in enumerate(args[:-1]):
+        if arg in COLOUR_OPTIONS:
+            out += [arg, args[index + 1]]
+    return out
+
+
+def preset_colour_args(entry):
+    """The colour options a super-preset entry gives vfx-transcode ([] = the presets file's
+    default colour)."""
+    if not entry:
+        return []
+    try:
+        return colour_args(sp.args_for({"_": entry}, "_"))
+    except Exception:
+        return []
 
 
 def overwrites_input(item, predicted):
